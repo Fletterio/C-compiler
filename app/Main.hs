@@ -1,31 +1,9 @@
 module Main where
 
+import Driver.Driver (runCompilerDriver)
 import System.Environment (getArgs)
-import System.Process (callProcess)
-import System.FilePath (replaceExtension)
-import System.Exit (exitSuccess, exitFailure)
-import Control.Exception (finally)
-
-preprocessCFile :: String -> IO String
-preprocessCFile cFilePath = do
-    let iFilePath = replaceExtension cFilePath "i"
-    callProcess "gcc" ["-E", "-P", cFilePath, "-o", iFilePath]
-    return iFilePath
-
-compilePreprocessedCFile :: String -> IO String
-compilePreprocessedCFile iFilePath = do
-    let sFilePath = replaceExtension iFilePath "s"
-    let compile = callProcess "gcc" ["-S", "-O", "-fno-asynchronous-unwind-tables", "-fcf-protection=none", iFilePath, "-o", sFilePath]
-    compile `finally` callProcess "rm" [iFilePath]
-    return sFilePath
-
-assembleAndLink :: String -> IO ()
-assembleAndLink sFilePath = do
-    callProcess "gcc" [sFilePath, "-o", replaceExtension sFilePath ""]
-    callProcess "rm" [sFilePath]
-
-runCompilerDriver :: String -> IO ()
-runCompilerDriver input = preprocessCFile input >>= compilePreprocessedCFile >>= assembleAndLink
+import System.Exit (exitFailure)
+import Data.List (isSuffixOf)
 
 main :: IO ()
 main = do
@@ -37,11 +15,9 @@ main = do
             if ".c" `isSuffixOf` filename
                 then runCompilerDriver filename
                 else putStrLn "Input file must have a .c extension." >> exitFailure
-    where
-    isSuffixOf :: Eq a => [a] -> [a] -> Bool
-    isSuffixOf suf str = suf == reverse (take (length suf) (reverse str))
 
     -- Returns: (Maybe flag, S flag, filename)
+    where
     parseArgs :: [String] -> Either String (Maybe String, Bool, String)
     parseArgs [filename] = Right (Nothing, False, filename)
     parseArgs [flag, filename]
