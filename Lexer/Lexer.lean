@@ -69,6 +69,12 @@ private def nextToken (chars : List Char) : Option (Token × List Char) :=
     else if c == '{' then some (.OpenBrace,  rest)
     else if c == '}' then some (.CloseBrace, rest)
     else if c == ';' then some (.Semicolon,  rest)
+    else if c == '~' then some (.Tilde,      rest)
+    -- Longest match: -- before -
+    else if c == '-' then
+      match rest with
+      | '-' :: rest' => some (.MinusMinus, rest')
+      | _            => some (.Minus,      rest)
     -- Identifier or keyword: [a-zA-Z_]\w*\b
     -- Keywords are recognised after the whole word is consumed (see spec).
     else if isIdentStart c then

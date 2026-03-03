@@ -27,12 +27,19 @@ private def expect (expected : Token) (tokens : List Token) : Except String (Lis
 -- Parsing functions (one per non-terminal in the formal grammar)
 -- ---------------------------------------------------------------------------
 
--- <exp> ::= <int>
+-- <exp> ::= <int> | <unop> <exp> | "(" <exp> ")"
+-- <unop> ::= "-" | "~"
 private def parseExp (tokens : List Token) : Except String (Exp × List Token) :=
   match tokens with
-  | []                       => .error "Expected expression but reached end of input"
-  | .Constant n :: rest      => .ok (.Constant n, rest)
-  | t :: _                   => .error s!"Expected constant but found {t.describe}"
+  | []                  => .error "Expected expression but reached end of input"
+  | .Constant n :: rest => .ok (.Constant n, rest)
+  | .Minus :: rest      => do let (e, rest') ← parseExp rest; .ok (.Unary .Negate e, rest')
+  | .Tilde :: rest      => do let (e, rest') ← parseExp rest; .ok (.Unary .Complement e, rest')
+  | .OpenParen :: rest  => do
+      let (e, rest') ← parseExp rest
+      let rest''     ← expect .CloseParen rest'
+      .ok (e, rest'')
+  | t :: _              => .error s!"Expected expression but found {t.describe}"
 
 -- <statement> ::= "return" <exp> ";"
 private def parseStatement (tokens : List Token) : Except String (Statement × List Token) := do

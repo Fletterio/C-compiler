@@ -12,6 +12,9 @@ inductive Token where
   | OpenBrace  : Token           -- {
   | CloseBrace : Token           -- }
   | Semicolon  : Token           -- ;
+  | Tilde      : Token           -- ~
+  | Minus      : Token           -- -
+  | MinusMinus : Token           -- --
   deriving Repr, BEq
 
 /-- Human-readable description of a token, used in parser error messages. -/
@@ -26,5 +29,8 @@ def Token.describe : Token → String
   | .OpenBrace    => "\"{\""
   | .CloseBrace   => "\"}\""
   | .Semicolon    => "\";\""
+  | .Tilde        => "\"~\""
+  | .Minus        => "\"-\""
+  | .MinusMinus   => "\"--\""
 
 end Lexer

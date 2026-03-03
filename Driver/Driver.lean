@@ -71,24 +71,24 @@ def preprocess (inputPath : String) : IO String := do
 def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := do
   let contents ← IO.FS.readFile preprocessedPath
   -- Lex
-  let _tokens ←
+  let tokens ←
     match Lexer.tokenize contents with
     | .ok tokens => pure tokens
     | .error msg => throw (IO.userError s!"Lex error: {msg}")
+  if stage == .Lex then return none
   -- Parse
-  let _ast ←
-    match Parser.parseProgram _tokens with
+  let ast ←
+    match Parser.parseProgram tokens with
     | .ok ast   => pure ast
     | .error msg => throw (IO.userError s!"Parse error: {msg}")
+  if stage == .Parse then return none
   -- Assembly generation
-  let _asmAst := AssemblyAST.genProgram _ast
-  match stage with
-  | .Lex | .Parse | .Codegen =>
-    return none
-  | .EmitAssembly | .Full =>
-    let assemblyPath := changeExtension preprocessedPath ".s"
-    IO.FS.writeFile assemblyPath (Emission.emitProgram _asmAst)
-    return some assemblyPath
+  let asmAst := AssemblyAST.genProgram ast
+  if stage == .Codegen then return none
+  -- Emit assembly
+  let assemblyPath := changeExtension preprocessedPath ".s"
+  IO.FS.writeFile assemblyPath (Emission.emitProgram asmAst)
+  return some assemblyPath
 
 /-- Step 3 — Assemble and link `assemblyPath`, writing the executable to
     `outputPath`. Deletes the assembly file when done (even on failure). -/
