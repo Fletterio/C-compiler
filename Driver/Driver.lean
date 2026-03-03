@@ -1,4 +1,7 @@
 import Lexer.Lexer
+import Parser.Parser
+import AssemblyAST.CodeGen
+import Emission.Emit
 
 namespace Driver
 
@@ -72,18 +75,20 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
     match Lexer.tokenize contents with
     | .ok tokens => pure tokens
     | .error msg => throw (IO.userError s!"Lex error: {msg}")
+  -- Parse
+  let _ast ←
+    match Parser.parseProgram _tokens with
+    | .ok ast   => pure ast
+    | .error msg => throw (IO.userError s!"Parse error: {msg}")
+  -- Assembly generation
+  let _asmAst := AssemblyAST.genProgram _ast
   match stage with
-  | .Lex =>
-    return none
-  | .Parse =>
-    -- TODO: implement parser
-    return none
-  | .Codegen =>
-    -- TODO: implement assembly generation
+  | .Lex | .Parse | .Codegen =>
     return none
   | .EmitAssembly | .Full =>
-    -- TODO: implement code emission
-    throw (IO.userError "Compiler not yet implemented")
+    let assemblyPath := changeExtension preprocessedPath ".s"
+    IO.FS.writeFile assemblyPath (Emission.emitProgram _asmAst)
+    return some assemblyPath
 
 /-- Step 3 — Assemble and link `assemblyPath`, writing the executable to
     `outputPath`. Deletes the assembly file when done (even on failure). -/

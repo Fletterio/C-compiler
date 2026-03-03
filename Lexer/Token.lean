@@ -14,4 +14,17 @@ inductive Token where
   | Semicolon  : Token           -- ;
   deriving Repr, BEq
 
+/-- Human-readable description of a token, used in parser error messages. -/
+def Token.describe : Token → String
+  | .Identifier s => s!"identifier \"{s}\""
+  | .Constant n   => s!"constant \"{n}\""
+  | .KwInt        => "\"int\""
+  | .KwVoid       => "\"void\""
+  | .KwReturn     => "\"return\""
+  | .OpenParen    => "\"(\""
+  | .CloseParen   => "\")\""
+  | .OpenBrace    => "\"{\""
+  | .CloseBrace   => "\"}\""
+  | .Semicolon    => "\";\""
+
 end Lexer
