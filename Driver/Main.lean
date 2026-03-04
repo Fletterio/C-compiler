@@ -9,8 +9,19 @@ structure Args where
   stage     : Driver.Stage
 
 /-- Parse the command-line argument list into `Args`, or return an error
-    message. Exactly one positional argument (the source file) is required;
-    at most one stage flag may be supplied. -/
+    message.  Exactly one positional argument (the source file) is required;
+    at most one stage flag may be supplied.
+
+    Recognised flags and their corresponding pipeline stages:
+      --lex      → Stage.Lex
+      --parse    → Stage.Parse
+      --tacky    → Stage.Tacky
+      --codegen  → Stage.Codegen
+      -S         → Stage.EmitAssembly
+      (none)     → Stage.Full
+
+    Any unrecognised flag (starting with `-`) is treated as an error.
+    Multiple positional arguments are also an error. -/
 def parseArgs (args : List String) : Except String Args := do
   let mut inputFile : Option String := none
   let mut stage : Driver.Stage := .Full
@@ -18,6 +29,7 @@ def parseArgs (args : List String) : Except String Args := do
     match arg with
     | "--lex"     => stage := .Lex
     | "--parse"   => stage := .Parse
+    | "--tacky"   => stage := .Tacky
     | "--codegen" => stage := .Codegen
     | "-S"        => stage := .EmitAssembly
     | _ =>
@@ -35,6 +47,10 @@ def parseArgs (args : List String) : Except String Args := do
 -- Entry point
 -- ---------------------------------------------------------------------------
 
+/-- Program entry point.
+    Parses command-line arguments, then runs the compiler driver.  Any error
+    (from argument parsing or from the compiler pipeline) is printed to stderr
+    and the process exits with code 1. -/
 def main (args : List String) : IO Unit := do
   match parseArgs args with
   | .error msg =>

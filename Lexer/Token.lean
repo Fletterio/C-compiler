@@ -15,6 +15,24 @@ inductive Token where
   | Tilde      : Token           -- ~
   | Minus      : Token           -- -
   | MinusMinus : Token           -- --
+  | Plus         : Token           -- +
+  | Star         : Token           -- *
+  | Slash        : Token           -- /
+  | Percent      : Token           -- %
+  | Ampersand      : Token           -- &
+  | Pipe           : Token           -- |
+  | Caret          : Token           -- ^
+  | LessLess       : Token           -- <<
+  | GreaterGreater : Token           -- >>
+  | Bang           : Token           -- !
+  | AmpAmp         : Token           -- &&
+  | PipePipe       : Token           -- ||
+  | EqualEqual     : Token           -- ==
+  | BangEqual      : Token           -- !=
+  | Less           : Token           -- <
+  | Greater        : Token           -- >
+  | LessEqual      : Token           -- <=
+  | GreaterEqual   : Token           -- >=
   deriving Repr, BEq
 
 /-- Human-readable description of a token, used in parser error messages. -/
@@ -32,5 +50,23 @@ def Token.describe : Token → String
   | .Tilde        => "\"~\""
   | .Minus        => "\"-\""
   | .MinusMinus   => "\"--\""
+  | .Plus           => "\"+\""
+  | .Star           => "\"*\""
+  | .Slash          => "\"/\""
+  | .Percent        => "\"%\""
+  | .Ampersand      => "\"&\""
+  | .Pipe           => "\"|\""
+  | .Caret          => "\"^\""
+  | .LessLess       => "\"<<\""
+  | .GreaterGreater => "\">>\""
+  | .Bang           => "\"!\""
+  | .AmpAmp         => "\"&&\""
+  | .PipePipe       => "\"||\""
+  | .EqualEqual     => "\"==\""
+  | .BangEqual      => "\"!=\""
+  | .Less           => "\"<\""
+  | .Greater        => "\">\""
+  | .LessEqual      => "\"<=\""
+  | .GreaterEqual   => "\">=\""
 
 end Lexer

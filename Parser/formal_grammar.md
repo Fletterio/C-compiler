@@ -1,6 +1,6 @@
-# Formal Grammar — Chapter 2
+# Formal Grammar — Chapter 4
 
-Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter 2.
+Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter 4.
 
 ```
 <program>    ::= <function>
@@ -9,9 +9,14 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 
 <statement>  ::= "return" <exp> ";"
 
-<exp>        ::= <int> | <unop> <exp> | "(" <exp> ")"
+<exp>        ::= <factor> | <exp> <binop> <exp>
 
-<unop>       ::= "-" | "~"
+<factor>     ::= <int> | <unop> <factor> | "(" <exp> ")"
+
+<binop>      ::= "-" | "+" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>"
+             | "&&" | "||" | "==" | "!=" | "<" | "<=" | ">" | ">="
+
+<unop>       ::= "-" | "~" | "!"
 
 <identifier> ::= ? An identifier token ?
 
@@ -26,6 +31,18 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 
 ## Notes
 
-- The `<exp>` rule is recursive: a unary expression `<unop> <exp>` contains another `<exp>`, allowing arbitrarily nested operations like `-(~(-~-(-4)))`.
-- Parentheses `"(" <exp> ")"` have no corresponding AST node — they affect grouping only. `1`, `(1)`, and `((((1))))` all produce the same `Constant(1)` node.
-- The decrement operator `--` does not appear in this grammar; the parser must reject it.
+- `<exp>` is parsed using **precedence climbing** rather than a directly recursive descent grammar.  The ambiguous `<exp> <binop> <exp>` rule is resolved by associativity and precedence (high to low):
+  - `*`, `/`, `%` → 50 (multiplicative)
+  - `+`, `-` → 45 (additive)
+  - `<<`, `>>` → 40 (shift)
+  - `<`, `<=`, `>`, `>=` → 35 (relational)
+  - `==`, `!=` → 30 (equality)
+  - `&` → 25 (bitwise AND)
+  - `^` → 20 (bitwise XOR)
+  - `|` → 15 (bitwise OR)
+  - `&&` → 10 (logical AND)
+  - `||` → 5 (logical OR)
+  - All binary operators are **left-associative**: `1 - 2 - 3` parses as `(1 - 2) - 3`.
+- `<factor>` handles unary operators and atoms; it is the highest-priority form.  Unary `-` and `~` apply to a `<factor>`, not a full `<exp>`, so they always bind more tightly than any binary operator.
+- Parentheses `"(" <exp> ")"` have no corresponding AST node — they affect grouping only.
+- The decrement operator `--` does not appear in this grammar; the parser will reject it.
