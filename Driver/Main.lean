@@ -19,6 +19,7 @@ structure Args where
       --tacky    → Stage.Tacky
       --codegen  → Stage.Codegen
       -S         → Stage.EmitAssembly
+      -c         → Stage.ObjectFile
       (none)     → Stage.Full
 
     Any unrecognised flag (starting with `-`) is treated as an error.
@@ -34,6 +35,7 @@ def parseArgs (args : List String) : Except String Args := do
     | "--tacky"    => stage := .Tacky
     | "--codegen" => stage := .Codegen
     | "-S"        => stage := .EmitAssembly
+    | "-c"        => stage := .ObjectFile
     | _ =>
       if arg.startsWith "-" then
         throw s!"Unknown option: {arg}"

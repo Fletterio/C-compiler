@@ -12,6 +12,10 @@ import AST.AST
   Labels in C are function-scoped, so this pass collects every label in the
   entire function body (regardless of nesting) before checking goto targets.
 
+  Chapter 9: the pass processes each function definition independently.
+  Cross-function gotos fail naturally: a goto in function A is checked against
+  only A's labels, so it will fail if the target is only defined in function B.
+
   The pass does not modify the AST — it only validates it, returning `()`
   on success or an error message on failure.
 -/
@@ -50,6 +54,7 @@ private partial def collectLabelsStmt : AST.Statement → List String
 private partial def collectLabelsItem : AST.BlockItem → List String
   | .S stmt => collectLabelsStmt stmt
   | .D _    => []
+  | .FD _   => []
 
 end
 
@@ -89,17 +94,27 @@ private partial def checkGotosStmt (defined : List String) : AST.Statement → E
 private partial def checkGotosItem (defined : List String) : AST.BlockItem → Except String Unit
   | .S stmt => checkGotosStmt defined stmt
   | .D _    => .ok ()
+  | .FD _   => .ok ()
 
 end
 
-/-- Entry point for the label resolution pass.
-    Collects all labels in the function body, checks for duplicates, then
-    verifies that all goto targets exist. -/
-def resolveLabels (p : AST.Program) : Except String Unit := do
-  let f := p.func
-  let labels := f.body.foldl (fun acc i => acc ++ collectLabelsItem i) []
+/-- Validate labels and gotos for a single function body.
+    Collects all labels defined in the body, checks for duplicates, then
+    verifies that all goto targets exist within the same function. -/
+private def resolveFunctionLabels (body : List AST.BlockItem) : Except String Unit := do
+  let labels := body.foldl (fun acc i => acc ++ collectLabelsItem i) []
   checkDuplicates labels
-  let _ ← f.body.mapM (fun i => checkGotosItem labels i)
+  let _ ← body.mapM (fun i => checkGotosItem labels i)
   return ()
+
+/-- Entry point for the label resolution pass.
+    Chapter 9: processes each function definition independently.
+    Labels are function-scoped; cross-function gotos are detected as errors
+    because the target label won't be found in the calling function's label set. -/
+def resolveLabels (p : AST.Program) : Except String Unit := do
+  for tl in p.topLevels do
+    match tl with
+    | .FunDef fd  => resolveFunctionLabels fd.body
+    | .FunDecl _  => pure ()   -- declarations have no body to check
 
 end Semantics

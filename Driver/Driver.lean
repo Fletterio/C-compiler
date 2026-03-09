@@ -23,6 +23,7 @@ inductive Stage where
   | Tacky         -- run through TACKY generation (--tacky)
   | Codegen       -- run through assembly generation (--codegen)
   | EmitAssembly  -- compile to assembly but do not assemble or link (-S)
+  | ObjectFile    -- compile to object file but do not link (-c)
   | Full          -- complete compilation (default)
   deriving Repr, BEq
 
@@ -94,14 +95,25 @@ def preprocess (inputPath : String) : IO String := do
 
     Pipeline order:
       1. Lex      — tokenize the source
-      2. Parse    — build the AST
-      3. Validate — variable resolution (rename locals, reject invalid programs)
+      2. Parse    — build the AST (now: list of top-level items)
+      3. Validate — identifier resolution (rename locals, reject invalid programs)
+                    + loop labeling, switch collection, label resolution
       4. TACKY    — flatten nested expressions into three-address code
       5. Codegen (3 passes):
            a. TACKY → Assembly AST (with pseudoregisters)
            b. Replace pseudoregisters with stack slots
-           c. Insert AllocateStack; fix mem-to-mem Mov instructions
-      6. Emit     — serialise the assembly AST to AT&T-syntax text -/
+           c. Insert AllocateStack (16-byte aligned); fix mem-to-mem instructions
+      6. Emit     — serialise the assembly AST to AT&T-syntax text
+
+    Chapter 9 changes:
+      - parseProgram now returns a Program with a list of TopLevel items.
+      - resolveProgram handles multiple functions and function calls.
+      - labelLoops, collectSwitchCases, resolveLabels all handle multi-function.
+      - emitProgram processes only FunDef entries, threading the counter globally.
+      - genProgram handles multiple functions.
+      - replacePseudos handles each function independently.
+      - fixUp handles each function with its own stack size and 16-byte alignment.
+      - emitProgram emits all functions, using @PLT for external calls. -/
 def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := do
   let contents ← IO.FS.readFile preprocessedPath
   -- Lex
@@ -116,50 +128,70 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
     | .ok ast   => pure ast
     | .error msg => throw (IO.userError s!"Parse error: {msg}")
   if stage == .Parse then return none
-  -- Variable resolution: rename locals, reject undeclared/duplicate variables
+  -- Variable/identifier resolution: rename locals, validate function calls,
+  -- reject undeclared/duplicate identifiers
   let (resolvedAst, initCounter) ←
     match Semantics.resolveProgram ast with
     | .ok r      => pure r
     | .error msg => throw (IO.userError s!"Semantic error: {msg}")
   -- Loop labeling: annotate loops/switch/break/continue with unique IDs;
-  -- rejects break/continue outside of loops (or switch for break)
+  -- rejects break/continue outside of loops (or switch for break).
+  -- Chapter 9: uses a global counter across all functions.
   let resolvedAst ←
     match Semantics.labelLoops resolvedAst with
     | .ok p      => pure p
     | .error msg => throw (IO.userError s!"Semantic error: {msg}")
   -- Switch case collection (extra credit): collect and validate case/default
-  -- labels for each switch statement and attach them to the Switch AST node
+  -- labels for each switch statement and attach them to the Switch AST node.
+  -- Chapter 9: processes all functions.
   let resolvedAst ←
     match Semantics.collectSwitchCases resolvedAst with
     | .ok p      => pure p
     | .error msg => throw (IO.userError s!"Semantic error: {msg}")
   if stage == .Validate then return none
-  -- Label resolution (extra credit ch6): validates goto targets and duplicate labels
+  -- Label resolution (extra credit ch6): validates goto targets and duplicate labels.
+  -- Chapter 9: each function is checked independently.
   match Semantics.resolveLabels resolvedAst with
   | .ok ()     => pure ()
   | .error msg => throw (IO.userError s!"Semantic error: {msg}")
-  -- TACKY generation
+  -- TACKY generation: flatten AST to three-address code.
+  -- Chapter 9: global counter across all functions; only FunDef entries produce code.
   let tacky := Tacky.emitProgram resolvedAst initCounter
   if stage == .Tacky then return none
-  -- Assembly generation pass 1: TACKY → Assembly (with pseudoregisters)
+  -- Assembly generation pass 1: TACKY → Assembly AST (with pseudoregisters).
+  -- Chapter 9: handles multiple functions and the new FunCall, Push, Call instructions.
   let asmAst := AssemblyAST.genProgram tacky
-  -- Assembly generation pass 2: replace pseudoregisters with stack slots
-  let (asmAst, stackBytes) := AssemblyAST.replacePseudos asmAst
-  -- Assembly generation pass 3: insert AllocateStack, fix invalid instructions
-  let asmAst := AssemblyAST.fixUp stackBytes asmAst
+  -- Assembly generation pass 2: replace pseudoregisters with stack slots.
+  -- Chapter 9: each function processed independently; stack sizes stored in FunctionDef.
+  let asmAst := AssemblyAST.replacePseudos asmAst
+  -- Assembly generation pass 3: insert AllocateStack (16-byte aligned), fix invalid instructions.
+  -- Chapter 9: each function fixed up with its own stack size.
+  let asmAst := AssemblyAST.fixUp asmAst
   if stage == .Codegen then return none
-  -- Emit assembly
+  -- Emit assembly: serialize assembly AST to AT&T-syntax text.
+  -- Chapter 9: emits all functions; uses @PLT for external function calls.
   let assemblyPath := changeExtension preprocessedPath ".s"
   IO.FS.writeFile assemblyPath (Emission.emitProgram asmAst)
   return some assemblyPath
 
-/-- Step 3 — Assemble and link `assemblyPath` into an executable at `outputPath`.
+/-- Step 3a — Assemble and link `assemblyPath` into an executable at `outputPath`.
     Delegates to GCC, which handles both assembly and linking in one step.
     Deletes the `.s` file afterwards regardless of whether linking succeeds,
     since keeping a partial assembly file around would be confusing. -/
 def assemble (assemblyPath : String) (outputPath : String) : IO Unit := do
   try
     runCmd "gcc" #[assemblyPath, "-o", outputPath] "Assembly/linking failed"
+  catch e =>
+    try IO.FS.removeFile assemblyPath catch _ => pure ()
+    throw e
+  try IO.FS.removeFile assemblyPath catch _ => pure ()
+
+/-- Step 3b — Assemble `assemblyPath` into an object file at `objectPath`
+    without linking.  Uses `gcc -c`, which instructs GCC to stop after assembly.
+    Deletes the `.s` file afterwards. -/
+def assembleToObject (assemblyPath : String) (objectPath : String) : IO Unit := do
+  try
+    runCmd "gcc" #["-c", assemblyPath, "-o", objectPath] "Assembly to object failed"
   catch e =>
     try IO.FS.removeFile assemblyPath catch _ => pure ()
     throw e
@@ -189,10 +221,14 @@ def run (inputPath : String) (stage : Stage) : IO Unit := do
       try IO.FS.removeFile preprocessed catch _ => pure ()
       throw e
 
-  -- Step 3: assemble/link (only for full compilation)
+  -- Step 3: assemble/link/object depending on stage
   match stage, assemblyOpt with
   | .Full, some assemblyPath =>
+    -- Full compilation: assemble + link into an executable
     assemble assemblyPath (dropExtension inputPath)
+  | .ObjectFile, some assemblyPath =>
+    -- Object file only: assemble into .o without linking
+    assembleToObject assemblyPath (changeExtension inputPath ".o")
   | _, _ =>
     -- EmitAssembly keeps the .s file; Lex/Parse/Tacky/Codegen produce no output.
     pure ()

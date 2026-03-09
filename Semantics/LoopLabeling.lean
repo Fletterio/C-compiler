@@ -22,6 +22,11 @@ import AST.AST
     The collected `(value, label)` list is NOT populated here; that is done by
     the subsequent switch-case-collection pass.
 
+  Chapter 9: the pass processes ALL function definitions in the program,
+  maintaining a GLOBAL counter across functions so that labels in different
+  functions have different numbers (e.g. "loop.0" in foo, "loop.1" in bar).
+  This prevents label conflicts and satisfies the label naming scheme test.
+
   The pass reports an error if:
     - A `break` statement appears outside any loop or switch.
     - A `continue` statement appears outside any loop.
@@ -50,6 +55,8 @@ mutual
                 annotate `break` statements.
     `contLbl`:  the ID base of the innermost enclosing *loop* (never a switch)
                 — used to annotate `continue` statements.
+    `switchLbl`: the ID base of the innermost enclosing switch — used to
+                 validate `case` and `default` statements.
     When a new loop is entered, both `breakLbl` and `contLbl` are updated to
     the new loop's ID.  When a switch is entered, only `breakLbl` is updated
     (so `continue` still refers to the surrounding loop, if any). -/
@@ -125,7 +132,8 @@ private partial def labelStatement
   | .Return _ | .Expression _ | .Goto _ | .Null => return stmt
 
 /-- Annotate a block item with loop labels by delegating to `labelStatement`
-    for statement items; declaration items are returned unchanged. -/
+    for statement items; declaration items are returned unchanged.
+    Chapter 9: `FD` (local function declaration) items are also returned as-is. -/
 private partial def labelBlockItem
     (item      : AST.BlockItem)
     (breakLbl  : Option String)
@@ -135,17 +143,34 @@ private partial def labelBlockItem
   match item with
   | .S stmt => return .S (← labelStatement stmt breakLbl contLbl switchLbl)
   | .D _    => return item
+  | .FD _   => return item
 
 end
 
+/-- Label loops within a single function's body, using the given counter state.
+    Returns the annotated body and the updated counter state. -/
+private def labelFunctionBody (body : List AST.BlockItem) : LabelM (List AST.BlockItem) := do
+  body.mapM (fun item => labelBlockItem item none none none)
+
 /-- Entry point for the loop labeling pass.
-    Annotates every loop, switch, case/default, break, and continue in the
-    program with a unique ID string.  Returns an error if a `break` or
-    `continue` appears outside an appropriate enclosing statement. -/
+    Processes all function definitions in the program sequentially, maintaining
+    a GLOBAL counter across all functions.  This ensures that labels in different
+    functions have different numbers, preventing conflicts.
+    Returns an error if a `break` or `continue` appears outside an appropriate
+    enclosing statement. -/
 def labelLoops (p : AST.Program) : Except String AST.Program := do
-  let f := p.func
-  match (f.body.mapM (fun item => labelBlockItem item none none none)).run 0 with
-  | .error msg     => .error msg
-  | .ok (body', _) => .ok { p with func := { f with body := body' } }
+  -- Process all top-level items with a single shared counter
+  let action : LabelM (List AST.TopLevel) :=
+    p.topLevels.mapM fun tl =>
+      match tl with
+      | .FunDef fd => do
+          let body' ← labelFunctionBody fd.body
+          return .FunDef { fd with body := body' }
+      | .FunDecl fd =>
+          -- Declarations have no body: skip them
+          return .FunDecl fd
+  match action.run 0 with
+  | .error msg         => .error msg
+  | .ok (topLevels', _) => .ok { p with topLevels := topLevels' }
 
 end Semantics

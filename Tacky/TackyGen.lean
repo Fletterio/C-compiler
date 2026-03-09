@@ -9,6 +9,10 @@ import Tacky.Tacky
   for Var nodes).  Constants are passed through directly without generating
   any instructions.
 
+  Chapter 9: handles `FunCall` expressions and multiple function definitions.
+  The TACKY program contains only FunctionDef entries; FunDecl top-level items
+  are skipped (they carry no code).
+
   A single `Nat` counter is shared by `makeTemporary` and `makeLabel` to
   guarantee that every generated name is unique within the function.
   The initial counter value is supplied by the caller so that it does not
@@ -16,6 +20,9 @@ import Tacky.Tacky
   Temporary variables are named "tmp.N" and labels are named "<base>.N",
   where N is the current counter value.  Periods are not valid in C
   identifiers, so these names cannot clash with any user-defined identifier.
+
+  The counter is GLOBAL across all functions: it is threaded from one function
+  to the next so that no two functions produce the same temporary name.
 -/
 
 namespace Tacky
@@ -80,7 +87,9 @@ private def convertBinop : AST.BinaryOp → BinaryOp
       return `Var(v)` (the value of an assignment is the assigned value).
     - `PostfixIncr(Var(v))`: save the old value to a temporary, emit
       `Binary(Add, Var(v), 1, Var(v))` to increment in place, return old value.
-    - `PostfixDecr(Var(v))`: same as `PostfixIncr` but subtracts 1. -/
+    - `PostfixDecr(Var(v))`: same as `PostfixIncr` but subtracts 1.
+    - `FunCall(name, args)`: flatten each argument, allocate a temporary for
+      the return value, emit a `FunCall` instruction. -/
 private def emitExp : AST.Exp → GenM (Val × List Instruction)
   | .Constant n     => return (.Constant n, [])
   | .Var v          => return (.Var v, [])
@@ -158,6 +167,16 @@ private def emitExp : AST.Exp → GenM (Val × List Instruction)
         [.Copy (.Var v) (.Var tmp),
          .Binary .Subtract (.Var v) (.Constant 1) (.Var v)])
   | .PostfixDecr _ => return (.Constant 0, [])   -- unreachable after var resolution
+  | .FunCall name args => do
+      -- Flatten each argument expression into instructions + values
+      let argResults ← args.mapM emitExp
+      -- Collect all argument instructions (in order)
+      let argInstrs := argResults.foldl (fun acc (_, instrs) => acc ++ instrs) []
+      let argVals   := argResults.map (fun (v, _) => v)
+      -- Allocate a fresh temporary for the return value
+      let dst := Val.Var (← makeTemporary)
+      -- Emit all arg instructions, then the call, result in dst
+      return (dst, argInstrs ++ [.FunCall name argVals dst])
 
 /-- Translate a `for`-loop initial clause into TACKY instructions.
     A declaration initializer emits the expression and a `Copy` into the
@@ -185,6 +204,8 @@ private def emitForInit : AST.ForInit → GenM (List Instruction)
 mutual
 
 /-- Translate an AST statement into a flat list of TACKY instructions.
+    `funcName` is the name of the enclosing function, used to make
+    user-defined labels unique across functions (see `Labeled`/`Goto` below).
 
     Loop lowering (base derived from the annotation ID, e.g. `"loop.5"`):
       break label    = "brk_loop.5"   continue label = "cnt_loop.5"
@@ -200,8 +221,11 @@ mutual
       If no default: fall through to break label.
 
     `Case`/`Default`: emit `Label(caseLbl)` then the body.
-    `Labeled`/`Goto`: emit a `Label`/`Jump` instruction. -/
-private partial def emitStatement : AST.Statement → GenM (List Instruction)
+    `Labeled`/`Goto` (extra credit ch6): user labels are prefixed with `funcName ++ "."` so
+      that same-named labels in different functions do not conflict in the object file.
+      (The period is not a valid C identifier character, ensuring no clash with
+       user code or system-generated names like "loop.0".) -/
+private partial def emitStatement (funcName : String) : AST.Statement → GenM (List Instruction)
   | .Return e => do
       let (v, instrs) ← emitExp e
       return instrs ++ [.Return v]
@@ -211,19 +235,19 @@ private partial def emitStatement : AST.Statement → GenM (List Instruction)
   | .If cond thenStmt none => do
       let endLabel ← makeLabel "if_end"
       let (c, condInstrs) ← emitExp cond
-      let thenInstrs ← emitStatement thenStmt
+      let thenInstrs ← emitStatement funcName thenStmt
       return condInstrs ++ [.JumpIfZero c endLabel] ++ thenInstrs ++ [.Label endLabel]
   | .If cond thenStmt (some elseStmt) => do
       let elseLabel ← makeLabel "if_else"
       let endLabel  ← makeLabel "if_end"
       let (c, condInstrs) ← emitExp cond
-      let thenInstrs ← emitStatement thenStmt
-      let elseInstrs ← emitStatement elseStmt
+      let thenInstrs ← emitStatement funcName thenStmt
+      let elseInstrs ← emitStatement funcName elseStmt
       return condInstrs ++ [.JumpIfZero c elseLabel] ++ thenInstrs ++
              [.Jump endLabel, .Label elseLabel] ++ elseInstrs ++ [.Label endLabel]
   | .Compound items => do
       let instrs ← items.foldlM (fun acc item => do
-        return acc ++ (← emitBlockItem item)) []
+        return acc ++ (← emitBlockItem funcName item)) []
       return instrs
   -- Chapter 8: while loop
   -- Label(cnt) → cond → JumpIfZero(brk) → body → Jump(cnt) → Label(brk)
@@ -231,7 +255,7 @@ private partial def emitStatement : AST.Statement → GenM (List Instruction)
       let cntLabel := "cnt_" ++ base
       let brkLabel := "brk_" ++ base
       let (c, condInstrs) ← emitExp cond
-      let bodyInstrs ← emitStatement body
+      let bodyInstrs ← emitStatement funcName body
       return [.Label cntLabel] ++ condInstrs ++ [.JumpIfZero c brkLabel] ++
              bodyInstrs ++ [.Jump cntLabel, .Label brkLabel]
   | .While _ _ none => return []   -- unreachable: loop labeling always sets label
@@ -241,7 +265,7 @@ private partial def emitStatement : AST.Statement → GenM (List Instruction)
       let startLabel := "start_" ++ base
       let cntLabel   := "cnt_"   ++ base
       let brkLabel   := "brk_"   ++ base
-      let bodyInstrs ← emitStatement body
+      let bodyInstrs ← emitStatement funcName body
       let (c, condInstrs) ← emitExp cond
       return [.Label startLabel] ++ bodyInstrs ++ [.Label cntLabel] ++
              condInstrs ++ [.JumpIfNotZero c startLabel, .Label brkLabel]
@@ -259,7 +283,7 @@ private partial def emitStatement : AST.Statement → GenM (List Instruction)
         | some c => do
             let (v, instrs) ← emitExp c
             pure (instrs ++ [.JumpIfZero v brkLabel])
-      let bodyInstrs ← emitStatement body
+      let bodyInstrs ← emitStatement funcName body
       let postInstrs ← match post with
         | none   => pure []
         | some e => do
@@ -290,36 +314,45 @@ private partial def emitStatement : AST.Statement → GenM (List Instruction)
       -- If there is no default clause, fall through to the break label.
       let noDefault  := cases.all (fun (v, _) => v.isSome)
       let fallThrough := if noDefault then [Instruction.Jump brkLabel] else []
-      let bodyInstrs ← emitStatement body
+      let bodyInstrs ← emitStatement funcName body
       return expInstrs ++ jumpTable ++ fallThrough ++ bodyInstrs ++ [.Label brkLabel]
   | .Switch _ _ none _ => return []   -- unreachable
   -- Chapter 8 extra credit: case and default — emit jump target label then body
   | .Case _ body (some lbl) => do
-      return [.Label lbl] ++ (← emitStatement body)
+      return [.Label lbl] ++ (← emitStatement funcName body)
   | .Case _ _ none => return []   -- unreachable
   | .Default body (some lbl) => do
-      return [.Label lbl] ++ (← emitStatement body)
+      return [.Label lbl] ++ (← emitStatement funcName body)
   | .Default _ none => return []   -- unreachable
+  -- Chapter 6 extra credit: labeled statement.
+  -- Prefix the user label with funcName so same-named labels in different functions
+  -- don't collide in the assembled object file (e.g. "foo.end" vs "bar.end").
   | .Labeled label stmt => do
-      let stmtInstrs ← emitStatement stmt
-      return [.Label label] ++ stmtInstrs
+      let stmtInstrs ← emitStatement funcName stmt
+      return [.Label (funcName ++ "." ++ label)] ++ stmtInstrs
+  -- Chapter 6 extra credit: goto — jump to the same prefixed label.
   | .Goto label =>
-      return [.Jump label]
+      return [.Jump (funcName ++ "." ++ label)]
   | .Null => return []
 
 /-- Translate a single block item into a list of TACKY instructions.
+    `funcName` is threaded through to `emitStatement` for user-label prefixing.
     Declarations with no initializer produce no instructions.
     Declarations with an initializer emit the initializer expression and
     a `Copy` to store the result in the variable.
-    Statements delegate to `emitStatement`. -/
-private partial def emitBlockItem : AST.BlockItem → GenM (List Instruction)
-  | .S stmt => emitStatement stmt
+    Local function declarations (FD) produce no instructions at all — they
+    are only needed for semantic validation, not code generation. -/
+private partial def emitBlockItem (funcName : String) : AST.BlockItem → GenM (List Instruction)
+  | .S stmt => emitStatement funcName stmt
   | .D decl =>
       match decl.init with
       | none   => return []
       | some e => do
           let (val, instrs) ← emitExp e
           return instrs ++ [.Copy val (.Var decl.name)]
+  | .FD _ =>
+      -- Local function declarations carry no code; skip them.
+      return []
 
 end
 
@@ -327,20 +360,34 @@ end
     Processes all block items in order and appends a final
     `Return(Constant(0))` so that functions without an explicit return
     statement return 0 (correct for `main`) and cleanly restore the caller's
-    stack frame for other functions. -/
-private def emitFunctionDef (f : AST.FunctionDef) (initCounter : Nat) : FunctionDef :=
-  let action : GenM (List Instruction) := do
-    let body ← f.body.foldlM (fun acc item => do
-      return acc ++ (← emitBlockItem item)) []
-    return body ++ [.Return (.Constant 0)]
-  let (body, _) := action.run initCounter
-  { name := f.name, body }
+    stack frame for other functions.
+    Chapter 9: preserves the renamed parameter list so CodeGen can emit
+    parameter-copy instructions at function entry. -/
+private def emitFunctionDef (f : AST.FunctionDef) : GenM FunctionDef := do
+  -- Pass f.name to emitBlockItem so user-defined labels (Labeled/Goto) are
+  -- prefixed with the function name, preventing conflicts across functions.
+  let body ← f.body.foldlM (fun acc item => do
+    return acc ++ (← emitBlockItem f.name item)) []
+  return { name := f.name, params := f.params, body := body ++ [.Return (.Constant 0)] }
 
 /-- Entry point for the IR generation pass.
-    `initCounter` should be set to the final counter value returned by the
-    variable resolution pass, so that TACKY temporaries (`tmp.N`) do not
-    collide with renamed local variables (`<name>.N`). -/
+    Chapter 9: processes all top-level items; only FunDef entries produce TACKY
+    FunctionDef nodes.  FunDecl entries are silently skipped.
+    The counter is GLOBAL across all functions — each function picks up where
+    the previous one left off, so no two functions produce the same tmp.N name.
+    `initCounter` should be the final counter value from variable resolution. -/
 def emitProgram (p : AST.Program) (initCounter : Nat := 0) : Program :=
-  { func := emitFunctionDef p.func initCounter }
+  -- Collect only the FunDef top-levels (skip declarations)
+  let astFuncs := p.topLevels.filterMap fun tl =>
+    match tl with
+    | .FunDef fd  => some fd
+    | .FunDecl _  => none
+  -- Emit each function sequentially, threading the counter through
+  let action : GenM (List FunctionDef) :=
+    astFuncs.foldlM (fun acc fd => do
+      let tackyFd ← emitFunctionDef fd
+      return acc ++ [tackyFd]) []
+  let (funcs, _) := action.run initCounter
+  { funcs }
 
 end Tacky

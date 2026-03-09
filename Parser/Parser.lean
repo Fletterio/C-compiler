@@ -132,10 +132,15 @@ mutual
 
 /-- Parse a *factor*: the grammar's highest-priority expression form.
     A factor is one of:
-      - An integer constant token             → `Exp.Constant`
-      - An identifier                         → `Exp.Var` (or postfix ++ or --)
+      - An integer constant token                    → `Exp.Constant`
+      - An identifier followed by `(`               → `Exp.FunCall` (function call)
+      - An identifier not followed by `(`           → `Exp.Var` (or postfix ++ or --)
       - A prefix unary operator followed by a factor → `Exp.Unary` or desugared assignment
-      - A parenthesised full expression       → the inner `Exp` node (no wrapper)
+      - A parenthesised full expression             → the inner `Exp` node (no wrapper)
+
+    Chapter 9: when we see `Identifier "("`, we parse it as a function call.
+    The argument list is `(void)` (empty) or `(e1, e2, ...)`.
+    Trailing commas in the argument list are a parse error.
 
     Prefix `++e` desugars to `Assignment(e, Binary(Add, e, 1))`.
     Prefix `--e` desugars to `Assignment(e, Binary(Subtract, e, 1))`.
@@ -157,7 +162,15 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
   | .MinusMinus :: rest => do
       let (e, rest') ← parseFactor rest
       .ok (.Assignment e (.Binary .Subtract e (.Constant 1)), rest')
-  -- Identifier: check for postfix ++ or --
+  -- Identifier: check for function call (followed by '('), postfix ++/--, or plain variable
+  | .Identifier v :: .OpenParen :: rest => do
+      -- Function call: parse the argument list
+      let (args, rest') ← parseArgList rest
+      -- Check for postfix ++ or -- after a function call (unusual but valid C)
+      match rest' with
+      | .PlusPlus   :: rest'' => .ok (.PostfixIncr (.FunCall v args), rest'')
+      | .MinusMinus :: rest'' => .ok (.PostfixDecr (.FunCall v args), rest'')
+      | _                     => .ok (.FunCall v args, rest')
   | .Identifier v :: rest =>
       match rest with
       | .PlusPlus   :: rest' => .ok (.PostfixIncr (.Var v), rest')
@@ -172,6 +185,36 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
       | .MinusMinus :: rest''' => .ok (.PostfixDecr e, rest''')
       | _                      => .ok (e, rest'')
   | t :: _              => .error s!"Expected expression but found {t.describe}"
+
+/-- Parse the argument list of a function call.
+    Precondition: the opening `(` has already been consumed.
+    Grammar: `)` (empty) | `exp { "," exp } ")"`.
+    No trailing comma is allowed.
+    Returns the list of argument expressions and the remaining tokens
+    (after consuming the closing `)`). -/
+private partial def parseArgList (tokens : List Token) : Except String (List Exp × List Token) :=
+  match tokens with
+  | .CloseParen :: rest =>
+      -- Empty argument list: ()
+      .ok ([], rest)
+  | _ => do
+      -- Parse first argument
+      let (firstArg, rest) ← parseExp 0 tokens
+      -- Parse additional arguments separated by commas
+      let (moreArgs, rest') ← parseArgListTail rest
+      .ok (firstArg :: moreArgs, rest')
+
+/-- Parse zero or more additional arguments after the first, each preceded by a comma.
+    Stops when `)` is found and consumes it. No trailing comma is allowed. -/
+private partial def parseArgListTail (tokens : List Token) : Except String (List Exp × List Token) :=
+  match tokens with
+  | .CloseParen :: rest => .ok ([], rest)
+  | .Comma :: rest => do
+      let (arg, rest') ← parseExp 0 rest
+      let (moreArgs, rest'') ← parseArgListTail rest'
+      .ok (arg :: moreArgs, rest'')
+  | [] => .error "Expected \")\" or \",\" in argument list but reached end of input"
+  | t :: _ => .error s!"Expected \")\" or \",\" in argument list but found {t.describe}"
 
 /-- Parse an expression using *precedence climbing*.
     `minPrec` is the minimum operator precedence level that this call is
@@ -233,7 +276,7 @@ end
 -- ---------------------------------------------------------------------------
 
 /-- Parse a variable declaration: `int <identifier> [ = <exp> ] ;` -/
-private def parseDeclaration (tokens : List Token) : Except String (Declaration × List Token) := do
+private def parseVarDecl (tokens : List Token) : Except String (Declaration × List Token) := do
   let tokens ← expect .KwInt tokens
   let (name, tokens) ←
     match tokens with
@@ -251,13 +294,13 @@ private def parseDeclaration (tokens : List Token) : Except String (Declaration 
 
 /-- Parse the initial clause of a `for` loop.
     The clause ends with a semicolon (which is consumed).
-    - `int <id> [= <exp>] ;` → `ForInit.InitDecl` (declaration, semicolon consumed by `parseDeclaration`)
+    - `int <id> [= <exp>] ;` → `ForInit.InitDecl` (declaration, semicolon consumed by `parseVarDecl`)
     - `;`                    → `ForInit.InitExp none` (absent expression)
     - `<exp> ;`              → `ForInit.InitExp (some exp)` (expression, then `;`) -/
 private def parseForInit (tokens : List Token) : Except String (ForInit × List Token) :=
   match tokens with
   | .KwInt :: _ => do
-      let (decl, rest) ← parseDeclaration tokens   -- parseDeclaration already consumes ';'
+      let (decl, rest) ← parseVarDecl tokens   -- parseVarDecl already consumes ';'
       .ok (.InitDecl decl, rest)
   | .Semicolon :: rest =>
       .ok (.InitExp none, rest)                     -- absent: just consume ';'
@@ -398,11 +441,35 @@ private partial def parseStatement (tokens : List Token) : Except String (Statem
       let rest'       ← expect .Semicolon rest
       .ok (.Expression exp, rest')
 
-/-- Parse a block item: either a declaration (starts with `int`) or a statement. -/
+/-- Parse a block item: either a variable declaration, a local function declaration,
+    or a statement.
+
+    Chapter 9 disambiguation:
+    - `int <identifier> "(" ...` → local function declaration (parsed without body)
+    - `int <identifier> [= ...]  ;` → variable declaration
+    - anything else → statement
+
+    When we see `int <name> (`, we parse a local function declaration.
+    Local function *definitions* (with `{` body) inside other functions are
+    rejected as a parse error. -/
 private partial def parseBlockItem (tokens : List Token) : Except String (BlockItem × List Token) :=
   match tokens with
+  -- Variable or function declaration: starts with `int`
+  | .KwInt :: .Identifier name :: .OpenParen :: rest => do
+      -- Local function declaration: int name(params);
+      -- Definitions inside functions are rejected below when we see '{' instead of ';'
+      let (params, rest') ← parseParamList rest
+      match rest' with
+      | .Semicolon :: rest'' =>
+          -- Declaration only (no body): valid inside a function
+          .ok (.FD { name, params }, rest'')
+      | .OpenBrace :: _ =>
+          -- Function definition inside a function body is not allowed
+          .error s!"Function definition for '{name}' inside a function is not allowed"
+      | [] => .error "Expected \";\" after local function declaration but reached end of input"
+      | t :: _ => .error s!"Expected \";\" after local function declaration but found {t.describe}"
   | .KwInt :: _ => do
-      let (decl, rest) ← parseDeclaration tokens
+      let (decl, rest) ← parseVarDecl tokens
       .ok (.D decl, rest)
   | _ => do
       let (stmt, rest) ← parseStatement tokens
@@ -418,36 +485,95 @@ private partial def parseBlockItems (tokens : List Token) : Except String (List 
       let (items, rest') ← parseBlockItems rest
       .ok (item :: items, rest')
 
+/-- Parse a parameter list for a function declaration or definition.
+    Precondition: the opening `(` has already been consumed.
+    Grammar: `"void" ")"` (no parameters) | `"int" id { "," "int" id } ")"`.
+    Returns the list of parameter names and the remaining tokens (after `)`). -/
+private partial def parseParamList (tokens : List Token) : Except String (List String × List Token) :=
+  match tokens with
+  | .KwVoid :: .CloseParen :: rest =>
+      -- (void) means no parameters
+      .ok ([], rest)
+  | .CloseParen :: rest =>
+      -- () also means no parameters (some compilers accept this)
+      .ok ([], rest)
+  | _ => do
+      -- Parse first parameter: `int <name>`
+      let (firstName, rest) ← parseOneParam tokens
+      let (moreNames, rest') ← parseParamListTail rest
+      .ok (firstName :: moreNames, rest')
+
+/-- Parse zero or more additional parameters after the first, each `"," "int" id`.
+    Stops when `)` is found and consumes it. No trailing comma allowed. -/
+private partial def parseParamListTail (tokens : List Token) : Except String (List String × List Token) :=
+  match tokens with
+  | .CloseParen :: rest => .ok ([], rest)
+  | .Comma :: rest => do
+      let (name, rest') ← parseOneParam rest
+      let (names, rest'') ← parseParamListTail rest'
+      .ok (name :: names, rest'')
+  | [] => .error "Expected \")\" or \",\" in parameter list but reached end of input"
+  | t :: _ => .error s!"Expected \")\" or \",\" in parameter list but found {t.describe}"
+
+/-- Parse a single parameter: `int <identifier>`.
+    Returns the parameter name and remaining tokens. -/
+private partial def parseOneParam (tokens : List Token) : Except String (String × List Token) := do
+  let tokens' ← expect .KwInt tokens
+  match tokens' with
+  | .Identifier name :: rest => .ok (name, rest)
+  | []                       => .error "Expected parameter name but reached end of input"
+  | t :: _                   => .error s!"Expected parameter name but found {t.describe}"
+
 end
 
 -- ---------------------------------------------------------------------------
--- Function definition and program
+-- Top-level declaration/definition parsing
 -- ---------------------------------------------------------------------------
 
-/-- Parse a function definition: `int <name> ( void ) { <block-item>* }` -/
-private def parseFunctionDef (tokens : List Token) : Except String (FunctionDef × List Token) := do
+/-- Parse a top-level function declaration or definition.
+    Grammar:
+      `int <name> "(" param-list ")" ";"` → `TopLevel.FunDecl`
+      `int <name> "(" param-list ")" "{" body "}"` → `TopLevel.FunDef`
+
+    In Chapter 9, the return type is always `int` and parameters are
+    either `void` (no params) or a comma-separated list of `int` params. -/
+private partial def parseTopLevel (tokens : List Token) : Except String (TopLevel × List Token) := do
   let tokens ← expect .KwInt tokens
   let (name, tokens) ←
     match tokens with
     | .Identifier name :: rest => .ok (name, rest)
     | []                       => .error "Expected function name but reached end of input"
     | t :: _                   => .error s!"Expected function name but found {t.describe}"
-  let tokens ← expect .OpenParen  tokens
-  let tokens ← expect .KwVoid     tokens
-  let tokens ← expect .CloseParen tokens
-  let tokens ← expect .OpenBrace  tokens
-  let (body, tokens) ← parseBlockItems tokens
-  let tokens ← expect .CloseBrace tokens
-  .ok ({ name, body }, tokens)
+  let tokens ← expect .OpenParen tokens
+  let (params, tokens) ← parseParamList tokens
+  -- Decide: declaration (ends with ';') or definition (body follows)
+  match tokens with
+  | .Semicolon :: rest =>
+      -- Declaration only (prototype)
+      .ok (.FunDecl { name, params }, rest)
+  | .OpenBrace :: rest => do
+      -- Full definition with body
+      let (body, rest') ← parseBlockItems rest
+      let rest''        ← expect .CloseBrace rest'
+      .ok (.FunDef { name, params, body }, rest'')
+  | [] => .error s!"Expected open brace or semicolon after function header for '{name}' but reached end of input"
+  | t :: _ => .error s!"Expected open brace or semicolon after function header for '{name}' but found {t.describe}"
 
-/-- Parse a complete program: exactly one top-level function definition with
-    no tokens left over afterwards.
-    After `parseFunctionDef` succeeds, any remaining tokens indicate a syntax
-    error — valid programs end after the closing brace of `main`. -/
+/-- Parse a sequence of top-level items until the token list is exhausted.
+    Each item must begin with `int` (the only supported return/declaration type). -/
+private partial def parseTopLevels (tokens : List Token) : Except String (List TopLevel) :=
+  match tokens with
+  | []   => .ok []
+  | _    => do
+      let (item, rest) ← parseTopLevel tokens
+      let items        ← parseTopLevels rest
+      .ok (item :: items)
+
+/-- Parse a complete program: one or more top-level function declarations
+    or definitions until EOF.
+    Returns an error if tokens remain after the last top-level item. -/
 def parseProgram (tokens : List Token) : Except String Program := do
-  let (func, remaining) ← parseFunctionDef tokens
-  match remaining with
-  | []    => .ok { func }
-  | t :: _ => .error s!"Unexpected token after end of program: {t.describe}"
+  let topLevels ← parseTopLevels tokens
+  .ok { topLevels }
 
 end Parser

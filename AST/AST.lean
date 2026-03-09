@@ -1,12 +1,14 @@
 namespace AST
 
 /-
-  Abstract Syntax Tree for Chapter 7.
+  Abstract Syntax Tree for Chapter 9.
 
   ASDL definition:
-    program            = Program(function_definition)
-    function_definition = Function(identifier name, block_item* body)
-    block_item         = S(statement) | D(declaration)
+    program            = Program(top_level*)
+    top_level          = FunDef(function_def) | FunDecl(function_decl)
+    function_def       = Function(identifier name, identifier* params, block_item* body)
+    function_decl      = FunctionDecl(identifier name, identifier* params)
+    block_item         = S(statement) | D(declaration) | FD(function_decl)
     declaration        = Declaration(identifier name, exp? init)
     statement          = Return(exp)
                        | Expression(exp)
@@ -34,6 +36,7 @@ namespace AST
                        | Conditional(exp condition, exp, exp)
                        | PostfixIncr(exp)        -- extra credit: e++
                        | PostfixDecr(exp)        -- extra credit: e--
+                       | FunCall(identifier, exp*)  -- Chapter 9: function call
     unary_operator     = Complement | Negate | Not
     binary_operator    = Add | Subtract | Multiply | Divide | Remainder
                        | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight
@@ -80,6 +83,8 @@ inductive BinaryOp where
   | GreaterOrEqual : BinaryOp -- >=
   deriving Repr, BEq
 
+/-- Expressions in the C subset.
+    `FunCall` is new in Chapter 9: a function call `foo(a, b, c)`. -/
 inductive Exp where
   | Constant    : Int → Exp
   | Var         : String → Exp              -- variable reference
@@ -89,6 +94,7 @@ inductive Exp where
   | Conditional : Exp → Exp → Exp → Exp    -- cond ? e1 : e2
   | PostfixIncr : Exp → Exp                 -- extra credit: e++
   | PostfixDecr : Exp → Exp                 -- extra credit: e--
+  | FunCall     : String → List Exp → Exp   -- Chapter 9: foo(a, b, c)
   deriving Repr, BEq
 
 /-- A variable declaration with an optional initializer expression. -/
@@ -148,23 +154,44 @@ inductive Statement where
   | Goto     : String → Statement              -- "goto label;"
   | Null     : Statement                       -- null statement: ";"
 
-/-- A block item is either a statement or a declaration. -/
+/-- A block item is a statement, a variable declaration, or (Chapter 9) a
+    local function declaration (no body allowed inside a function). -/
 inductive BlockItem where
-  | S : Statement   → BlockItem
-  | D : Declaration → BlockItem
+  | S  : Statement    → BlockItem  -- statement
+  | D  : Declaration  → BlockItem  -- variable declaration
+  | FD : FunctionDecl → BlockItem  -- local function declaration (Chapter 9)
+
+/-- A local function declaration — name and parameters only, no body.
+    Used as block items inside function bodies (Chapter 9). -/
+structure FunctionDecl where
+  name   : String        -- function name
+  params : List String   -- parameter names (for arity checking)
 
 end
 
 deriving instance Repr for Statement
 deriving instance Repr for BlockItem
+deriving instance Repr for FunctionDecl
 
+/-- A complete function definition: name, parameter list, and body.
+    Chapter 9 adds `params`; earlier chapters had an implicit `(void)` list. -/
 structure FunctionDef where
-  name : String
-  body : List BlockItem
+  name   : String        -- function name
+  params : List String   -- parameter names (renamed by VarResolution)
+  body   : List BlockItem
   deriving Repr
 
+/-- Top-level item in a translation unit.
+    Chapter 9 allows multiple function definitions and declarations at file scope. -/
+inductive TopLevel where
+  | FunDef  : FunctionDef  → TopLevel   -- function definition (has a body)
+  | FunDecl : FunctionDecl → TopLevel   -- function declaration (prototype only)
+  deriving Repr
+
+/-- A complete C program: a list of top-level declarations and definitions.
+    Chapter 9 replaces the single `FunctionDef` with a list of `TopLevel` items. -/
 structure Program where
-  func : FunctionDef
+  topLevels : List TopLevel
   deriving Repr
 
 end AST

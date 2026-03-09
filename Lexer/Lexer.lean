@@ -105,6 +105,7 @@ private def nextToken (chars : List Char) : Option (Token × List Char) :=
   | '~' :: rest         => some (.Tilde,      rest)
   | '?' :: rest         => some (.Question,   rest)
   | ':' :: rest         => some (.Colon,      rest)
+  | ',' :: rest         => some (.Comma,      rest)
   -- Longest match: multi-char operators before their single-char prefixes.
   -- + family: ++ and += before +
   | '+' :: '+' :: rest  => some (.PlusPlus,         rest)

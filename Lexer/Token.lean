@@ -62,6 +62,8 @@ inductive Token where
   | KwSwitch   : Token   -- switch
   | KwCase     : Token   -- case
   | KwDefault  : Token   -- default
+  -- Chapter 9: comma separator for argument lists and parameter lists
+  | Comma      : Token   -- ,
   deriving Repr, BEq
 
 /-- Human-readable description of a token, used in parser error messages. -/
@@ -122,5 +124,6 @@ def Token.describe : Token → String
   | .KwSwitch   => "\"switch\""
   | .KwCase     => "\"case\""
   | .KwDefault  => "\"default\""
+  | .Comma      => "\",\""
 
 end Lexer

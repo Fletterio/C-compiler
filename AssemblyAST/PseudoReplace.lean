@@ -8,13 +8,19 @@ import AssemblyAST.AssemblyAST
   starting at -4(%rbp) and growing downward: -4, -8, -12, …
   The same identifier always maps to the same slot.
 
-  Returns the rewritten program together with the total number of bytes
-  allocated, which pass 3 (FixUp) uses to emit the AllocateStack instruction.
+  Chapter 9: each function is processed independently, with its own fresh
+  pseudo-to-stack map and its own stack byte count.  The resulting stack size
+  is stored in the `FunctionDef.stackSize` field so that FixUp can use it.
+
+  The new `Push` and `DeallocateStack` instructions are also handled:
+    - `Push(Pseudo(id))` → `Push(Stack(offset))`
+    - `DeallocateStack` has no operands: returned as-is.
+    - `Call` has no operands: returned as-is.
 -/
 
 namespace AssemblyAST
 
-/-- Mutable state threaded through the pseudo-replacement pass.
+/-- Mutable state threaded through the pseudo-replacement pass for ONE function.
     `map` is an association list from pseudoregister name to its assigned stack
     offset.  `maxBytes` tracks the total bytes allocated so far; the next slot
     will be at offset `-(maxBytes + 4)`. -/
@@ -48,7 +54,9 @@ private def replaceOp (s : ReplState) : Operand → ReplState × Operand
 /-- Replace all `Pseudo` operands in a single instruction.
     `Mov` and `Binary` each have two operands, both of which may be pseudos.
     `Unary` and `Idiv` each have one operand.
-    `Ret`, `Cdq`, and `AllocateStack` carry no operands and are returned as-is.
+    `Push` has one operand (new in Chapter 9).
+    `Ret`, `Cdq`, `AllocateStack`, `DeallocateStack`, and `Call` carry no
+    pseudo operands and are returned as-is.
     Returns the updated state together with the rewritten instruction wrapped
     in a list (to keep a uniform return type with other passes that may expand
     one instruction into several). -/
@@ -74,17 +82,16 @@ private def replaceInstr (s : ReplState) : Instruction → ReplState × List Ins
   | .SetCC cc operand =>
       let (s, op') := replaceOp s operand
       (s, [.SetCC cc op'])
-  | instr => (s, [instr])
+  | .Push operand =>
+      -- Chapter 9: Push may have a Pseudo operand; replace it.
+      let (s, op') := replaceOp s operand
+      (s, [.Push op'])
+  | instr => (s, [instr])  -- Ret, Cdq, AllocateStack, DeallocateStack, Call, Jmp, etc.
 
-/-- Entry point for pass 2.
-    Folds `replaceInstr` over the function's instruction list, threading
-    the `ReplState` through so the same pseudoregister always gets the same
-    slot.  Returns the rewritten program and the total bytes allocated
-    (`ReplState.maxBytes`), which is the magnitude of the most-negative stack
-    offset used and is therefore the minimum number of bytes that must be
-    reserved on the stack. -/
-def replacePseudos (p : Program) : Program × Nat :=
-  let f := p.func
+/-- Replace pseudoregisters in a single function definition.
+    Processes the instruction list with a fresh ReplState, then stores the
+    resulting stack size in the FunctionDef.stackSize field. -/
+private def replaceFunctionDef (f : FunctionDef) : FunctionDef :=
   let (finalState, instrs) :=
     f.instructions.foldl
       (fun (acc : ReplState × List Instruction) instr =>
@@ -92,6 +99,13 @@ def replacePseudos (p : Program) : Program × Nat :=
         let (s', new) := replaceInstr s instr
         (s', out ++ new))
       (ReplState.empty, [])
-  ({ p with func := { f with instructions := instrs } }, finalState.maxBytes)
+  { f with instructions := instrs, stackSize := finalState.maxBytes }
+
+/-- Entry point for pass 2.
+    Chapter 9: processes each function independently.
+    Each function gets its own fresh pseudo map and stack byte count.
+    The stack size is stored in `FunctionDef.stackSize` for pass 3 (FixUp). -/
+def replacePseudos (p : Program) : Program :=
+  { p with funcs := p.funcs.map replaceFunctionDef }
 
 end AssemblyAST

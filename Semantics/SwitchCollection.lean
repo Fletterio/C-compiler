@@ -15,6 +15,8 @@ import AST.AST
     4. Attaches the collected `List (Option Int × String)` to the `Switch` node
        so TACKY generation can emit the comparison jump table.
 
+  Chapter 9: updated to process all function definitions in the program.
+
   This pass must run *after* the loop-labeling pass because it depends on
   `Case` and `Default` nodes already having their unique labels filled in.
 -/
@@ -65,6 +67,7 @@ private partial def collectCasesFromStmt : AST.Statement → Except String (List
 private partial def collectCasesFromItem : AST.BlockItem → Except String (List CaseEntry)
   | .S stmt => collectCasesFromStmt stmt
   | .D _    => return []
+  | .FD _   => return []
 
 end
 
@@ -130,12 +133,19 @@ private partial def processSwitchesItem : AST.BlockItem → Except String AST.Bl
 end
 
 /-- Entry point for the switch case collection pass.
-    Traverses the entire program, collecting and validating case lists for
-    every `switch` statement, and attaches the lists to the AST nodes.
+    Chapter 9: traverses ALL function definitions in the program.
+    Collects and validates case lists for every `switch` statement in each
+    function, and attaches the lists to the AST nodes.
     Must be called *after* the loop-labeling pass. -/
 def collectSwitchCases (p : AST.Program) : Except String AST.Program := do
-  let f := p.func
-  let body' ← f.body.mapM processSwitchesItem
-  return { p with func := { f with body := body' } }
+  let topLevels' ← p.topLevels.mapM fun tl =>
+    match tl with
+    | .FunDef fd => do
+        let body' ← fd.body.mapM processSwitchesItem
+        return AST.TopLevel.FunDef { fd with body := body' }
+    | .FunDecl fd =>
+        -- Declarations have no body: skip
+        return AST.TopLevel.FunDecl fd
+  return { p with topLevels := topLevels' }
 
 end Semantics
