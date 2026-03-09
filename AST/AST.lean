@@ -1,21 +1,50 @@
 namespace AST
 
 /-
-  Abstract Syntax Tree for Chapter 4.
+  Abstract Syntax Tree for Chapter 7.
 
   ASDL definition:
     program            = Program(function_definition)
-    function_definition = Function(identifier name, statement body)
+    function_definition = Function(identifier name, block_item* body)
+    block_item         = S(statement) | D(declaration)
+    declaration        = Declaration(identifier name, exp? init)
     statement          = Return(exp)
+                       | Expression(exp)
+                       | If(exp condition, statement then, statement? else)
+                       | Compound(block_item*)               -- Chapter 7: "{ ... }"
+                       | While(exp condition, statement, string? label)     -- Chapter 8
+                       | DoWhile(statement, exp condition, string? label)   -- Chapter 8
+                       | For(for_init, exp? condition, exp? post,           -- Chapter 8
+                               statement, string? label)
+                       | Break(string? label)                               -- Chapter 8
+                       | Continue(string? label)                            -- Chapter 8
+                       | Switch(exp, statement, string? label,              -- Chapter 8 EC
+                                 (int? × string)* cases)
+                       | Case(int, statement, string? label)                -- Chapter 8 EC
+                       | Default(statement, string? label)                  -- Chapter 8 EC
+                       | Labeled(identifier, statement)  -- extra credit ch6: "label: stmt"
+                       | Goto(identifier)               -- extra credit ch6: "goto label;"
+                       | Null
+    for_init           = InitExp(exp?) | InitDecl(declaration)
     exp                = Constant(int)
+                       | Var(identifier)
                        | Unary(unary_operator, exp)
                        | Binary(binary_operator, exp, exp)
+                       | Assignment(exp, exp)
+                       | Conditional(exp condition, exp, exp)
+                       | PostfixIncr(exp)        -- extra credit: e++
+                       | PostfixDecr(exp)        -- extra credit: e--
     unary_operator     = Complement | Negate | Not
     binary_operator    = Add | Subtract | Multiply | Divide | Remainder
                        | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight
                        | And | Or
                        | Equal | NotEqual
                        | LessThan | LessOrEqual | GreaterThan | GreaterOrEqual
+
+  Prefix ++ and -- and compound assignment operators (+=, -=, etc.) are
+  desugared into Assignment nodes during parsing and never appear in the AST.
+  Postfix ++ and -- require preserving the original value and so are kept
+  as distinct AST nodes.
 
   ASDL built-in types map to Lean as:
     identifier  →  String
@@ -52,22 +81,90 @@ inductive BinaryOp where
   deriving Repr, BEq
 
 inductive Exp where
-  | Constant : Int → Exp
-  | Unary    : UnaryOp → Exp → Exp
-  | Binary   : BinaryOp → Exp → Exp → Exp
+  | Constant    : Int → Exp
+  | Var         : String → Exp              -- variable reference
+  | Unary       : UnaryOp → Exp → Exp
+  | Binary      : BinaryOp → Exp → Exp → Exp
+  | Assignment  : Exp → Exp → Exp           -- lvalue = rhs
+  | Conditional : Exp → Exp → Exp → Exp    -- cond ? e1 : e2
+  | PostfixIncr : Exp → Exp                 -- extra credit: e++
+  | PostfixDecr : Exp → Exp                 -- extra credit: e--
   deriving Repr, BEq
 
-inductive Statement where
-  | Return : Exp → Statement
+/-- A variable declaration with an optional initializer expression. -/
+structure Declaration where
+  name : String
+  init : Option Exp
   deriving Repr, BEq
+
+/-- The initial clause of a `for` loop.
+    `InitExp none` represents an absent clause (`for (; ...)`)..
+    `InitExp (some e)` represents an expression clause (`for (e; ...)`).
+    `InitDecl d` represents a variable declaration (`for (int x = 0; ...)`),
+    which introduces `x` into the loop's scope (visible in condition, post,
+    and body, but not outside the loop). -/
+inductive ForInit where
+  | InitExp  : Option Exp → ForInit
+  | InitDecl : Declaration → ForInit
+  deriving Repr
+
+/-
+  `Statement` and `BlockItem` are mutually recursive: `Compound` holds a
+  `List BlockItem`, while each `BlockItem` may contain a `Statement`.
+  Lean 4 requires a `mutual` block for mutually recursive inductives; the
+  `deriving` instances are applied after the block using `deriving instance`.
+-/
+mutual
+
+/-- A statement in the C subset.
+    The `Option String` fields on loop/break/continue/switch/case/default nodes
+    carry an ID label injected by the loop-labeling semantic-analysis pass.
+    After parsing all such fields are `none`; after loop labeling they hold a
+    unique string like `"loop.5"` or `"case.3"`.  TACKY generation uses these
+    IDs to derive the concrete break/continue/jump labels it emits. -/
+inductive Statement where
+  | Return     : Exp → Statement
+  | Expression : Exp → Statement    -- expression statement: "e ;"
+  | If         : Exp → Statement → Option Statement → Statement
+  | Compound   : List BlockItem → Statement  -- Chapter 7: "{ ... }"
+  -- Chapter 8: loops
+  | While    : Exp → Statement → Option String → Statement
+    -- while (cond) body; loop label
+  | DoWhile  : Statement → Exp → Option String → Statement
+    -- do body while (cond); loop label
+  | For      : ForInit → Option Exp → Option Exp → Statement → Option String → Statement
+    -- for (init; cond; post) body; loop label
+  | Break    : Option String → Statement    -- break; loop/switch label
+  | Continue : Option String → Statement    -- continue; loop label
+  -- Chapter 8 extra credit: switch statements
+  | Switch   : Exp → Statement → Option String → List (Option Int × String) → Statement
+    -- switch (exp) body; switch label; collected case entries (val×caseLbl)
+  | Case     : Int → Statement → Option String → Statement
+    -- case n: body; case jump label
+  | Default  : Statement → Option String → Statement
+    -- default: body; default jump label
+  -- Chapter 6 extra credit: labeled statements and goto
+  | Labeled  : String → Statement → Statement  -- "label: stmt"
+  | Goto     : String → Statement              -- "goto label;"
+  | Null     : Statement                       -- null statement: ";"
+
+/-- A block item is either a statement or a declaration. -/
+inductive BlockItem where
+  | S : Statement   → BlockItem
+  | D : Declaration → BlockItem
+
+end
+
+deriving instance Repr for Statement
+deriving instance Repr for BlockItem
 
 structure FunctionDef where
   name : String
-  body : Statement
-  deriving Repr, BEq
+  body : List BlockItem
+  deriving Repr
 
 structure Program where
   func : FunctionDef
-  deriving Repr, BEq
+  deriving Repr
 
 end AST

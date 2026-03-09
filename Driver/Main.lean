@@ -15,6 +15,7 @@ structure Args where
     Recognised flags and their corresponding pipeline stages:
       --lex      → Stage.Lex
       --parse    → Stage.Parse
+      --validate → Stage.Validate
       --tacky    → Stage.Tacky
       --codegen  → Stage.Codegen
       -S         → Stage.EmitAssembly
@@ -27,9 +28,10 @@ def parseArgs (args : List String) : Except String Args := do
   let mut stage : Driver.Stage := .Full
   for arg in args do
     match arg with
-    | "--lex"     => stage := .Lex
-    | "--parse"   => stage := .Parse
-    | "--tacky"   => stage := .Tacky
+    | "--lex"      => stage := .Lex
+    | "--parse"    => stage := .Parse
+    | "--validate" => stage := .Validate
+    | "--tacky"    => stage := .Tacky
     | "--codegen" => stage := .Codegen
     | "-S"        => stage := .EmitAssembly
     | _ =>

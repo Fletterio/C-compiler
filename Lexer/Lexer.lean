@@ -64,7 +64,18 @@ private def classifyWord (word : String) : Token :=
   | "int"    => .KwInt
   | "void"   => .KwVoid
   | "return" => .KwReturn
-  | _        => .Identifier word
+  | "if"       => .KwIf
+  | "else"     => .KwElse
+  | "goto"     => .KwGoto
+  | "while"    => .KwWhile
+  | "do"       => .KwDo
+  | "for"      => .KwFor
+  | "break"    => .KwBreak
+  | "continue" => .KwContinue
+  | "switch"   => .KwSwitch
+  | "case"     => .KwCase
+  | "default"  => .KwDefault
+  | _          => .Identifier word
 
 -- ---------------------------------------------------------------------------
 -- Single-token matcher
@@ -92,33 +103,52 @@ private def nextToken (chars : List Char) : Option (Token × List Char) :=
   | '}' :: rest         => some (.CloseBrace, rest)
   | ';' :: rest         => some (.Semicolon,  rest)
   | '~' :: rest         => some (.Tilde,      rest)
-  | '+' :: rest         => some (.Plus,            rest)
-  | '*' :: rest         => some (.Star,            rest)
-  | '/' :: rest         => some (.Slash,           rest)
-  | '%' :: rest         => some (.Percent,         rest)
-  | '^' :: rest         => some (.Caret,           rest)
-  -- Longest match: two-char operators before their single-char prefixes.
-  -- & family: && before &
-  | '&' :: '&' :: rest  => some (.AmpAmp,          rest)
+  | '?' :: rest         => some (.Question,   rest)
+  | ':' :: rest         => some (.Colon,      rest)
+  -- Longest match: multi-char operators before their single-char prefixes.
+  -- + family: ++ and += before +
+  | '+' :: '+' :: rest  => some (.PlusPlus,         rest)
+  | '+' :: '=' :: rest  => some (.PlusEqual,        rest)
+  | '+' :: rest         => some (.Plus,             rest)
+  -- * family: *= before *
+  | '*' :: '=' :: rest  => some (.StarEqual,        rest)
+  | '*' :: rest         => some (.Star,             rest)
+  -- / family: /= before /
+  | '/' :: '=' :: rest  => some (.SlashEqual,       rest)
+  | '/' :: rest         => some (.Slash,            rest)
+  -- % family: %= before %
+  | '%' :: '=' :: rest  => some (.PercentEqual,     rest)
+  | '%' :: rest         => some (.Percent,          rest)
+  -- ^ family: ^= before ^
+  | '^' :: '=' :: rest  => some (.CaretEqual,       rest)
+  | '^' :: rest         => some (.Caret,            rest)
+  -- & family: && before &= before &
+  | '&' :: '&' :: rest  => some (.AmpAmp,           rest)
+  | '&' :: '=' :: rest  => some (.AmpEqual,         rest)
   | '&' :: rest         => some (.Ampersand,        rest)
-  -- | family: || before |
+  -- | family: || before |= before |
   | '|' :: '|' :: rest  => some (.PipePipe,         rest)
+  | '|' :: '=' :: rest  => some (.PipeEqual,        rest)
   | '|' :: rest         => some (.Pipe,             rest)
   -- ! family: != before !
   | '!' :: '=' :: rest  => some (.BangEqual,        rest)
   | '!' :: rest         => some (.Bang,             rest)
-  -- = family: == (no single = in this language yet)
+  -- = family: == before =
   | '=' :: '=' :: rest  => some (.EqualEqual,       rest)
-  -- < family: <= and << before <
-  | '<' :: '=' :: rest  => some (.LessEqual,        rest)
+  | '=' :: rest         => some (.Equal,            rest)
+  -- < family: <<= before << before <= before <
+  | '<' :: '<' :: '=' :: rest => some (.LessLessEqual,      rest)
   | '<' :: '<' :: rest  => some (.LessLess,         rest)
+  | '<' :: '=' :: rest  => some (.LessEqual,        rest)
   | '<' :: rest         => some (.Less,             rest)
-  -- > family: >= and >> before >
-  | '>' :: '=' :: rest  => some (.GreaterEqual,     rest)
+  -- > family: >>= before >> before >= before >
+  | '>' :: '>' :: '=' :: rest => some (.GreaterGreaterEqual, rest)
   | '>' :: '>' :: rest  => some (.GreaterGreater,   rest)
+  | '>' :: '=' :: rest  => some (.GreaterEqual,     rest)
   | '>' :: rest         => some (.Greater,          rest)
-  -- - family: -- before -
+  -- - family: -- before -= before -
   | '-' :: '-' :: rest  => some (.MinusMinus,       rest)
+  | '-' :: '=' :: rest  => some (.MinusEqual,       rest)
   | '-' :: rest         => some (.Minus,            rest)
   -- Identifier/keyword and integer constant require predicate checks,
   -- so a catch-all arm with if/else handles them.

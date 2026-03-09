@@ -1,5 +1,9 @@
 import Lexer.Lexer
 import Parser.Parser
+import Semantics.VarResolution
+import Semantics.LoopLabeling
+import Semantics.SwitchCollection
+import Semantics.LabelResolution
 import Tacky.TackyGen
 import AssemblyAST.CodeGen
 import AssemblyAST.PseudoReplace
@@ -15,6 +19,7 @@ namespace Driver
 inductive Stage where
   | Lex           -- run only the lexer (--lex)
   | Parse         -- run lexer and parser (--parse)
+  | Validate      -- run through semantic analysis (--validate)
   | Tacky         -- run through TACKY generation (--tacky)
   | Codegen       -- run through assembly generation (--codegen)
   | EmitAssembly  -- compile to assembly but do not assemble or link (-S)
@@ -88,14 +93,15 @@ def preprocess (inputPath : String) : IO String := do
     write an assembly file return `some assemblyPath`.
 
     Pipeline order:
-      1. Lex   — tokenize the source
-      2. Parse — build the AST
-      3. TACKY — flatten nested expressions into three-address code
-      4. Codegen (3 passes):
+      1. Lex      — tokenize the source
+      2. Parse    — build the AST
+      3. Validate — variable resolution (rename locals, reject invalid programs)
+      4. TACKY    — flatten nested expressions into three-address code
+      5. Codegen (3 passes):
            a. TACKY → Assembly AST (with pseudoregisters)
            b. Replace pseudoregisters with stack slots
            c. Insert AllocateStack; fix mem-to-mem Mov instructions
-      5. Emit  — serialise the assembly AST to AT&T-syntax text -/
+      6. Emit     — serialise the assembly AST to AT&T-syntax text -/
 def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := do
   let contents ← IO.FS.readFile preprocessedPath
   -- Lex
@@ -110,8 +116,30 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
     | .ok ast   => pure ast
     | .error msg => throw (IO.userError s!"Parse error: {msg}")
   if stage == .Parse then return none
+  -- Variable resolution: rename locals, reject undeclared/duplicate variables
+  let (resolvedAst, initCounter) ←
+    match Semantics.resolveProgram ast with
+    | .ok r      => pure r
+    | .error msg => throw (IO.userError s!"Semantic error: {msg}")
+  -- Loop labeling: annotate loops/switch/break/continue with unique IDs;
+  -- rejects break/continue outside of loops (or switch for break)
+  let resolvedAst ←
+    match Semantics.labelLoops resolvedAst with
+    | .ok p      => pure p
+    | .error msg => throw (IO.userError s!"Semantic error: {msg}")
+  -- Switch case collection (extra credit): collect and validate case/default
+  -- labels for each switch statement and attach them to the Switch AST node
+  let resolvedAst ←
+    match Semantics.collectSwitchCases resolvedAst with
+    | .ok p      => pure p
+    | .error msg => throw (IO.userError s!"Semantic error: {msg}")
+  if stage == .Validate then return none
+  -- Label resolution (extra credit ch6): validates goto targets and duplicate labels
+  match Semantics.resolveLabels resolvedAst with
+  | .ok ()     => pure ()
+  | .error msg => throw (IO.userError s!"Semantic error: {msg}")
   -- TACKY generation
-  let tacky := Tacky.emitProgram ast
+  let tacky := Tacky.emitProgram resolvedAst initCounter
   if stage == .Tacky then return none
   -- Assembly generation pass 1: TACKY → Assembly (with pseudoregisters)
   let asmAst := AssemblyAST.genProgram tacky
