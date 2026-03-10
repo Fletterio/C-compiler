@@ -116,5 +116,6 @@ def resolveLabels (p : AST.Program) : Except String Unit := do
     match tl with
     | .FunDef fd  => resolveFunctionLabels fd.body
     | .FunDecl _  => pure ()   -- declarations have no body to check
+    | .VarDecl _  => pure ()   -- Chapter 10: file-scope variables have no body
 
 end Semantics

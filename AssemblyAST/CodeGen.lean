@@ -4,7 +4,7 @@ import AssemblyAST.AssemblyAST
 /-
   Pass 1 of assembly generation: converts Tacky.Program → AssemblyAST.Program.
   Temporary variables are kept as Pseudo operands; they are replaced with
-  concrete stack locations in pass 2 (PseudoReplace).
+  concrete locations in pass 2 (PseudoReplace).
 
   Chapter 9 additions:
     - Parameter-copy instructions are emitted at function entry.
@@ -18,12 +18,23 @@ import AssemblyAST.AssemblyAST
         5. DeallocateStack to reclaim arg space.
         6. Move AX to destination.
 
-  Conversion tables (Tables 3-3 through 3-6, updated):
+  Chapter 10 additions:
+    - Program structure changes from a flat list of FunctionDef to a list of
+      AsmTopLevel items that may be Function or StaticVariable.
+    - TACKY StaticVariable top-level items are passed through to assembly
+      StaticVariable items unchanged (name, global, init).
+    - The `global` field on TACKY FunctionDef is forwarded to the assembly
+      FunctionDef.
+    - TACKY Var operands still convert to Pseudo operands here; PseudoReplace
+      (pass 2) resolves them to either Stack or Data operands.
 
-    TACKY top-level         Assembly top-level
-    ─────────────────────────────────────────────────────
-    Program(funcs)           Program(funcs)
-    Function(name,params,body)  Function(name,params,instructions,stackSize=0)
+  Conversion tables:
+
+    TACKY top-level              Assembly top-level
+    ─────────────────────────────────────────────────────────────────
+    Program(top_levels)          Program(top_levels)
+    Function(fd)                 AsmTopLevel.Function(fd')
+    StaticVariable(n, g, i)      AsmTopLevel.StaticVariable(n, g, i)
 
     TACKY instruction              Assembly instructions
     ──────────────────────────────────────────────────────────────
@@ -92,7 +103,8 @@ private def relCondCode : Tacky.BinaryOp → Option CondCode
 /-- Map a TACKY value to an assembly operand.
     `Constant(n)` becomes an immediate `Imm(n)`.
     `Var(id)` becomes a `Pseudo(id)` pseudoregister, which pass 2 will later
-    replace with a concrete `Stack` address. -/
+    replace with a concrete `Stack` address (for locals/temps) or `Data`
+    address (for static variables). -/
 private def convertVal : Tacky.Val → Operand
   | .Constant n => .Imm n
   | .Var id     => .Pseudo id
@@ -119,15 +131,11 @@ private def emitParamCopies (params : List String) : List Instruction :=
     let dst := Operand.Pseudo paramName
     if i < 6 then
       -- Register argument: copy from the appropriate arg register
-      -- argRegs has 6 elements; i < 6 is guaranteed by the outer if condition.
-      -- Use array indexing for O(1) access.
       let argRegsArr : Array Reg := #[.DI, .SI, .DX, .CX, .R8, .R9]
       let reg := argRegsArr.getD i .DI
       .Mov (.Reg reg) dst
     else
       -- Stack argument: callers push extras at 16(%rbp), 24(%rbp), etc.
-      -- The layout is: return address at 8(%rbp), saved RBP at 0(%rbp),
-      -- so the first stack argument is at 16(%rbp), second at 24(%rbp), etc.
       let stackOffset : Int := ((i - 6 + 2) * 8 : Nat)
       .Mov (.Stack stackOffset) dst
 
@@ -142,10 +150,8 @@ private def emitParamCopies (params : List String) : List Instruction :=
       6. Emit Mov(AX, dst) to retrieve the return value.
 
     Note: for stack arguments that are already Reg or Imm operands, we can
-    push them directly.  For memory (Stack) operands, we must load into AX
-    first (x86 does not allow `pushq mem` in general; more importantly, the
-    calling convention requires the pushed value to be the full 8-byte word,
-    whereas our values are 32-bit and would need zero/sign extension). -/
+    push them directly.  For memory (Stack/Data) operands, we must load into AX
+    first (x86 does not allow direct push of arbitrary memory in general). -/
 private def convertFunCall (name : String) (args : List Tacky.Val) (dst : Tacky.Val)
     : List Instruction :=
   let argOps    := args.map convertVal
@@ -153,7 +159,6 @@ private def convertFunCall (name : String) (args : List Tacky.Val) (dst : Tacky.
   let regArgs   := (argOps.zip argRegs).take 6   -- pairs (operand, reg)
   let stackArgs := if argOps.length <= 6 then [] else argOps.drop 6
   -- Padding: if stack arg count is odd, add 8 bytes so RSP stays 16-byte aligned.
-  -- (After function prologue, RSP is 16-byte aligned; each push decrements by 8.)
   let stackPad  : Int := if stackArgs.length % 2 == 1 then 8 else 0
   let padInstrs : List Instruction :=
     if stackPad != 0 then [.AllocateStack stackPad] else []
@@ -161,8 +166,6 @@ private def convertFunCall (name : String) (args : List Tacky.Val) (dst : Tacky.
   let regInstrs : List Instruction :=
     regArgs.map fun (op, reg) => .Mov op (.Reg reg)
   -- Push stack arguments in reverse order (last arg pushed first)
-  -- If the operand is already a register or immediate, push directly.
-  -- If it's a stack/pseudo memory operand, copy to AX first, then push.
   let pushInstrs : List Instruction :=
     stackArgs.reverse.foldl (fun acc op =>
       match op with
@@ -229,7 +232,6 @@ private def convertInstruction : Tacky.Instruction → List Instruction
        .Mov (.Reg .DX) (convertVal dst)]
   | .Binary .ShiftLeft src1 src2 dst =>
       -- x64 shift instructions require the count in %cl or as an immediate.
-      -- We always route through CX: move the count into ECX, then shift using %cl.
       [.Mov (convertVal src1) (convertVal dst),
        .Mov (convertVal src2) (.Reg .CX),
        .Binary .Sal (.Reg .CX) (convertVal dst)]
@@ -241,17 +243,14 @@ private def convertInstruction : Tacky.Instruction → List Instruction
       match relCondCode op with
       | some cc =>
           -- cmpl src2, src1 computes src1−src2 and sets RFLAGS.
-          -- Zero dst first (set<cc> only writes one byte), then write result.
           [.Cmp (convertVal src2) (convertVal src1),
            .Mov (.Imm 0) (convertVal dst),
            .SetCC cc (convertVal dst)]
       | none =>
           [.Mov (convertVal src1) (convertVal dst),
            .Binary (convertBinop op) (convertVal src2) (convertVal dst)]
-  -- Copy is a direct value transfer: lower to Mov.
   | .Copy src dst =>
       [.Mov (convertVal src) (convertVal dst)]
-  -- Control flow: lower directly to assembly equivalents.
   | .Jump target =>
       [.Jmp target]
   | .JumpIfZero cond target =>
@@ -260,29 +259,35 @@ private def convertInstruction : Tacky.Instruction → List Instruction
       [.Cmp (.Imm 0) (convertVal cond), .JmpCC .NE target]
   | .Label name =>
       [.Label name]
-  -- Chapter 9: function call
   | .FunCall name args dst =>
       convertFunCall name args dst
 
-/-- Convert a TACKY function body to an assembly function definition.
+/-- Convert a TACKY function definition to an assembly function definition.
+    Chapter 10: the `global` flag is forwarded from the TACKY FunctionDef.
     Emits parameter-copy instructions at the top (before the body), then
     expands each TACKY instruction into assembly instructions.
     The `stackSize` field is initialized to 0; PseudoReplace will fill it in. -/
 private def convertFunctionDef (f : Tacky.FunctionDef) : FunctionDef :=
-  -- Parameter copies: move from calling-convention locations to pseudo variables
   let paramCopies := emitParamCopies f.params
-  -- Body: expand each TACKY instruction
   let bodyInstrs := f.body.foldl (fun acc i => acc ++ convertInstruction i) []
   { name         := f.name,
+    global       := f.global,   -- Chapter 10: forward linkage flag
     params       := f.params,
     instructions := paramCopies ++ bodyInstrs,
     stackSize    := 0 }
 
 /-- Entry point for pass 1.
-    Converts a complete TACKY program to an assembly program with
-    pseudoregister operands still present.
-    Chapter 9: processes all function definitions in the program. -/
+    Chapter 10: converts a complete TACKY program (which may contain both
+    function definitions and static variable definitions) to an assembly program.
+    - TACKY `Function(fd)` → `AsmTopLevel.Function(convertFunctionDef fd)`
+    - TACKY `StaticVariable(n, g, i)` → `AsmTopLevel.StaticVariable(n, g, i)`
+      (passed through unchanged; emitter will generate the appropriate
+      `.data`/`.bss` directives). -/
 def genProgram (p : Tacky.Program) : Program :=
-  { funcs := p.funcs.map convertFunctionDef }
+  let topLevels := p.topLevels.map fun tl =>
+    match tl with
+    | .Function fd           => AsmTopLevel.Function (convertFunctionDef fd)
+    | .StaticVariable n g i  => AsmTopLevel.StaticVariable n g i
+  { topLevels }
 
 end AssemblyAST

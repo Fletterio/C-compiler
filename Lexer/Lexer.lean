@@ -75,6 +75,8 @@ private def classifyWord (word : String) : Token :=
   | "switch"   => .KwSwitch
   | "case"     => .KwCase
   | "default"  => .KwDefault
+  | "static"   => .KwStatic   -- Chapter 10: storage-class specifier
+  | "extern"   => .KwExtern   -- Chapter 10: storage-class specifier
   | _          => .Identifier word
 
 -- ---------------------------------------------------------------------------

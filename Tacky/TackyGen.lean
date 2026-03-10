@@ -1,28 +1,27 @@
 import AST.AST
 import Tacky.Tacky
+import Semantics.SymbolTable
 
 /-
   IR generation pass: converts AST.Program → Tacky.Program.
 
-  Each AST expression is flattened into a sequence of TACKY instructions
-  that leave the result in a fresh temporary variable (or a named variable
-  for Var nodes).  Constants are passed through directly without generating
-  any instructions.
+  Chapter 10 additions:
+    - Takes a `SymbolTable` as an additional parameter.
+    - For each function definition in the AST, emits a TACKY `Function` with
+      the `global` flag derived from the symbol table.
+    - After processing all AST function definitions, scans the symbol table and
+      generates `StaticVariable` top-level items:
+        - `Static(Initial(n), global)` → `StaticVariable(name, global, n)`
+        - `Static(Tentative, global)`  → `StaticVariable(name, global, 0)`
+        - `Static(NoInitializer, _)`   → skip (extern, not defined here)
+        - `FunAttr(_, _)`              → skip (function, not a variable)
+        - `Local`                      → skip (automatic variable, on the stack)
+    - Local static variables (renamed to `<orig>.<n>`) appear in the symbol
+      table under their renamed names and are emitted as non-global static vars.
+    - File-scope static variables appear under their original names.
 
-  Chapter 9: handles `FunCall` expressions and multiple function definitions.
-  The TACKY program contains only FunctionDef entries; FunDecl top-level items
-  are skipped (they carry no code).
-
-  A single `Nat` counter is shared by `makeTemporary` and `makeLabel` to
-  guarantee that every generated name is unique within the function.
-  The initial counter value is supplied by the caller so that it does not
-  overlap with the names produced by the variable resolution pass.
-  Temporary variables are named "tmp.N" and labels are named "<base>.N",
-  where N is the current counter value.  Periods are not valid in C
-  identifiers, so these names cannot clash with any user-defined identifier.
-
-  The counter is GLOBAL across all functions: it is threaded from one function
-  to the next so that no two functions produce the same temporary name.
+  The counter is GLOBAL across all functions (same as before), ensuring that
+  every generated temporary and label name is unique program-wide.
 -/
 
 namespace Tacky
@@ -78,6 +77,8 @@ private def convertBinop : AST.BinaryOp → BinaryOp
 
     - `Constant(n)`: no instructions; value is `Tacky.Val.Constant n`.
     - `Var(v)`: no instructions; value is `Tacky.Val.Var v` directly.
+      (v is already renamed — static vars use their unique name, which
+       PseudoReplace will map to a Data/RIP-relative operand.)
     - `Unary(op, inner)`: flatten `inner`, allocate a temporary, emit `Unary`.
     - `Binary(And, e1, e2)`: short-circuit logical AND via `JumpIfZero`.
     - `Binary(Or, e1, e2)`: short-circuit logical OR via `JumpIfNotZero`.
@@ -168,20 +169,19 @@ private def emitExp : AST.Exp → GenM (Val × List Instruction)
          .Binary .Subtract (.Var v) (.Constant 1) (.Var v)])
   | .PostfixDecr _ => return (.Constant 0, [])   -- unreachable after var resolution
   | .FunCall name args => do
-      -- Flatten each argument expression into instructions + values
       let argResults ← args.mapM emitExp
-      -- Collect all argument instructions (in order)
       let argInstrs := argResults.foldl (fun acc (_, instrs) => acc ++ instrs) []
       let argVals   := argResults.map (fun (v, _) => v)
-      -- Allocate a fresh temporary for the return value
       let dst := Val.Var (← makeTemporary)
-      -- Emit all arg instructions, then the call, result in dst
       return (dst, argInstrs ++ [.FunCall name argVals dst])
 
 /-- Translate a `for`-loop initial clause into TACKY instructions.
     A declaration initializer emits the expression and a `Copy` into the
     renamed variable.  An expression clause emits the expression and discards
-    its result.  An absent clause emits nothing. -/
+    its result.  An absent clause emits nothing.
+
+    Chapter 10: local-static declarations have no initializer in the AST body
+    (the init was removed by VarResolution); `InitDecl` with `none` init → empty. -/
 private def emitForInit : AST.ForInit → GenM (List Instruction)
   | .InitExp none   => return []
   | .InitExp (some e) => do
@@ -196,35 +196,19 @@ private def emitForInit : AST.ForInit → GenM (List Instruction)
 
 /-
   `emitStatement` and `emitBlockItem` are mutually recursive through the
-  `Compound` constructor: `emitStatement` calls `emitBlockItem` for each item
-  in a compound body, while `emitBlockItem` calls `emitStatement` for
-  statement items.  Both are declared `partial` so Lean does not require a
-  structural termination proof.
+  `Compound` constructor.
 -/
 mutual
 
 /-- Translate an AST statement into a flat list of TACKY instructions.
     `funcName` is the name of the enclosing function, used to make
-    user-defined labels unique across functions (see `Labeled`/`Goto` below).
+    user-defined labels unique across functions.
 
-    Loop lowering (base derived from the annotation ID, e.g. `"loop.5"`):
-      break label    = "brk_loop.5"   continue label = "cnt_loop.5"
-
-    - `While`:   `Label(cnt)` → cond → `JumpIfZero(brk)` → body → `Jump(cnt)` → `Label(brk)`
-    - `DoWhile`: `Label(start)` → body → `Label(cnt)` → cond → `JumpIfNotZero(start)` → `Label(brk)`
-    - `For`:     init → `Label(start)` → cond → body → `Label(cnt)` → post → `Jump(start)` → `Label(brk)`
-    - `Break`/`Continue`: single unconditional `Jump`.
-
-    Switch lowering (annotation ID `"switch.5"`, break label `"brk_switch.5"`):
-      For each case `(some n, lbl)`: compare exp == n and `JumpIfNotZero` to `lbl`.
-      For `(none, lbl)` (default): unconditional `Jump` to `lbl`.
-      If no default: fall through to break label.
-
-    `Case`/`Default`: emit `Label(caseLbl)` then the body.
-    `Labeled`/`Goto` (extra credit ch6): user labels are prefixed with `funcName ++ "."` so
-      that same-named labels in different functions do not conflict in the object file.
-      (The period is not a valid C identifier character, ensuring no clash with
-       user code or system-generated names like "loop.0".) -/
+    Chapter 10: no changes to statement lowering.  Static variables are
+    addressed via `Var(uniqueName)` in expressions; PseudoReplace maps them
+    to `Data` operands instead of `Stack` slots.  Initializers for static
+    local variables are NOT emitted here (they are emitted as `StaticVariable`
+    top-level items in TackyGen instead). -/
 private partial def emitStatement (funcName : String) : AST.Statement → GenM (List Instruction)
   | .Return e => do
       let (v, instrs) ← emitExp e
@@ -250,7 +234,6 @@ private partial def emitStatement (funcName : String) : AST.Statement → GenM (
         return acc ++ (← emitBlockItem funcName item)) []
       return instrs
   -- Chapter 8: while loop
-  -- Label(cnt) → cond → JumpIfZero(brk) → body → Jump(cnt) → Label(brk)
   | .While cond body (some base) => do
       let cntLabel := "cnt_" ++ base
       let brkLabel := "brk_" ++ base
@@ -260,7 +243,6 @@ private partial def emitStatement (funcName : String) : AST.Statement → GenM (
              bodyInstrs ++ [.Jump cntLabel, .Label brkLabel]
   | .While _ _ none => return []   -- unreachable: loop labeling always sets label
   -- Chapter 8: do-while loop
-  -- Label(start) → body → Label(cnt) → cond → JumpIfNotZero(start) → Label(brk)
   | .DoWhile body cond (some base) => do
       let startLabel := "start_" ++ base
       let cntLabel   := "cnt_"   ++ base
@@ -271,8 +253,6 @@ private partial def emitStatement (funcName : String) : AST.Statement → GenM (
              condInstrs ++ [.JumpIfNotZero c startLabel, .Label brkLabel]
   | .DoWhile _ _ none => return []   -- unreachable
   -- Chapter 8: for loop
-  -- init → Label(start) → [cond → JumpIfZero(brk)] → body →
-  -- Label(cnt) → post → Jump(start) → Label(brk)
   | .For init cond post body (some base) => do
       let startLabel := "start_" ++ base
       let cntLabel   := "cnt_"   ++ base
@@ -292,18 +272,15 @@ private partial def emitStatement (funcName : String) : AST.Statement → GenM (
       return initInstrs ++ [.Label startLabel] ++ condInstrs ++ bodyInstrs ++
              [.Label cntLabel] ++ postInstrs ++ [.Jump startLabel, .Label brkLabel]
   | .For _ _ _ _ none => return []   -- unreachable
-  -- Chapter 8: break and continue — annotated with the enclosing loop/switch base
+  -- Chapter 8: break and continue
   | .Break (some base)    => return [.Jump ("brk_" ++ base)]
   | .Break none           => return []   -- unreachable after loop labeling
   | .Continue (some base) => return [.Jump ("cnt_" ++ base)]
   | .Continue none        => return []   -- unreachable after loop labeling
   -- Chapter 8 extra credit: switch statement
-  -- exp → jump table (compare + conditional jumps) → [Jump(brk) if no default] →
-  -- body (which contains Label instructions at Case/Default sites) → Label(brk)
   | .Switch exp body (some base) cases => do
       let brkLabel := "brk_" ++ base
       let (v, expInstrs) ← emitExp exp
-      -- Emit one comparison+jump per case; for default, emit an unconditional jump.
       let jumpTable ← cases.foldlM (fun acc (caseVal, caseLbl) => do
           match caseVal with
           | some n => do
@@ -311,37 +288,34 @@ private partial def emitStatement (funcName : String) : AST.Statement → GenM (
               pure (acc ++ [.Binary .Equal v (.Constant n) tmp,
                             .JumpIfNotZero tmp caseLbl])
           | none => pure (acc ++ [.Jump caseLbl])) []
-      -- If there is no default clause, fall through to the break label.
       let noDefault  := cases.all (fun (v, _) => v.isSome)
       let fallThrough := if noDefault then [Instruction.Jump brkLabel] else []
       let bodyInstrs ← emitStatement funcName body
       return expInstrs ++ jumpTable ++ fallThrough ++ bodyInstrs ++ [.Label brkLabel]
   | .Switch _ _ none _ => return []   -- unreachable
-  -- Chapter 8 extra credit: case and default — emit jump target label then body
+  -- Chapter 8 extra credit: case and default
   | .Case _ body (some lbl) => do
       return [.Label lbl] ++ (← emitStatement funcName body)
   | .Case _ _ none => return []   -- unreachable
   | .Default body (some lbl) => do
       return [.Label lbl] ++ (← emitStatement funcName body)
   | .Default _ none => return []   -- unreachable
-  -- Chapter 6 extra credit: labeled statement.
-  -- Prefix the user label with funcName so same-named labels in different functions
-  -- don't collide in the assembled object file (e.g. "foo.end" vs "bar.end").
+  -- Chapter 6 extra credit: labeled statement and goto
   | .Labeled label stmt => do
       let stmtInstrs ← emitStatement funcName stmt
       return [.Label (funcName ++ "." ++ label)] ++ stmtInstrs
-  -- Chapter 6 extra credit: goto — jump to the same prefixed label.
   | .Goto label =>
       return [.Jump (funcName ++ "." ++ label)]
   | .Null => return []
 
 /-- Translate a single block item into a list of TACKY instructions.
-    `funcName` is threaded through to `emitStatement` for user-label prefixing.
-    Declarations with no initializer produce no instructions.
-    Declarations with an initializer emit the initializer expression and
-    a `Copy` to store the result in the variable.
-    Local function declarations (FD) produce no instructions at all — they
-    are only needed for semantic validation, not code generation. -/
+
+    Chapter 10: local static variables (`static int x = n`) have their
+    initializer removed by VarResolution (replaced with `none`).  So
+    `InitDecl { init := none }` for a static var produces no instructions here
+    — the variable is initialized via its `StaticVariable` top-level entry.
+    The variable is still referenced by name in expressions; PseudoReplace
+    will map the name to a `Data` operand. -/
 private partial def emitBlockItem (funcName : String) : AST.BlockItem → GenM (List Instruction)
   | .S stmt => emitStatement funcName stmt
   | .D decl =>
@@ -357,37 +331,63 @@ private partial def emitBlockItem (funcName : String) : AST.BlockItem → GenM (
 end
 
 /-- Translate an AST function definition to TACKY.
-    Processes all block items in order and appends a final
-    `Return(Constant(0))` so that functions without an explicit return
-    statement return 0 (correct for `main`) and cleanly restore the caller's
-    stack frame for other functions.
-    Chapter 9: preserves the renamed parameter list so CodeGen can emit
-    parameter-copy instructions at function entry. -/
-private def emitFunctionDef (f : AST.FunctionDef) : GenM FunctionDef := do
-  -- Pass f.name to emitBlockItem so user-defined labels (Labeled/Goto) are
-  -- prefixed with the function name, preventing conflicts across functions.
+    Chapter 10: the `global` flag is taken from the symbol table (passed in
+    from the caller).  This flag controls whether the function's symbol is
+    exported (`.globl` directive in the emitter). -/
+private def emitFunctionDef (f : AST.FunctionDef) (isGlobal : Bool) : GenM FunctionDef := do
   let body ← f.body.foldlM (fun acc item => do
     return acc ++ (← emitBlockItem f.name item)) []
-  return { name := f.name, params := f.params, body := body ++ [.Return (.Constant 0)] }
+  return { name := f.name, params := f.params,
+           body := body ++ [.Return (.Constant 0)],
+           global := isGlobal }
+
+/-- Scan the symbol table and collect all static variable entries as
+    `TackyTopLevel.StaticVariable` items.
+
+    Rules:
+      - `Static(Initial(n), global)` → `StaticVariable(name, global, n)`
+      - `Static(Tentative, global)`  → `StaticVariable(name, global, 0)`
+      - `Static(NoInitializer, _)`   → skip (extern ref, no storage in this TU)
+      - `FunAttr(_, _)`              → skip (function entry)
+      - `Local`                      → skip (automatic variable, on the stack) -/
+private def emitStaticVars (symTable : Semantics.SymbolTable) : List TackyTopLevel :=
+  symTable.filterMap fun (name, entry) =>
+    match entry.attrs with
+    | .Static (.Initial n) isGlobal  => some (.StaticVariable name isGlobal n)
+    | .Static .Tentative   isGlobal  => some (.StaticVariable name isGlobal 0)
+    | .Static .NoInitializer _       => none   -- extern, not defined here
+    | .FunAttr _ _                   => none   -- function entry
+    | .Local                         => none   -- automatic variable
 
 /-- Entry point for the IR generation pass.
-    Chapter 9: processes all top-level items; only FunDef entries produce TACKY
-    FunctionDef nodes.  FunDecl entries are silently skipped.
-    The counter is GLOBAL across all functions — each function picks up where
-    the previous one left off, so no two functions produce the same tmp.N name.
-    `initCounter` should be the final counter value from variable resolution. -/
-def emitProgram (p : AST.Program) (initCounter : Nat := 0) : Program :=
-  -- Collect only the FunDef top-levels (skip declarations)
+    Chapter 10:
+      - Takes a `SymbolTable` to determine function linkage (`global` flag) and
+        to generate `StaticVariable` top-level items.
+      - Processes all `FunDef` top-level items.
+      - Skips `FunDecl` and `VarDecl` entries (no code to generate).
+      - After emitting functions, scans the symbol table to emit static vars.
+    The counter is GLOBAL across all functions. -/
+def emitProgram (p : AST.Program) (symTable : Semantics.SymbolTable)
+    (initCounter : Nat := 0) : Program :=
+  -- Collect only the FunDef top-levels (skip FunDecl and VarDecl)
   let astFuncs := p.topLevels.filterMap fun tl =>
     match tl with
     | .FunDef fd  => some fd
     | .FunDecl _  => none
+    | .VarDecl _  => none
   -- Emit each function sequentially, threading the counter through
-  let action : GenM (List FunctionDef) :=
+  let action : GenM (List TackyTopLevel) :=
     astFuncs.foldlM (fun acc fd => do
-      let tackyFd ← emitFunctionDef fd
-      return acc ++ [tackyFd]) []
-  let (funcs, _) := action.run initCounter
-  { funcs }
+      -- Determine global flag from symbol table
+      let isGlobal : Bool := match Semantics.lookupSym symTable fd.name with
+        | some { attrs := .FunAttr _ g, .. } => g
+        | _ => true  -- default to global if not found (shouldn't happen)
+      let tackyFd ← emitFunctionDef fd isGlobal
+      return acc ++ [.Function tackyFd]) []
+  let (funcItems, _) := action.run initCounter
+  -- Append StaticVariable items from the symbol table
+  let staticItems := emitStaticVars symTable
+  -- Functions first, then static variables (order matters for readability)
+  { topLevels := funcItems ++ staticItems }
 
 end Tacky

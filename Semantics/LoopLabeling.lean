@@ -169,8 +169,11 @@ def labelLoops (p : AST.Program) : Except String AST.Program := do
       | .FunDecl fd =>
           -- Declarations have no body: skip them
           return .FunDecl fd
+      | .VarDecl vd =>
+          -- Chapter 10: file-scope variable declarations have no body
+          return .VarDecl vd
   match action.run 0 with
-  | .error msg         => .error msg
+  | .error msg          => .error msg
   | .ok (topLevels', _) => .ok { p with topLevels := topLevels' }
 
 end Semantics

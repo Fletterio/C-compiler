@@ -146,6 +146,9 @@ def collectSwitchCases (p : AST.Program) : Except String AST.Program := do
     | .FunDecl fd =>
         -- Declarations have no body: skip
         return AST.TopLevel.FunDecl fd
+    | .VarDecl vd =>
+        -- Chapter 10: file-scope variable declarations have no body
+        return AST.TopLevel.VarDecl vd
   return { p with topLevels := topLevels' }
 
 end Semantics

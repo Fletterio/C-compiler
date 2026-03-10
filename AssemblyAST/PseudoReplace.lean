@@ -1,111 +1,134 @@
 import AssemblyAST.AssemblyAST
+import Semantics.SymbolTable
 
 /-
-  Pass 2 of assembly generation: replace every Pseudo operand with a Stack
-  operand at a unique offset from RBP.
+  Pass 2 of assembly generation: replace every Pseudo operand with a concrete
+  operand — either a Stack slot or a Data (RIP-relative) operand.
 
-  Each distinct pseudoregister is assigned to a 4-byte slot on the stack,
-  starting at -4(%rbp) and growing downward: -4, -8, -12, …
-  The same identifier always maps to the same slot.
+  Chapter 9: each function processed independently with its own stack map.
 
-  Chapter 9: each function is processed independently, with its own fresh
-  pseudo-to-stack map and its own stack byte count.  The resulting stack size
-  is stored in the `FunctionDef.stackSize` field so that FixUp can use it.
-
-  The new `Push` and `DeallocateStack` instructions are also handled:
-    - `Push(Pseudo(id))` → `Push(Stack(offset))`
-    - `DeallocateStack` has no operands: returned as-is.
-    - `Call` has no operands: returned as-is.
+  Chapter 10 additions:
+    - Takes the global `SymbolTable` built by VarResolution.
+    - When a Pseudo operand is encountered for the first time, we check the
+      symbol table:
+        - If the entry has `Static` attributes, it is a static variable; map
+          it to `Data(name)` (RIP-relative address, no stack slot allocated).
+        - Otherwise (Local attr or not found — TACKY temporaries are not in the
+          symbol table), assign a new stack slot as before.
+    - Static variables do NOT count toward the function's stack size.
+    - `AsmTopLevel.StaticVariable` entries are passed through unchanged; they
+      carry no instructions and need no pseudoregister replacement.
 -/
 
 namespace AssemblyAST
 
 /-- Mutable state threaded through the pseudo-replacement pass for ONE function.
     `map` is an association list from pseudoregister name to its assigned stack
-    offset.  `maxBytes` tracks the total bytes allocated so far; the next slot
-    will be at offset `-(maxBytes + 4)`. -/
+    offset or Data label.
+    `maxBytes` tracks the total bytes of stack space allocated so far; the next
+    stack slot will be at offset `-(maxBytes + 4)`. -/
 private structure ReplState where
-  map      : List (String × Int)  -- pseudoregister id → stack offset
-  maxBytes : Nat                   -- bytes allocated so far
+  /-- Map from pseudo name to the concrete operand it was assigned. -/
+  map      : List (String × Operand)
+  /-- Total stack bytes allocated so far (for Stack-assigned pseudos only). -/
+  maxBytes : Nat
 
 /-- The initial replacement state: no pseudoregisters mapped, nothing allocated. -/
 private def ReplState.empty : ReplState := { map := [], maxBytes := 0 }
 
-/-- Look up `id` in the state's map.  If found, return the existing offset.
-    If not found, allocate the next 4-byte slot (offset = -(maxBytes + 4)),
-    record the mapping, and return the new offset.
-    This guarantees that every occurrence of the same pseudoregister is
-    replaced with exactly the same stack address. -/
-private def ReplState.getOrInsert (s : ReplState) (id : String) : ReplState × Int :=
+/-- Look up or assign a concrete operand for `id`.
+    Consults the symbol table first:
+      - Static attribute → map to `Data(id)` (no stack allocation).
+      - Otherwise → assign next 4-byte stack slot.
+    If `id` already has a mapping from a previous occurrence, return it directly. -/
+private def ReplState.getOrInsert (s : ReplState) (id : String)
+    (symTable : Semantics.SymbolTable) : ReplState × Operand :=
+  -- Check if we already assigned an operand for this pseudo
   match s.map.find? (fun p => p.1 == id) with
-  | some (_, offset) => (s, offset)
+  | some (_, op) => (s, op)
   | none =>
-      let bytes  := s.maxBytes + 4
-      let offset : Int := -(bytes : Int)
-      ({ map := s.map ++ [(id, offset)], maxBytes := bytes }, offset)
+      -- Check the symbol table to determine storage duration
+      let isStatic : Bool := match Semantics.lookupSym symTable id with
+        | some { attrs := .Static _ _, .. } => true
+        | _                                 => false
+      if isStatic then
+        -- Static variable: use RIP-relative Data operand, no stack space needed
+        let op := Operand.Data id
+        ({ s with map := s.map ++ [(id, op)] }, op)
+      else
+        -- Automatic variable or TACKY temporary: assign a 4-byte stack slot
+        let bytes  := s.maxBytes + 4
+        let offset : Int := -(bytes : Int)
+        let op := Operand.Stack offset
+        ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
 
 /-- Replace a single operand if it is a `Pseudo`.
-    Non-pseudo operands are returned unchanged together with the unmodified
-    state, so this function is safe to call on any operand. -/
-private def replaceOp (s : ReplState) : Operand → ReplState × Operand
-  | .Pseudo id => let (s', off) := s.getOrInsert id; (s', .Stack off)
+    Non-pseudo operands are returned unchanged together with the unmodified state.
+    Chapter 10: consults the symbol table to decide Stack vs. Data. -/
+private def replaceOp (s : ReplState) (symTable : Semantics.SymbolTable) : Operand → ReplState × Operand
+  | .Pseudo id => s.getOrInsert id symTable
   | op         => (s, op)
 
 /-- Replace all `Pseudo` operands in a single instruction.
-    `Mov` and `Binary` each have two operands, both of which may be pseudos.
-    `Unary` and `Idiv` each have one operand.
-    `Push` has one operand (new in Chapter 9).
-    `Ret`, `Cdq`, `AllocateStack`, `DeallocateStack`, and `Call` carry no
-    pseudo operands and are returned as-is.
-    Returns the updated state together with the rewritten instruction wrapped
-    in a list (to keep a uniform return type with other passes that may expand
-    one instruction into several). -/
-private def replaceInstr (s : ReplState) : Instruction → ReplState × List Instruction
+    Chapter 10: passes `symTable` to `replaceOp` for static vs. local decisions.
+    All instruction shapes handled:
+    - Two-operand: Mov, Binary, Cmp (both src and dst may be pseudo)
+    - One-operand: Unary, Idiv, SetCC, Push
+    - No operand: Ret, Cdq, AllocateStack, DeallocateStack, Call, Jmp, JmpCC, Label
+    Returns the updated state plus the rewritten instruction list. -/
+private def replaceInstr (s : ReplState) (symTable : Semantics.SymbolTable)
+    : Instruction → ReplState × List Instruction
   | .Mov src dst =>
-      let (s, src') := replaceOp s src
-      let (s, dst') := replaceOp s dst
+      let (s, src') := replaceOp s symTable src
+      let (s, dst') := replaceOp s symTable dst
       (s, [.Mov src' dst'])
   | .Unary op operand =>
-      let (s, op') := replaceOp s operand
+      let (s, op') := replaceOp s symTable operand
       (s, [.Unary op op'])
   | .Binary op src dst =>
-      let (s, src') := replaceOp s src
-      let (s, dst') := replaceOp s dst
+      let (s, src') := replaceOp s symTable src
+      let (s, dst') := replaceOp s symTable dst
       (s, [.Binary op src' dst'])
   | .Idiv operand =>
-      let (s, op') := replaceOp s operand
+      let (s, op') := replaceOp s symTable operand
       (s, [.Idiv op'])
   | .Cmp src dst =>
-      let (s, src') := replaceOp s src
-      let (s, dst') := replaceOp s dst
+      let (s, src') := replaceOp s symTable src
+      let (s, dst') := replaceOp s symTable dst
       (s, [.Cmp src' dst'])
   | .SetCC cc operand =>
-      let (s, op') := replaceOp s operand
+      let (s, op') := replaceOp s symTable operand
       (s, [.SetCC cc op'])
   | .Push operand =>
       -- Chapter 9: Push may have a Pseudo operand; replace it.
-      let (s, op') := replaceOp s operand
+      let (s, op') := replaceOp s symTable operand
       (s, [.Push op'])
   | instr => (s, [instr])  -- Ret, Cdq, AllocateStack, DeallocateStack, Call, Jmp, etc.
 
 /-- Replace pseudoregisters in a single function definition.
     Processes the instruction list with a fresh ReplState, then stores the
-    resulting stack size in the FunctionDef.stackSize field. -/
-private def replaceFunctionDef (f : FunctionDef) : FunctionDef :=
+    resulting stack size (only from Stack-allocated pseudos) in stackSize. -/
+private def replaceFunctionDef (f : FunctionDef) (symTable : Semantics.SymbolTable) : FunctionDef :=
   let (finalState, instrs) :=
     f.instructions.foldl
       (fun (acc : ReplState × List Instruction) instr =>
         let (s, out) := acc
-        let (s', new) := replaceInstr s instr
+        let (s', new) := replaceInstr s symTable instr
         (s', out ++ new))
       (ReplState.empty, [])
   { f with instructions := instrs, stackSize := finalState.maxBytes }
 
 /-- Entry point for pass 2.
-    Chapter 9: processes each function independently.
-    Each function gets its own fresh pseudo map and stack byte count.
-    The stack size is stored in `FunctionDef.stackSize` for pass 3 (FixUp). -/
-def replacePseudos (p : Program) : Program :=
-  { p with funcs := p.funcs.map replaceFunctionDef }
+    Chapter 10: takes the global symbol table.
+    - `AsmTopLevel.Function(fd)`: processes each function independently with a
+      fresh pseudo map and stack byte count.
+    - `AsmTopLevel.StaticVariable(...)`: passed through unchanged (no
+      pseudoregisters in static variable definitions). -/
+def replacePseudos (p : Program) (symTable : Semantics.SymbolTable) : Program :=
+  let topLevels := p.topLevels.map fun tl =>
+    match tl with
+    | .Function fd           => AsmTopLevel.Function (replaceFunctionDef fd symTable)
+    | sv@(.StaticVariable ..) => sv  -- no instructions, nothing to replace
+  { topLevels }
 
 end AssemblyAST

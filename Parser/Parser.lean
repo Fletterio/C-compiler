@@ -275,9 +275,35 @@ end
 -- Statement, declaration, and block-item parsing
 -- ---------------------------------------------------------------------------
 
-/-- Parse a variable declaration: `int <identifier> [ = <exp> ] ;` -/
-private def parseVarDecl (tokens : List Token) : Except String (Declaration × List Token) := do
+/-- Try to parse an optional storage-class specifier token at the front of
+    `tokens`.  Returns `(some sc, rest)` when a `static` or `extern` keyword
+    is found, or `(none, tokens)` when neither is present.
+
+    Chapter 10 supports both orderings of the type and storage class:
+      `static int x;`   — storage class before type (canonical C order)
+      `int static x;`   — type before storage class (also accepted)
+    The caller handles the ordering: it tries this function both before and
+    after consuming the `int` keyword. -/
+private def parseStorageClass (tokens : List Token) : Option StorageClass × List Token :=
+  match tokens with
+  | .KwStatic :: rest => (some .Static, rest)
+  | .KwExtern :: rest => (some .Extern, rest)
+  | _                 => (none, tokens)
+
+/-- Parse a variable declaration: `[static|extern] int <identifier> [ = <exp> ] ;`
+    Also handles `int [static|extern] <identifier> ...` for the type-before-
+    storage-class ordering.
+    `storageClassOpt` is the storage class parsed BEFORE the `int` keyword,
+    if any (the caller parses it first, then calls this function with the
+    remaining tokens that should start with `int`). -/
+private def parseVarDecl (tokens : List Token) (storageClassOpt : Option StorageClass := none)
+    : Except String (Declaration × List Token) := do
+  -- Consume the mandatory `int` keyword
   let tokens ← expect .KwInt tokens
+  -- Check for a storage class AFTER the `int` keyword (e.g. `int static x;`)
+  let (sc2, tokens) := parseStorageClass tokens
+  -- The effective storage class: prefer the one before `int` if given, else after
+  let sc := storageClassOpt.orElse (fun () => sc2)
   let (name, tokens) ←
     match tokens with
     | .Identifier n :: rest => .ok (n, rest)
@@ -287,20 +313,31 @@ private def parseVarDecl (tokens : List Token) : Except String (Declaration × L
   | .Equal :: rest => do
       let (e, rest')  ← parseExp 0 rest
       let rest''      ← expect .Semicolon rest'
-      .ok ({ name, init := some e }, rest'')
+      .ok ({ name, init := some e, storageClass := sc }, rest'')
   | _ => do
       let rest ← expect .Semicolon tokens
-      .ok ({ name, init := none }, rest)
+      .ok ({ name, init := none, storageClass := sc }, rest)
 
 /-- Parse the initial clause of a `for` loop.
     The clause ends with a semicolon (which is consumed).
-    - `int <id> [= <exp>] ;` → `ForInit.InitDecl` (declaration, semicolon consumed by `parseVarDecl`)
+    - `[static|extern] int <id> [= <exp>] ;` → `ForInit.InitDecl`
+      (storage-class specifiers are parsed and stored; semantic analysis will
+       later reject them if present — storage class is illegal in a for-init)
     - `;`                    → `ForInit.InitExp none` (absent expression)
     - `<exp> ;`              → `ForInit.InitExp (some exp)` (expression, then `;`) -/
 private def parseForInit (tokens : List Token) : Except String (ForInit × List Token) :=
   match tokens with
   | .KwInt :: _ => do
       let (decl, rest) ← parseVarDecl tokens   -- parseVarDecl already consumes ';'
+      .ok (.InitDecl decl, rest)
+  | .KwStatic :: _ => do
+      -- Storage class before `int`: `static int x = ...;`
+      let (sc, tokens') := parseStorageClass tokens
+      let (decl, rest) ← parseVarDecl tokens' sc
+      .ok (.InitDecl decl, rest)
+  | .KwExtern :: _ => do
+      let (sc, tokens') := parseStorageClass tokens
+      let (decl, rest) ← parseVarDecl tokens' sc
       .ok (.InitDecl decl, rest)
   | .Semicolon :: rest =>
       .ok (.InitExp none, rest)                     -- absent: just consume ';'
@@ -441,6 +478,22 @@ private partial def parseStatement (tokens : List Token) : Except String (Statem
       let rest'       ← expect .Semicolon rest
       .ok (.Expression exp, rest')
 
+/-- Parse a local function declaration (no body) after the `int name (` prefix
+    has been determined.  `sc` is the optional storage-class specifier that was
+    already parsed.  The opening `(` has NOT yet been consumed when this helper
+    is called; `rest` starts after `name`. -/
+private partial def parseLocalFunDecl (name : String) (sc : Option StorageClass)
+    (rest : List Token) : Except String (BlockItem × List Token) := do
+  let rest' ← expect .OpenParen rest
+  let (params, rest'') ← parseParamList rest'
+  match rest'' with
+  | .Semicolon :: rest''' =>
+      .ok (.FD { name, params, storageClass := sc }, rest''')
+  | .OpenBrace :: _ =>
+      .error s!"Function definition for '{name}' inside a function is not allowed"
+  | [] => .error "Expected \";\" after local function declaration but reached end of input"
+  | t :: _ => .error s!"Expected \";\" after local function declaration but found {t.describe}"
+
 /-- Parse a block item: either a variable declaration, a local function declaration,
     or a statement.
 
@@ -449,25 +502,43 @@ private partial def parseStatement (tokens : List Token) : Except String (Statem
     - `int <identifier> [= ...]  ;` → variable declaration
     - anything else → statement
 
+    Chapter 10: storage-class specifiers may appear before or after `int`.
+    - `static int foo(void);` → local function declaration (SC error in semantic analysis)
+    - `extern int x;`        → local extern variable declaration
+    - `int static x;`        → same (type-before-SC ordering)
+
     When we see `int <name> (`, we parse a local function declaration.
     Local function *definitions* (with `{` body) inside other functions are
     rejected as a parse error. -/
 private partial def parseBlockItem (tokens : List Token) : Except String (BlockItem × List Token) :=
   match tokens with
-  -- Variable or function declaration: starts with `int`
-  | .KwInt :: .Identifier name :: .OpenParen :: rest => do
-      -- Local function declaration: int name(params);
-      -- Definitions inside functions are rejected below when we see '{' instead of ';'
-      let (params, rest') ← parseParamList rest
-      match rest' with
-      | .Semicolon :: rest'' =>
-          -- Declaration only (no body): valid inside a function
-          .ok (.FD { name, params }, rest'')
-      | .OpenBrace :: _ =>
-          -- Function definition inside a function body is not allowed
-          .error s!"Function definition for '{name}' inside a function is not allowed"
-      | [] => .error "Expected \";\" after local function declaration but reached end of input"
-      | t :: _ => .error s!"Expected \";\" after local function declaration but found {t.describe}"
+  -- Storage class BEFORE `int` (e.g. `static int foo(...)` or `extern int x`)
+  | .KwStatic :: rest | .KwExtern :: rest => do
+      -- Figure out which storage class token we're looking at
+      let (sc, afterSC) := parseStorageClass tokens
+      -- After the storage class we must see `int`
+      match afterSC with
+      | .KwInt :: .Identifier name :: .OpenParen :: rest' => do
+          -- Function-like: `static int name(...)` — parse as local function decl.
+          -- Pass `OpenParen :: rest'` directly (name is already known, don't re-parse it).
+          parseLocalFunDecl name sc (.OpenParen :: rest')
+      | .KwInt :: .Identifier _ :: _ => do
+          -- Variable: `static int x = ...;` or `extern int x;`
+          let (decl, rest') ← parseVarDecl afterSC sc
+          .ok (.D decl, rest')
+      | _ => do
+          -- Unexpected; try parsing as statement for a better error message
+          let (stmt, rest') ← parseStatement tokens
+          .ok (.S stmt, rest')
+  -- `int static name(...)` or `int extern name(...)`: type before storage class, function
+  | .KwInt :: .KwStatic :: .Identifier name :: .OpenParen :: rest =>
+      parseLocalFunDecl name (some .Static) (.OpenParen :: rest)
+  | .KwInt :: .KwExtern :: .Identifier name :: .OpenParen :: rest =>
+      parseLocalFunDecl name (some .Extern) (.OpenParen :: rest)
+  -- `int name(...)`: plain function declaration (no storage class)
+  | .KwInt :: .Identifier name :: .OpenParen :: rest =>
+      parseLocalFunDecl name none (.OpenParen :: rest)
+  -- `int [static|extern] name [= e] ;`: variable declaration (any ordering)
   | .KwInt :: _ => do
       let (decl, rest) ← parseVarDecl tokens
       .ok (.D decl, rest)
@@ -530,37 +601,65 @@ end
 -- Top-level declaration/definition parsing
 -- ---------------------------------------------------------------------------
 
-/-- Parse a top-level function declaration or definition.
-    Grammar:
-      `int <name> "(" param-list ")" ";"` → `TopLevel.FunDecl`
-      `int <name> "(" param-list ")" "{" body "}"` → `TopLevel.FunDef`
+/-- Parse a top-level declaration or definition (function or variable).
+    Grammar (Chapter 10):
+      `[static|extern] int <name> "(" param-list ")" ";"` → `TopLevel.FunDecl`
+      `[static|extern] int <name> "(" param-list ")" "{" body "}"` → `TopLevel.FunDef`
+      `[static|extern] int <name> ["=" exp] ";"` → `TopLevel.VarDecl`
 
-    In Chapter 9, the return type is always `int` and parameters are
-    either `void` (no params) or a comma-separated list of `int` params. -/
+    The storage class may appear before OR after the `int` keyword (both orders
+    are accepted per the C grammar, since type and storage-class specifiers may
+    be interleaved).  After consuming both, we decide whether this is a variable
+    or function declaration by looking for `(` after the name.
+
+    Chapter 10: file-scope variable declarations are represented as
+    `TopLevel.VarDecl`.  They are never renamed (they keep their original names
+    so they can be matched across translation units by the linker). -/
 private partial def parseTopLevel (tokens : List Token) : Except String (TopLevel × List Token) := do
+  -- Optional storage-class specifier BEFORE `int`
+  let (sc1, tokens) := parseStorageClass tokens
+  -- Mandatory `int` keyword
   let tokens ← expect .KwInt tokens
+  -- Optional storage-class specifier AFTER `int` (e.g. `int static x;`)
+  let (sc2, tokens) := parseStorageClass tokens
+  -- Reject multiple storage-class specifiers (e.g. `static int extern foo`)
+  if sc1.isSome && sc2.isSome then
+    throw "Multiple storage class specifiers"
+  -- Effective storage class: prefer before-int if given, else after-int
+  let sc := sc1.orElse (fun () => sc2)
+  -- Parse the name
   let (name, tokens) ←
     match tokens with
     | .Identifier name :: rest => .ok (name, rest)
-    | []                       => .error "Expected function name but reached end of input"
-    | t :: _                   => .error s!"Expected function name but found {t.describe}"
-  let tokens ← expect .OpenParen tokens
-  let (params, tokens) ← parseParamList tokens
-  -- Decide: declaration (ends with ';') or definition (body follows)
+    | []                       => .error "Expected identifier but reached end of input"
+    | t :: _                   => .error s!"Expected identifier but found {t.describe}"
+  -- Decide: variable or function by peeking at next token
   match tokens with
+  | .OpenParen :: rest => do
+      -- Function: `int name ( params ) ; | { body }`
+      let (params, tokens) ← parseParamList rest
+      match tokens with
+      | .Semicolon :: rest' =>
+          .ok (.FunDecl { name, params, storageClass := sc }, rest')
+      | .OpenBrace :: rest' => do
+          let (body, rest'') ← parseBlockItems rest'
+          let rest'''        ← expect .CloseBrace rest''
+          .ok (.FunDef { name, params, body, storageClass := sc }, rest''')
+      | [] => .error s!"Expected open-brace or semicolon after function header for {name} but reached end of input"
+      | t :: _ => .error s!"Expected open-brace or semicolon after function header for {name} but found {t.describe}"
+  | .Equal :: rest => do
+      -- Variable with initializer: `[sc] int name = exp ;`
+      let (e, rest')  ← parseExp 0 rest
+      let rest''      ← expect .Semicolon rest'
+      .ok (.VarDecl { name, init := some e, storageClass := sc }, rest'')
   | .Semicolon :: rest =>
-      -- Declaration only (prototype)
-      .ok (.FunDecl { name, params }, rest)
-  | .OpenBrace :: rest => do
-      -- Full definition with body
-      let (body, rest') ← parseBlockItems rest
-      let rest''        ← expect .CloseBrace rest'
-      .ok (.FunDef { name, params, body }, rest'')
-  | [] => .error s!"Expected open brace or semicolon after function header for '{name}' but reached end of input"
-  | t :: _ => .error s!"Expected open brace or semicolon after function header for '{name}' but found {t.describe}"
+      -- Variable without initializer: `[sc] int name ;`
+      .ok (.VarDecl { name, init := none, storageClass := sc }, rest)
+  | [] => .error s!"Expected open-brace, semicolon, or open-paren after name {name} but reached end of input"
+  | t :: _ => .error s!"Expected open-brace, semicolon, or open-paren after name {name} but found {t.describe}"
 
 /-- Parse a sequence of top-level items until the token list is exhausted.
-    Each item must begin with `int` (the only supported return/declaration type). -/
+    Each item must begin with an optional storage class followed by `int`. -/
 private partial def parseTopLevels (tokens : List Token) : Except String (List TopLevel) :=
   match tokens with
   | []   => .ok []

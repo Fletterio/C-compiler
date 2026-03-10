@@ -13,39 +13,40 @@ import AssemblyAST.AssemblyAST
 
   2. Rewrite invalid instructions:
 
-     a. Mov(Stack(x), Stack(y)): movl can't use two memory operands.
-          → Mov(Stack(x), Reg(R10))
-            Mov(Reg(R10), Stack(y))
+     a. Mov(mem, mem): movl can't use two memory operands.
+          → Mov(mem, Reg(R10))
+            Mov(Reg(R10), mem)
+        where `mem` is Stack(n) or Data(name).
 
      b. Idiv(Imm(n)): idivl can't take an immediate operand.
           → Mov(Imm(n), Reg(R10))
             Idiv(Reg(R10))
 
-     c. Binary(Add|Sub|And|Or|Xor, Stack(x), Stack(y)): these instructions
+     c. Binary(Add|Sub|And|Or|Xor, mem, mem): these instructions
         can't use two memory operands.
-          → Mov(Stack(x), Reg(R10))
-            Binary(op, Reg(R10), Stack(y))
+          → Mov(mem, Reg(R10))
+            Binary(op, Reg(R10), mem)
 
-     d. Binary(Mult, src, Stack(y)): imull can't use a memory destination.
-          → Mov(Stack(y), Reg(R11))
+     d. Binary(Mult, src, mem): imull can't use a memory destination.
+          → Mov(mem, Reg(R11))
             Binary(Mult, src, Reg(R11))
-            Mov(Reg(R11), Stack(y))
+            Mov(Reg(R11), mem)
 
      e. Cmp(src, Imm(n)): cmpl's second operand (AT&T dst) can't be an immediate.
           → Mov(Imm(n), Reg(R11))
             Cmp(src, Reg(R11))
 
-     f. Cmp(Stack(x), Stack(y)): cmpl can't use two memory operands.
-          → Mov(Stack(x), Reg(R10))
-            Cmp(Reg(R10), Stack(y))
+     f. Cmp(mem, mem): cmpl can't use two memory operands.
+          → Mov(mem, Reg(R10))
+            Cmp(Reg(R10), mem)
 
-  Chapter 9 additions:
-    - DeallocateStack: no fix-up needed; returned as-is.
-    - Push: no fix-up needed (CodeGen only emits Push(Reg) or Push(Imm);
-      PseudoReplace may convert Push(Pseudo) → Push(Stack), but the x86-64
-      instruction `pushq n(%rbp)` is valid so we allow it through).
-    - Call: no fix-up needed; returned as-is.
-    - The stack size is rounded to a multiple of 16.
+  Chapter 10 additions:
+    - `Data(name)` is a memory operand (RIP-relative), subject to the same
+      fix-up rules as `Stack(n)`.  Any combination of Stack or Data in a
+      two-operand instruction is treated as mem-to-mem and split through a
+      scratch register.
+    - `AsmTopLevel.StaticVariable` items are passed through unchanged.
+    - `AsmTopLevel.Function` items are processed by `fixFunctionDef` as before.
 
   R10 is used for source fix-ups and R11 for destination fix-ups, so both
   can be applied to the same instruction without clobbering each other.
@@ -59,39 +60,72 @@ namespace AssemblyAST
 private def roundUp16 (n : Int) : Int :=
   ((n + 15) / 16) * 16
 
+/-- Return true if an operand is a memory address (Stack or Data).
+    Both Stack and Data operands require memory-to-memory fix-ups when
+    used together in a single instruction. -/
+private def isMem : Operand → Bool
+  | .Stack _ => true
+  | .Data _  => true
+  | _        => false
+
 /-- Rewrite a single instruction if it violates x64 encoding constraints.
-    See the module header for a full list of rewrite rules.
+    Chapter 10: Data operands are treated as memory operands throughout.
+    See the module header for the full list of rewrite rules.
     Returns a singleton for instructions that need no fix-up, or a two- or
     three-instruction sequence for those that do. -/
 private def fixInstr : Instruction → List Instruction
   -- movl: source and destination cannot both be memory addresses
-  | .Mov (.Stack x) (.Stack y) =>
-      [.Mov (.Stack x) (.Reg .R10), .Mov (.Reg .R10) (.Stack y)]
+  | .Mov src dst =>
+      if isMem src && isMem dst then
+        [.Mov src (.Reg .R10), .Mov (.Reg .R10) dst]
+      else
+        [.Mov src dst]
   -- idivl: operand cannot be an immediate value; move it to R10D first
   | .Idiv (.Imm n) =>
       [.Mov (.Imm n) (.Reg .R10), .Idiv (.Reg .R10)]
-  -- addl/subl/andl/orl/xorl: source and destination cannot both be memory addresses
-  | .Binary .Add (.Stack x) (.Stack y) =>
-      [.Mov (.Stack x) (.Reg .R10), .Binary .Add (.Reg .R10) (.Stack y)]
-  | .Binary .Sub (.Stack x) (.Stack y) =>
-      [.Mov (.Stack x) (.Reg .R10), .Binary .Sub (.Reg .R10) (.Stack y)]
-  | .Binary .And (.Stack x) (.Stack y) =>
-      [.Mov (.Stack x) (.Reg .R10), .Binary .And (.Reg .R10) (.Stack y)]
-  | .Binary .Or (.Stack x) (.Stack y) =>
-      [.Mov (.Stack x) (.Reg .R10), .Binary .Or (.Reg .R10) (.Stack y)]
-  | .Binary .Xor (.Stack x) (.Stack y) =>
-      [.Mov (.Stack x) (.Reg .R10), .Binary .Xor (.Reg .R10) (.Stack y)]
+  -- addl/subl/andl/orl/xorl: source and destination cannot both be memory
+  | .Binary .Add src dst =>
+      if isMem src && isMem dst then
+        [.Mov src (.Reg .R10), .Binary .Add (.Reg .R10) dst]
+      else
+        [.Binary .Add src dst]
+  | .Binary .Sub src dst =>
+      if isMem src && isMem dst then
+        [.Mov src (.Reg .R10), .Binary .Sub (.Reg .R10) dst]
+      else
+        [.Binary .Sub src dst]
+  | .Binary .And src dst =>
+      if isMem src && isMem dst then
+        [.Mov src (.Reg .R10), .Binary .And (.Reg .R10) dst]
+      else
+        [.Binary .And src dst]
+  | .Binary .Or src dst =>
+      if isMem src && isMem dst then
+        [.Mov src (.Reg .R10), .Binary .Or (.Reg .R10) dst]
+      else
+        [.Binary .Or src dst]
+  | .Binary .Xor src dst =>
+      if isMem src && isMem dst then
+        [.Mov src (.Reg .R10), .Binary .Xor (.Reg .R10) dst]
+      else
+        [.Binary .Xor src dst]
   -- imull: destination cannot be a memory address; use R11D as a temporary
-  | .Binary .Mult src (.Stack y) =>
-      [.Mov (.Stack y) (.Reg .R11),
-       .Binary .Mult src (.Reg .R11),
-       .Mov (.Reg .R11) (.Stack y)]
+  | .Binary .Mult src dst =>
+      if isMem dst then
+        [.Mov dst (.Reg .R11),
+         .Binary .Mult src (.Reg .R11),
+         .Mov (.Reg .R11) dst]
+      else
+        [.Binary .Mult src dst]
   -- cmpl: second operand (AT&T dst) cannot be an immediate; move it to R11D
   | .Cmp src (.Imm n) =>
       [.Mov (.Imm n) (.Reg .R11), .Cmp src (.Reg .R11)]
   -- cmpl: source and destination cannot both be memory addresses; use R10D
-  | .Cmp (.Stack x) (.Stack y) =>
-      [.Mov (.Stack x) (.Reg .R10), .Cmp (.Reg .R10) (.Stack y)]
+  | .Cmp src dst =>
+      if isMem src && isMem dst then
+        [.Mov src (.Reg .R10), .Cmp (.Reg .R10) dst]
+      else
+        [.Cmp src dst]
   -- All other instructions need no fix-up
   | instr => [instr]
 
@@ -101,17 +135,19 @@ private def fixInstr : Instruction → List Instruction
     3. Prepend `AllocateStack(rounded)` to the instruction list.
     4. Apply `fixInstr` to each instruction. -/
 private def fixFunctionDef (f : FunctionDef) : FunctionDef :=
-  -- Round the stack size up to maintain 16-byte alignment
   let rounded := roundUp16 f.stackSize
-  -- Fix up each instruction (expanding invalid ones into multiple valid ones)
   let fixed := f.instructions.foldl (fun acc i => acc ++ fixInstr i) []
-  -- Prepend AllocateStack at the front (it becomes the third prologue instruction)
   { f with instructions := .AllocateStack rounded :: fixed }
 
 /-- Entry point for pass 3.
-    Chapter 9: processes each function in the program independently.
-    Each function gets its own AllocateStack based on its own pseudo count. -/
+    Chapter 10: processes each AsmTopLevel item:
+    - `Function(fd)`: apply AllocateStack insertion and instruction fix-ups.
+    - `StaticVariable(...)`: pass through unchanged (no instructions). -/
 def fixUp (p : Program) : Program :=
-  { p with funcs := p.funcs.map fixFunctionDef }
+  let topLevels := p.topLevels.map fun tl =>
+    match tl with
+    | .Function fd            => AsmTopLevel.Function (fixFunctionDef fd)
+    | sv@(.StaticVariable ..) => sv
+  { topLevels }
 
 end AssemblyAST

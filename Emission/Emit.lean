@@ -3,6 +3,20 @@ import AssemblyAST.AssemblyAST
 /-
   Code emission pass: converts AssemblyAST.Program to x64 AT&T-syntax assembly.
 
+  Chapter 10 additions:
+    - `Data(name)` operands: emitted as `name(%rip)` (RIP-relative addressing).
+    - `StaticVariable(name, global, init)`: emitted as a set of assembly
+      directives in the `.data` (nonzero init) or `.bss` (zero init) section:
+        global, nonzero:   .globl name / .data / .align 4 / name: / .long init
+        global, zero:      .globl name / .bss  / .align 4 / name: / .zero 4
+        local, nonzero:                  .data / .align 4 / name: / .long init
+        local, zero:                     .bss  / .align 4 / name: / .zero 4
+    - Function definitions:
+        - A `.text` directive is emitted before each function (required now
+          that other sections are also emitted by this pass).
+        - The `.globl` directive is emitted only when `FunctionDef.global` is
+          true (internal-linkage functions declared `static` omit it).
+
   Linux conventions:
   - Function labels are emitted as-is (no leading underscore).
   - A .section .note.GNU-stack directive is appended to mark the stack
@@ -15,50 +29,29 @@ import AssemblyAST.AssemblyAST
       movq  %rsp, %rbp
 
   AllocateStack(n) emits the third prologue instruction:
-      subq $n, %rsp          (64-bit; note the q suffix, not l)
+      subq $n, %rsp
 
   DeallocateStack(n) emits:
-      addq $n, %rsp          (Chapter 9: reclaim space used for stack arguments)
+      addq $n, %rsp
 
   Push(operand) emits:
-      pushq <64-bit operand> (Chapter 9: pass argument on stack)
+      pushq <64-bit operand>
 
   Call(name) emits:
-      call name              (if name is locally defined)
-      call name@PLT          (if name is external on Linux)
+      call name       (if name is locally defined)
+      call name@PLT   (if name is external on Linux)
 
   Ret emits the full epilogue:
       movq %rbp, %rsp
       popq %rbp
       ret
 
-  Instruction formatting:
-    Mov(src, dst)             →  movl  <src>, <dst>
-    Unary(Neg, dst)           →  negl  <dst>
-    Unary(Not, dst)           →  notl  <dst>
-    Binary(Add, src, dst)     →  addl  <src>, <dst>
-    Binary(Sub, src, dst)     →  subl  <src>, <dst>
-    Binary(Mult, src, dst)    →  imull <src>, <dst>
-    Idiv(operand)             →  idivl <operand>
-    Cdq                       →  cdq
-    AllocateStack(n)          →  subq  $n, %rsp
-    DeallocateStack(n)        →  addq  $n, %rsp
-    Push(operand)             →  pushq <64-bit operand>
-    Call(name)                →  call  name  or  call  name@PLT
-
   Operand formatting:
-    Imm(n)     →  $n
-    Reg(AX)    →  %eax  / %rax  / %al
-    Reg(DX)    →  %edx  / %rdx  / %dl
-    Reg(CX)    →  %ecx  / %rcx  / %cl
-    Reg(DI)    →  %edi  / %rdi  / %dil
-    Reg(SI)    →  %esi  / %rsi  / %sil
-    Reg(R8)    →  %r8d  / %r8   / %r8b
-    Reg(R9)    →  %r9d  / %r9   / %r9b
-    Reg(R10)   →  %r10d / %r10  / %r10b
-    Reg(R11)   →  %r11d / %r11  / %r11b
-    Stack(n)   →  n(%rbp)
-    Pseudo(_)  →  (illegal at this stage — should have been replaced)
+    Imm(n)       →  $n
+    Reg(AX)      →  %eax  / %rax  / %al
+    Stack(n)     →  n(%rbp)
+    Data(name)   →  name(%rip)   [Chapter 10: RIP-relative]
+    Pseudo(_)    →  (illegal at this stage — should have been replaced)
 -/
 
 namespace Emission
@@ -83,8 +76,7 @@ private def emitReg4 : Reg → String
   | .R11 => "%r11d"
 
 /-- Emit the 64-bit (8-byte) name of a hardware register.
-    Used for `pushq`, `subq`, `addq`, `movq`, and other 64-bit operations.
-    The System V AMD64 ABI requires pushing full 64-bit values. -/
+    Used for `pushq`, `subq`, `addq`, `movq`, and other 64-bit operations. -/
 private def emitReg8 : Reg → String
   | .AX  => "%rax"
   | .DX  => "%rdx"
@@ -117,13 +109,14 @@ private def emitReg1 : Reg → String
 /-- Emit an assembly operand in AT&T syntax using 32-bit register names.
     - `Imm(n)`: immediate value, prefixed with `$`.
     - `Reg(r)`: hardware register name (32-bit for normal instructions).
-    - `Stack(n)`: memory address at offset `n` from the frame base register
-      `%rbp`, written as `n(%rbp)` (e.g. `-4(%rbp)`).
+    - `Stack(n)`: memory address at offset `n` from `%rbp`.
+    - `Data(name)`: Chapter 10 — RIP-relative address `name(%rip)`.
     - `Pseudo`: must never reach this stage; signals a compiler bug. -/
 private def emitOperand : Operand → String
   | .Imm n    => s!"${n}"
   | .Reg r    => emitReg4 r
   | .Stack n  => s!"{n}(%rbp)"
+  | .Data nm  => s!"{nm}(%rip)"   -- Chapter 10: RIP-relative static variable
   | .Pseudo _ => panic! "Pseudo operand reached emission stage"
 
 /-- Emit an operand using 64-bit register names.
@@ -132,6 +125,7 @@ private def emitOperand8 : Operand → String
   | .Imm n    => s!"${n}"
   | .Reg r    => emitReg8 r
   | .Stack n  => s!"{n}(%rbp)"
+  | .Data nm  => s!"{nm}(%rip)"
   | .Pseudo _ => panic! "Pseudo operand reached emission stage"
 
 /-- Emit a shift count operand.
@@ -142,12 +136,11 @@ private def emitShiftCount : Operand → String
   | .Reg .CX => "%cl"
   | other    => emitOperand other
 
-/-- Emit a byte-sized operand for `set<cc>` instructions.
-    Only registers are valid byte operands at this stage (stack slots are
-    handled by the fix-up pass via a register intermediary). -/
+/-- Emit a byte-sized operand for `set<cc>` instructions. -/
 private def emitByteOperand : Operand → String
   | .Reg r    => emitReg1 r
   | .Stack n  => s!"{n}(%rbp)"
+  | .Data nm  => s!"{nm}(%rip)"
   | .Imm n    => s!"${n}"
   | .Pseudo _ => panic! "Pseudo operand reached emission stage"
 
@@ -165,13 +158,8 @@ private def emitCondCode : CondCode → String
 -- ---------------------------------------------------------------------------
 
 /-- Emit a single assembly instruction as an indented string.
-    Binary arithmetic instructions all use 32-bit (`l`) suffixes.
-    `AllocateStack` and `DeallocateStack` use 64-bit (`q`) suffix since they
-    adjust the 64-bit stack pointer.
-    `Push` uses `pushq` (64-bit operand).
-    `Call` uses `call name@PLT` if the function is external (not in localDefs),
-    or `call name` if it is locally defined.
-    `Ret` is emitted as a multi-line string (prologue teardown + `ret`). -/
+    `localDefs` is the list of function names defined in this translation unit,
+    used to decide whether to suffix `@PLT` on `call` instructions. -/
 private def emitInstruction (localDefs : List String) : Instruction → String
   | .Mov src dst          => s!"    movl {emitOperand src}, {emitOperand dst}"
   | .Unary .Neg dst       => s!"    negl {emitOperand dst}"
@@ -196,7 +184,6 @@ private def emitInstruction (localDefs : List String) : Instruction → String
   | .Push operand         => s!"    pushq {emitOperand8 operand}"
   | .Call name            =>
       -- On Linux, use @PLT suffix for external functions.
-      -- Functions defined in this translation unit are called directly.
       if localDefs.contains name then
         s!"    call {name}"
       else
@@ -204,33 +191,78 @@ private def emitInstruction (localDefs : List String) : Instruction → String
   | .Ret                  => "    movq %rbp, %rsp\n    popq %rbp\n    ret"
 
 -- ---------------------------------------------------------------------------
--- Function and program emission
+-- Top-level emission
 -- ---------------------------------------------------------------------------
 
 /-- Emit a complete function definition.
-    Produces the `.globl` directive, the label, the two fixed prologue
-    instructions (`pushq %rbp` and `movq %rsp, %rbp`), and then all body
-    instructions joined by newlines.  The `AllocateStack` instruction (if
-    present) is the first body instruction and emits the `subq` that finishes
-    the prologue. -/
+    Chapter 10:
+    - Emits `.text` before the function label (required now that we also emit
+      `.data`/`.bss` sections for static variables).
+    - Emits `.globl name` only when `FunctionDef.global` is true (i.e. the
+      function has external linkage).  Internal-linkage (`static`) functions
+      omit this directive.
+    - Then emits the label, prologue, and instruction list. -/
 private def emitFunctionDef (localDefs : List String) (f : FunctionDef) : String :=
+  let globalDirective := if f.global then s!"    .globl {f.name}\n" else ""
   let prologue := "    pushq %rbp\n    movq %rsp, %rbp"
   let instrs   := String.intercalate "\n"
                     (f.instructions.map (emitInstruction localDefs))
-  s!"    .globl {f.name}\n{f.name}:\n{prologue}\n{instrs}"
+  s!"{globalDirective}    .text\n{f.name}:\n{prologue}\n{instrs}"
+
+/-- Emit a static variable definition as assembly directives.
+    Chapter 10: static variables are placed in `.data` (nonzero initializer) or
+    `.bss` (zero initializer).  On Linux we use `.align 4` (2^2 = 4 bytes).
+
+    `global = true, init ≠ 0`:
+        .globl name
+        .data
+        .align 4
+        name:
+        .long init
+
+    `global = true, init = 0`:
+        .globl name
+        .bss
+        .align 4
+        name:
+        .zero 4
+
+    `global = false, init ≠ 0`:
+        .data
+        .align 4
+        name:
+        .long init
+
+    `global = false, init = 0`:
+        .bss
+        .align 4
+        name:
+        .zero 4
+-/
+private def emitStaticVariable (name : String) (global : Bool) (init : Int) : String :=
+  let globalDirective := if global then s!"    .globl {name}\n" else ""
+  if init != 0 then
+    s!"{globalDirective}    .data\n    .align 4\n{name}:\n    .long {init}"
+  else
+    s!"{globalDirective}    .bss\n    .align 4\n{name}:\n    .zero 4"
 
 /-- Entry point for the emission pass.
-    Chapter 9: emits all function definitions, separated by blank lines.
-    The set of locally-defined function names is computed from the program so
-    that `Call` instructions for local functions are emitted without `@PLT`,
-    while calls to external functions (like printf, putchar, etc.) get `@PLT`.
-    Appends the GNU stack note section at the end. -/
+    Chapter 10: emits all top-level items (functions and static variables).
+    - Collects locally-defined function names for `@PLT` decisions.
+    - Emits each top-level item separated by blank lines.
+    - Appends the GNU stack note section at the end. -/
 def emitProgram (p : Program) : String :=
-  -- Collect the names of all locally-defined functions
-  let localDefs := p.funcs.map (fun f => f.name)
-  -- Emit each function definition, separated by blank lines
-  let funcStrings := p.funcs.map (emitFunctionDef localDefs)
-  let funcSection := String.intercalate "\n" funcStrings
-  s!"{funcSection}\n    .section .note.GNU-stack,\"\",@progbits\n"
+  -- Collect the names of all locally-defined functions (for @PLT decisions)
+  let localDefs := p.topLevels.filterMap fun tl =>
+    match tl with
+    | .Function f          => some f.name
+    | .StaticVariable ..   => none
+  -- Emit each top-level item
+  let topLevelStrings := p.topLevels.map fun tl =>
+    match tl with
+    | .Function f                   => emitFunctionDef localDefs f
+    | .StaticVariable name glob init => emitStaticVariable name glob init
+  let body := String.intercalate "\n" topLevelStrings
+  s!"{body}\n    .section .note.GNU-stack,\"\",@progbits\n"
 
 end Emission

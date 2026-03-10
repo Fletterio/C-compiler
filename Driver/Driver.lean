@@ -32,7 +32,7 @@ inductive Stage where
 -- ---------------------------------------------------------------------------
 
 /-- Split `path` into its directory prefix (including trailing separator) and
-    filename.  Detects Windows-style paths by the presence of `\`.
+    filename.  Detects Windows-style paths by the presence of `\\`.
     A path with no separator is treated as a bare filename in the current
     directory, returning `("", path)`. -/
 private def splitPath (path : String) : String × String :=
@@ -95,25 +95,25 @@ def preprocess (inputPath : String) : IO String := do
 
     Pipeline order:
       1. Lex      — tokenize the source
-      2. Parse    — build the AST (now: list of top-level items)
+      2. Parse    — build the AST (list of top-level items)
       3. Validate — identifier resolution (rename locals, reject invalid programs)
                     + loop labeling, switch collection, label resolution
       4. TACKY    — flatten nested expressions into three-address code
       5. Codegen (3 passes):
            a. TACKY → Assembly AST (with pseudoregisters)
-           b. Replace pseudoregisters with stack slots
+           b. Replace pseudoregisters with stack slots or Data operands
            c. Insert AllocateStack (16-byte aligned); fix mem-to-mem instructions
       6. Emit     — serialise the assembly AST to AT&T-syntax text
 
-    Chapter 9 changes:
-      - parseProgram now returns a Program with a list of TopLevel items.
-      - resolveProgram handles multiple functions and function calls.
-      - labelLoops, collectSwitchCases, resolveLabels all handle multi-function.
-      - emitProgram processes only FunDef entries, threading the counter globally.
-      - genProgram handles multiple functions.
-      - replacePseudos handles each function independently.
-      - fixUp handles each function with its own stack size and 16-byte alignment.
-      - emitProgram emits all functions, using @PLT for external calls. -/
+    Chapter 10 changes:
+      - resolveProgram now returns (Program, counter, SymbolTable).
+      - emitProgram takes the SymbolTable to emit static variables and set
+        the `global` flag on functions.
+      - replacePseudos takes the SymbolTable to map static Pseudo → Data
+        instead of Stack.
+      - genProgram handles both Function and StaticVariable top-level items.
+      - fixUp and emitProgram pass StaticVariable items through unchanged,
+        emitting .data/.bss directives for them in the final output. -/
 def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := do
   let contents ← IO.FS.readFile preprocessedPath
   -- Lex
@@ -129,47 +129,46 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
     | .error msg => throw (IO.userError s!"Parse error: {msg}")
   if stage == .Parse then return none
   -- Variable/identifier resolution: rename locals, validate function calls,
-  -- reject undeclared/duplicate identifiers
-  let (resolvedAst, initCounter) ←
+  -- reject undeclared/duplicate identifiers.
+  -- Chapter 10: also builds a SymbolTable with linkage and init info.
+  let (resolvedAst, initCounter, symTable) ←
     match Semantics.resolveProgram ast with
     | .ok r      => pure r
     | .error msg => throw (IO.userError s!"Semantic error: {msg}")
   -- Loop labeling: annotate loops/switch/break/continue with unique IDs;
   -- rejects break/continue outside of loops (or switch for break).
-  -- Chapter 9: uses a global counter across all functions.
   let resolvedAst ←
     match Semantics.labelLoops resolvedAst with
     | .ok p      => pure p
     | .error msg => throw (IO.userError s!"Semantic error: {msg}")
   -- Switch case collection (extra credit): collect and validate case/default
   -- labels for each switch statement and attach them to the Switch AST node.
-  -- Chapter 9: processes all functions.
   let resolvedAst ←
     match Semantics.collectSwitchCases resolvedAst with
     | .ok p      => pure p
     | .error msg => throw (IO.userError s!"Semantic error: {msg}")
   if stage == .Validate then return none
   -- Label resolution (extra credit ch6): validates goto targets and duplicate labels.
-  -- Chapter 9: each function is checked independently.
   match Semantics.resolveLabels resolvedAst with
   | .ok ()     => pure ()
   | .error msg => throw (IO.userError s!"Semantic error: {msg}")
   -- TACKY generation: flatten AST to three-address code.
-  -- Chapter 9: global counter across all functions; only FunDef entries produce code.
-  let tacky := Tacky.emitProgram resolvedAst initCounter
+  -- Chapter 10: takes the SymbolTable to determine function linkage and to
+  -- emit StaticVariable top-level items from symbol table entries.
+  let tacky := Tacky.emitProgram resolvedAst symTable initCounter
   if stage == .Tacky then return none
   -- Assembly generation pass 1: TACKY → Assembly AST (with pseudoregisters).
-  -- Chapter 9: handles multiple functions and the new FunCall, Push, Call instructions.
+  -- Chapter 10: handles Function and StaticVariable top-level items.
   let asmAst := AssemblyAST.genProgram tacky
-  -- Assembly generation pass 2: replace pseudoregisters with stack slots.
-  -- Chapter 9: each function processed independently; stack sizes stored in FunctionDef.
-  let asmAst := AssemblyAST.replacePseudos asmAst
-  -- Assembly generation pass 3: insert AllocateStack (16-byte aligned), fix invalid instructions.
-  -- Chapter 9: each function fixed up with its own stack size.
+  -- Assembly generation pass 2: replace pseudoregisters with stack slots or Data.
+  -- Chapter 10: consults the SymbolTable to map static variables to Data operands.
+  let asmAst := AssemblyAST.replacePseudos asmAst symTable
+  -- Assembly generation pass 3: insert AllocateStack (16-byte aligned),
+  -- fix invalid instructions (mem-to-mem, Data-to-Data treated the same as Stack).
   let asmAst := AssemblyAST.fixUp asmAst
   if stage == .Codegen then return none
   -- Emit assembly: serialize assembly AST to AT&T-syntax text.
-  -- Chapter 9: emits all functions; uses @PLT for external function calls.
+  -- Chapter 10: emits .text/.globl for functions and .data/.bss for static vars.
   let assemblyPath := changeExtension preprocessedPath ".s"
   IO.FS.writeFile assemblyPath (Emission.emitProgram asmAst)
   return some assemblyPath

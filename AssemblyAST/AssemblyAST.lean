@@ -1,11 +1,24 @@
 namespace AssemblyAST
 
 /-
-  Assembly AST for Chapter 9.
+  Assembly AST for Chapter 10.
+
+  Chapter 10 additions:
+    - `Data(identifier)`: a new operand for RIP-relative access to static
+      variables stored in the `.data` or `.bss` section.
+    - `global : Bool` on `FunctionDef`: true when the function has external
+      linkage and requires a `.globl` directive in the emitter.
+    - `AsmTopLevel`: replaces the flat `List FunctionDef`; now a program
+      consists of both function definitions and static variable definitions.
+    - `StaticVariable(name, global, init)`: a top-level assembly construct
+      that emits `.data`/`.bss` directives for a static variable.
+    - `Program.topLevels : List AsmTopLevel` replaces `Program.funcs`.
 
   ASDL definition:
-    program            = Program(function_definition*)
-    function_definition = Function(identifier name, identifier* params,
+    program            = Program(top_level*)
+    top_level          = Function(function_definition)
+                       | StaticVariable(identifier name, bool global, int init)
+    function_definition = Function(identifier name, bool global,
                                    instruction* instructions, int stackSize)
     instruction        = Mov(operand src, operand dst)
                        | Unary(unary_operator, operand)
@@ -25,25 +38,15 @@ namespace AssemblyAST
     unary_operator     = Neg | Not
     binary_operator    = Add | Sub | Mult | And | Or | Xor | Sal | Sar
     cond_code          = E | NE | G | GE | L | LE
-    operand            = Imm(int) | Reg(reg) | Pseudo(identifier) | Stack(int)
+    operand            = Imm(int) | Reg(reg) | Pseudo(identifier)
+                       | Stack(int) | Data(identifier)
     reg                = AX | DX | CX | DI | SI | R8 | R9 | R10 | R11
 
-  Chapter 9 additions:
-    - New registers DI, SI, R8, R9 for the System V AMD64 calling convention.
-      First 6 integer arguments: DI, SI, DX, CX, R8, R9.
-    - `Push`: emit `pushq` to pass stack arguments or save registers.
-    - `Call`: emit `call` to invoke a function (with @PLT on Linux for external).
-    - `DeallocateStack`: emit `addq $n, %rsp` to reclaim stack space used for
-      arguments passed on the stack.
-    - `stackSize` field on FunctionDef: set by PseudoReplace, used by FixUp
-      to emit the correct AllocateStack amount.
-
-  Pseudo operands represent temporary variables and must be eliminated
-  (replaced with Stack operands) before code emission.
-  AllocateStack corresponds to `subq $n, %rsp`; the surrounding prologue and
-  epilogue instructions are added during code emission.
-  Labels in Jmp, JmpCC, and Label are auto-generated names; they are mangled
-  with a `.L` prefix during emission to avoid clashing with user function names.
+  Chapter 10: `Data(identifier)` operands represent RIP-relative (PC-relative)
+  accesses to static variables.  They are emitted as `name(%rip)` in AT&T
+  syntax.  PseudoReplace maps static-variable pseudo operands to Data instead
+  of Stack.  FixUp treats Data as a memory operand, subject to the same
+  mem-to-mem split rules as Stack.
 -/
 
 inductive Reg where
@@ -58,11 +61,15 @@ inductive Reg where
   | R11 : Reg   -- R11D / R11 — scratch register for destination operand fix-ups
   deriving Repr, BEq
 
+/-- Assembly operands.
+    Chapter 10 adds `Data(identifier)` for RIP-relative access to static
+    variables in the data/BSS section.  Emitted as `name(%rip)`. -/
 inductive Operand where
   | Imm    : Int → Operand     -- immediate value $n
   | Reg    : Reg → Operand     -- hardware register
-  | Pseudo : String → Operand  -- pseudoregister (temporary variable)
+  | Pseudo : String → Operand  -- pseudoregister (temporary; replaced by PseudoReplace)
   | Stack  : Int → Operand     -- stack slot n(%rbp)
+  | Data   : String → Operand  -- Chapter 10: RIP-relative static variable name(%rip)
   deriving Repr, BEq
 
 inductive UnaryOp where
@@ -114,19 +121,33 @@ inductive Instruction where
   deriving Repr, BEq
 
 /-- An assembly function definition.
-    Chapter 9 adds `params` (for emitting parameter-copy instructions at entry)
-    and `stackSize` (set by PseudoReplace; used by FixUp to emit AllocateStack). -/
+    Chapter 9 adds `params` and `stackSize`.
+    Chapter 10 adds `global`: true if the function has external linkage and
+    requires a `.globl` directive in the emitter. -/
 structure FunctionDef where
   name         : String
+  global       : Bool          -- Chapter 10: true = external linkage, emit .globl
   params       : List String   -- renamed parameter names (for codegen entry copies)
   instructions : List Instruction
   stackSize    : Int           -- bytes needed for locals (filled in by PseudoReplace)
   deriving Repr, BEq
 
+/-- A top-level item in the assembly program.
+    Chapter 10: a program can contain both function definitions and static
+    variable definitions.
+    `StaticVariable(name, global, init)`:
+      - `name`:   identifier (original for file-scope; renamed for local-static)
+      - `global`: true if the symbol has external linkage (emits `.globl` directive)
+      - `init`:   initial integer value (0 for BSS, nonzero for data section) -/
+inductive AsmTopLevel where
+  | Function       : FunctionDef → AsmTopLevel
+  | StaticVariable : String → Bool → Int → AsmTopLevel  -- name, global, init
+  deriving Repr, BEq
+
 /-- A complete assembly program.
-    Chapter 9: holds a list of function definitions (one per source function). -/
+    Chapter 10: holds a list of `AsmTopLevel` items (functions and static vars). -/
 structure Program where
-  funcs : List FunctionDef
+  topLevels : List AsmTopLevel
   deriving Repr, BEq
 
 end AssemblyAST

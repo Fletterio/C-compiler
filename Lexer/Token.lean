@@ -64,6 +64,9 @@ inductive Token where
   | KwDefault  : Token   -- default
   -- Chapter 9: comma separator for argument lists and parameter lists
   | Comma      : Token   -- ,
+  -- Chapter 10: storage-class specifiers
+  | KwStatic   : Token   -- static
+  | KwExtern   : Token   -- extern
   deriving Repr, BEq
 
 /-- Human-readable description of a token, used in parser error messages. -/
@@ -125,5 +128,7 @@ def Token.describe : Token → String
   | .KwCase     => "\"case\""
   | .KwDefault  => "\"default\""
   | .Comma      => "\",\""
+  | .KwStatic   => "\"static\""
+  | .KwExtern   => "\"extern\""
 
 end Lexer
