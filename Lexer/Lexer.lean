@@ -77,6 +77,7 @@ private def classifyWord (word : String) : Token :=
   | "default"  => .KwDefault
   | "static"   => .KwStatic   -- Chapter 10: storage-class specifier
   | "extern"   => .KwExtern   -- Chapter 10: storage-class specifier
+  | "long"     => .KwLong     -- Chapter 11: long type keyword
   | _          => .Identifier word
 
 -- ---------------------------------------------------------------------------
@@ -165,14 +166,27 @@ private def nextToken (chars : List Char) : Option (Token × List Char) :=
         else
           none
       else if isDigit c then
-        -- Integer constant: [0-9]+\b
+        -- Integer constant: [0-9]+[lL]?\b
+        -- With an 'l' or 'L' suffix, produces a LongConstant token (Chapter 11).
         let (digitChars, remaining) := spanChars isDigit chars
-        if atWordBoundary remaining then
-          match (String.ofList digitChars).toNat? with
-          | some n => some (.Constant n, remaining)
-          | none   => none   -- unreachable: digit string always parses as Nat
-        else
-          none   -- e.g. "123bar" — not a valid token
+        -- Check for optional l/L suffix indicating a long literal
+        match remaining with
+        | 'l' :: rest | 'L' :: rest =>
+            -- Long constant suffix found; require a word boundary after it
+            if atWordBoundary rest then
+              match (String.ofList digitChars).toNat? with
+              | some n => some (.LongConstant n, rest)
+              | none   => none   -- unreachable
+            else
+              none   -- e.g. "123Lbar" — not a valid token
+        | _ =>
+            -- Plain integer constant (no suffix)
+            if atWordBoundary remaining then
+              match (String.ofList digitChars).toNat? with
+              | some n => some (.Constant n, remaining)
+              | none   => none   -- unreachable
+            else
+              none   -- e.g. "123bar" — not a valid token
       else
         none
 

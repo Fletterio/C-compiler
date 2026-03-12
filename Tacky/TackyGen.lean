@@ -5,54 +5,58 @@ import Semantics.SymbolTable
 /-
   IR generation pass: converts AST.Program → Tacky.Program.
 
-  Chapter 10 additions:
-    - Takes a `SymbolTable` as an additional parameter.
-    - For each function definition in the AST, emits a TACKY `Function` with
-      the `global` flag derived from the symbol table.
-    - After processing all AST function definitions, scans the symbol table and
-      generates `StaticVariable` top-level items:
-        - `Static(Initial(n), global)` → `StaticVariable(name, global, n)`
-        - `Static(Tentative, global)`  → `StaticVariable(name, global, 0)`
-        - `Static(NoInitializer, _)`   → skip (extern, not defined here)
-        - `FunAttr(_, _)`              → skip (function, not a variable)
-        - `Local`                      → skip (automatic variable, on the stack)
-    - Local static variables (renamed to `<orig>.<n>`) appear in the symbol
-      table under their renamed names and are emitted as non-global static vars.
-    - File-scope static variables appear under their original names.
-
-  The counter is GLOBAL across all functions (same as before), ensuring that
-  every generated temporary and label name is unique program-wide.
+  Chapter 11 additions:
+    - `emitExp` returns `(Val × AST.Typ × List Instruction)` so that each
+      expression's type is available for inserting correct assembly instructions.
+    - `makeTemporary` takes the type of the temporary being created and records
+      it in the `typeEnv` map (name → type) threaded through generation.
+    - Handles `AST.Exp.Cast`: emits `SignExtend` (Int→Long) or `Truncate`
+      (Long→Int) as appropriate.
+    - Handles typed constants: `ConstInt` → type `Int`, `ConstLong` → type `Long`.
+    - `emitProgram` returns `(Program × List (String × AST.Typ))`, the second
+      component being the `typeEnv` that the Driver uses to build the backend
+      symbol table.
+    - `StaticVariable` top-level items now carry the variable's AST.Typ.
+    - The counter is global across all functions (unchanged).
 -/
 
 namespace Tacky
 
-/-- The monad used during IR generation: a state monad carrying a `Nat`
-    counter that is incremented each time a new temporary or label is
-    allocated. -/
-private abbrev GenM := StateM Nat
+-- ---------------------------------------------------------------------------
+-- Generation monad
+-- ---------------------------------------------------------------------------
 
-/-- Allocate a fresh temporary variable name of the form `"tmp.N"`. -/
-private def makeTemporary : GenM String := do
-  let n ← get
-  modify (· + 1)
-  return s!"tmp.{n}"
+/-- State threaded through IR generation.
+    `counter`:  unique name counter (same as before).
+    `typeEnv`:  maps every temporary variable name (e.g. `"tmp.5"`) to its
+                scalar type, so the Driver can build the backend symbol table. -/
+private structure GenState where
+  counter : Nat
+  typeEnv : List (String × AST.Typ)
 
-/-- Allocate a fresh label with the given descriptive base name,
-    returning `"<base>.N"` where N is the current counter value. -/
+private abbrev GenM := StateM GenState
+
+/-- Allocate a fresh temporary of the given type, recording it in typeEnv. -/
+private def makeTemporary (t : AST.Typ) : GenM String := do
+  let s ← get
+  let name := s!"tmp.{s.counter}"
+  modify (fun (st : GenState) => { st with counter := st.counter + 1, typeEnv := (name, t) :: st.typeEnv })
+  return name
+
 private def makeLabel (base : String) : GenM String := do
-  let n ← get
-  modify (· + 1)
-  return s!"{base}.{n}"
+  let s ← get
+  modify (fun s => { s with counter := s.counter + 1 })
+  return s!"{base}.{s.counter - 1}"
 
-/-- Translate an AST unary operator to its TACKY equivalent. -/
+-- ---------------------------------------------------------------------------
+-- Operator translation
+-- ---------------------------------------------------------------------------
+
 private def convertUnop : AST.UnaryOp → UnaryOp
   | .Complement => .Complement
   | .Negate     => .Negate
   | .Not        => .Not
 
-/-- Translate an AST binary operator to its TACKY equivalent.
-    Not called for `And` or `Or`; those are handled via conditional jumps
-    in `emitExp` and never reach this function. -/
 private def convertBinop : AST.BinaryOp → BinaryOp
   | .Add           => .Add
   | .Subtract      => .Subtract
@@ -70,42 +74,68 @@ private def convertBinop : AST.BinaryOp → BinaryOp
   | .LessOrEqual   => .LessOrEqual
   | .GreaterThan   => .GreaterThan
   | .GreaterOrEqual => .GreaterOrEqual
-  | _              => .Add  -- unreachable: And/Or handled via jumps in emitExp
+  | _              => .Add   -- unreachable: And/Or handled via jumps
 
-/-- Flatten an AST expression into a list of TACKY instructions, returning
-    the `Val` that holds the expression's result.
+-- ---------------------------------------------------------------------------
+-- Expression lowering
+-- ---------------------------------------------------------------------------
 
-    - `Constant(n)`: no instructions; value is `Tacky.Val.Constant n`.
-    - `Var(v)`: no instructions; value is `Tacky.Val.Var v` directly.
-      (v is already renamed — static vars use their unique name, which
-       PseudoReplace will map to a Data/RIP-relative operand.)
-    - `Unary(op, inner)`: flatten `inner`, allocate a temporary, emit `Unary`.
-    - `Binary(And, e1, e2)`: short-circuit logical AND via `JumpIfZero`.
-    - `Binary(Or, e1, e2)`: short-circuit logical OR via `JumpIfNotZero`.
-    - `Binary(op, e1, e2)`: flatten both operands, allocate a temporary,
-      emit a `Binary` instruction.
-    - `Assignment(Var(v), rhs)`: flatten `rhs`, emit `Copy(result, Var(v))`,
-      return `Var(v)` (the value of an assignment is the assigned value).
-    - `PostfixIncr(Var(v))`: save the old value to a temporary, emit
-      `Binary(Add, Var(v), 1, Var(v))` to increment in place, return old value.
-    - `PostfixDecr(Var(v))`: same as `PostfixIncr` but subtracts 1.
-    - `FunCall(name, args)`: flatten each argument, allocate a temporary for
-      the return value, emit a `FunCall` instruction. -/
-private def emitExp : AST.Exp → GenM (Val × List Instruction)
-  | .Constant n     => return (.Constant n, [])
-  | .Var v          => return (.Var v, [])
+/-- Lower an AST expression to TACKY instructions.
+    Returns `(result_val, result_type, instructions)`.
+
+    Chapter 11:
+    - `Constant(.ConstInt n)` → `(Constant n, Int, [])`
+    - `Constant(.ConstLong n)` → `(Constant n, Long, [])`
+    - `Cast(.Long, e)` where e : Int → emit `SignExtend`
+    - `Cast(.Int, e)` where e : Long → emit `Truncate`
+    - `Cast(t, e)` where e already has type t → identity (no instruction)
+    - Binary relational operators always produce `Int` results (0 or 1).
+    - Other binary operators produce the common type of their operands.
+      (TypeCheck has already inserted Casts so operands have the same type.) -/
+private def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val × AST.Typ × List Instruction)
+  | .Constant (.ConstInt n)  => return (.Constant n, .Int,  [])
+  | .Constant (.ConstLong n) => return (.Constant n, .Long, [])
+  | .Var v => do
+      -- Look up the variable's type from the symbol table
+      let t : AST.Typ := match Semantics.lookupSym st v with
+        | some { type := .Obj t, .. } => t
+        | _ => .Int   -- default (temporaries are not in frontend sym table)
+      return (.Var v, t, [])
+  | .Cast targetTyp inner => do
+      let (src, srcTyp, instrs) ← emitExp st inner
+      if targetTyp == srcTyp then
+        -- No conversion needed (same type): pass through
+        return (src, targetTyp, instrs)
+      else
+        let dst := Val.Var (← makeTemporary targetTyp)
+        match targetTyp, srcTyp with
+        | .Long, .Int =>
+            -- Sign-extend 32-bit int to 64-bit long
+            return (dst, .Long, instrs ++ [.SignExtend src dst])
+        | .Int, .Long =>
+            -- Truncate 64-bit long to 32-bit int
+            return (dst, .Int, instrs ++ [.Truncate src dst])
+        | _, _ =>
+            -- Same type (redundant cast): pass through
+            return (src, targetTyp, instrs)
+  | .Unary .Not inner => do
+      -- Logical NOT: result is always Int (0 or 1)
+      let (src, _, instrs) ← emitExp st inner
+      let dst := Val.Var (← makeTemporary .Int)
+      return (dst, .Int, instrs ++ [.Unary .Not src dst])
   | .Unary op inner => do
-      let (src, innerInstrs) ← emitExp inner
-      let dst := Val.Var (← makeTemporary)
-      let instr := Instruction.Unary (convertUnop op) src dst
-      return (dst, innerInstrs ++ [instr])
+      let (src, srcTyp, instrs) ← emitExp st inner
+      let dst := Val.Var (← makeTemporary srcTyp)
+      return (dst, srcTyp, instrs ++ [.Unary (convertUnop op) src dst])
   | .Binary .And e1 e2 => do
-      let falseLabel    ← makeLabel "and_false"
-      let endLabel      ← makeLabel "and_end"
-      let (v1, instrs1) ← emitExp e1
-      let (v2, instrs2) ← emitExp e2
-      let result        := Val.Var (← makeTemporary)
+      -- Short-circuit logical AND; result is always Int
+      let falseLabel ← makeLabel "and_false"
+      let endLabel   ← makeLabel "and_end"
+      let (v1, _, instrs1) ← emitExp st e1
+      let (v2, _, instrs2) ← emitExp st e2
+      let result := Val.Var (← makeTemporary .Int)
       return (result,
+        .Int,
         instrs1 ++
         [.JumpIfZero v1 falseLabel] ++
         instrs2 ++
@@ -116,12 +146,14 @@ private def emitExp : AST.Exp → GenM (Val × List Instruction)
          .Copy (.Constant 0) result,
          .Label endLabel])
   | .Binary .Or e1 e2 => do
-      let trueLabel     ← makeLabel "or_true"
-      let endLabel      ← makeLabel "or_end"
-      let (v1, instrs1) ← emitExp e1
-      let (v2, instrs2) ← emitExp e2
-      let result        := Val.Var (← makeTemporary)
+      -- Short-circuit logical OR; result is always Int
+      let trueLabel  ← makeLabel "or_true"
+      let endLabel   ← makeLabel "or_end"
+      let (v1, _, instrs1) ← emitExp st e1
+      let (v2, _, instrs2) ← emitExp st e2
+      let result := Val.Var (← makeTemporary .Int)
       return (result,
+        .Int,
         instrs1 ++
         [.JumpIfNotZero v1 trueLabel] ++
         instrs2 ++
@@ -132,19 +164,29 @@ private def emitExp : AST.Exp → GenM (Val × List Instruction)
          .Copy (.Constant 1) result,
          .Label endLabel])
   | .Binary op e1 e2 => do
-      let (src1, instrs1) ← emitExp e1
-      let (src2, instrs2) ← emitExp e2
-      let dst := Val.Var (← makeTemporary)
-      let instr := Instruction.Binary (convertBinop op) src1 src2 dst
-      return (dst, instrs1 ++ instrs2 ++ [instr])
+      let (src1, t1, instrs1) ← emitExp st e1
+      let (src2, t2, instrs2) ← emitExp st e2
+      -- After TypeCheck, both operands have the same type (casts were inserted),
+      -- EXCEPT for shift operators where the right operand keeps its own type.
+      -- Relational operators always produce Int.
+      -- Shift operators: result type is the type of the LEFT operand (C §6.5.7).
+      -- Other arithmetic operators produce the common type of both operands.
+      let resultTyp : AST.Typ := match op with
+        | .Equal | .NotEqual | .LessThan | .LessOrEqual
+        | .GreaterThan | .GreaterOrEqual => .Int
+        | .ShiftLeft | .ShiftRight => t1   -- type of left operand, not common type
+        | _ => if t1 == .Long || t2 == .Long then .Long else .Int
+      let dst := Val.Var (← makeTemporary resultTyp)
+      return (dst, resultTyp, instrs1 ++ instrs2 ++ [.Binary (convertBinop op) src1 src2 dst])
   | .Conditional cond e1 e2 => do
       let e2Label  ← makeLabel "ternary_else"
       let endLabel ← makeLabel "ternary_end"
-      let (c,  condInstrs) ← emitExp cond
-      let (v1, e1Instrs)   ← emitExp e1
-      let (v2, e2Instrs)   ← emitExp e2
-      let result := Val.Var (← makeTemporary)
-      return (result,
+      let (c,  _, condInstrs) ← emitExp st cond
+      let (v1, t1, e1Instrs) ← emitExp st e1
+      let (v2, _, e2Instrs)  ← emitExp st e2
+      -- After TypeCheck, both branches have the same type
+      let result := Val.Var (← makeTemporary t1)
+      return (result, t1,
         condInstrs ++
         [.JumpIfZero c e2Label] ++
         e1Instrs ++
@@ -152,242 +194,218 @@ private def emitExp : AST.Exp → GenM (Val × List Instruction)
         e2Instrs ++
         [.Copy v2 result, .Label endLabel])
   | .Assignment (.Var v) rhs => do
-      let (result, instrs) ← emitExp rhs
-      return (.Var v, instrs ++ [.Copy result (.Var v)])
-  | .Assignment _ _ => return (.Constant 0, [])  -- unreachable after var resolution
+      let (result, _, instrs) ← emitExp st rhs
+      -- After TypeCheck, rhs is already cast to match v's type
+      let varTyp : AST.Typ := match Semantics.lookupSym st v with
+        | some { type := .Obj t, .. } => t
+        | _ => .Int
+      return (.Var v, varTyp, instrs ++ [.Copy result (.Var v)])
+  | .Assignment _ _ => return (.Constant 0, .Int, [])
   | .PostfixIncr (.Var v) => do
-      -- Save old value, then increment v in place, return old value.
-      let tmp ← makeTemporary
-      return (.Var tmp,
+      let varTyp : AST.Typ := match Semantics.lookupSym st v with
+        | some { type := .Obj t, .. } => t
+        | _ => .Int
+      let tmp ← makeTemporary varTyp
+      -- Determine the right constant: 1 as Int or 1 as Long
+      let one := Val.Constant 1
+      return (.Var tmp, varTyp,
         [.Copy (.Var v) (.Var tmp),
-         .Binary .Add (.Var v) (.Constant 1) (.Var v)])
-  | .PostfixIncr _ => return (.Constant 0, [])   -- unreachable after var resolution
+         .Binary .Add (.Var v) one (.Var v)])
+  | .PostfixIncr _ => return (.Constant 0, .Int, [])
   | .PostfixDecr (.Var v) => do
-      let tmp ← makeTemporary
-      return (.Var tmp,
+      let varTyp : AST.Typ := match Semantics.lookupSym st v with
+        | some { type := .Obj t, .. } => t
+        | _ => .Int
+      let tmp ← makeTemporary varTyp
+      let one := Val.Constant 1
+      return (.Var tmp, varTyp,
         [.Copy (.Var v) (.Var tmp),
-         .Binary .Subtract (.Var v) (.Constant 1) (.Var v)])
-  | .PostfixDecr _ => return (.Constant 0, [])   -- unreachable after var resolution
+         .Binary .Subtract (.Var v) one (.Var v)])
+  | .PostfixDecr _ => return (.Constant 0, .Int, [])
   | .FunCall name args => do
-      let argResults ← args.mapM emitExp
-      let argInstrs := argResults.foldl (fun acc (_, instrs) => acc ++ instrs) []
-      let argVals   := argResults.map (fun (v, _) => v)
-      let dst := Val.Var (← makeTemporary)
-      return (dst, argInstrs ++ [.FunCall name argVals dst])
+      let argResults ← args.mapM (emitExp st)
+      let argInstrs := argResults.foldl (fun acc (_, _, instrs) => acc ++ instrs) []
+      let argVals   := argResults.map   (fun (v, _, _) => v)
+      -- Look up the function's return type
+      let retTyp : AST.Typ := match Semantics.lookupSym st name with
+        | some { type := .Fun _ _ rt, .. } => rt
+        | _ => .Int
+      let dst := Val.Var (← makeTemporary retTyp)
+      return (dst, retTyp, argInstrs ++ [.FunCall name argVals dst])
 
-/-- Translate a `for`-loop initial clause into TACKY instructions.
-    A declaration initializer emits the expression and a `Copy` into the
-    renamed variable.  An expression clause emits the expression and discards
-    its result.  An absent clause emits nothing.
+-- ---------------------------------------------------------------------------
+-- Statement and block-item lowering
+-- ---------------------------------------------------------------------------
 
-    Chapter 10: local-static declarations have no initializer in the AST body
-    (the init was removed by VarResolution); `InitDecl` with `none` init → empty. -/
-private def emitForInit : AST.ForInit → GenM (List Instruction)
+private def emitForInit (st : Semantics.SymbolTable) : AST.ForInit → GenM (List Instruction)
   | .InitExp none   => return []
   | .InitExp (some e) => do
-      let (_, instrs) ← emitExp e
+      let (_, _, instrs) ← emitExp st e
       return instrs
   | .InitDecl decl =>
       match decl.init with
       | none   => return []
       | some e => do
-          let (val, instrs) ← emitExp e
+          let (val, _, instrs) ← emitExp st e
           return instrs ++ [.Copy val (.Var decl.name)]
 
-/-
-  `emitStatement` and `emitBlockItem` are mutually recursive through the
-  `Compound` constructor.
--/
 mutual
 
-/-- Translate an AST statement into a flat list of TACKY instructions.
-    `funcName` is the name of the enclosing function, used to make
-    user-defined labels unique across functions.
-
-    Chapter 10: no changes to statement lowering.  Static variables are
-    addressed via `Var(uniqueName)` in expressions; PseudoReplace maps them
-    to `Data` operands instead of `Stack` slots.  Initializers for static
-    local variables are NOT emitted here (they are emitted as `StaticVariable`
-    top-level items in TackyGen instead). -/
-private partial def emitStatement (funcName : String) : AST.Statement → GenM (List Instruction)
+private partial def emitStatement (st : Semantics.SymbolTable) (funcName : String)
+    : AST.Statement → GenM (List Instruction)
   | .Return e => do
-      let (v, instrs) ← emitExp e
+      let (v, _, instrs) ← emitExp st e
       return instrs ++ [.Return v]
   | .Expression e => do
-      let (_, instrs) ← emitExp e
+      let (_, _, instrs) ← emitExp st e
       return instrs
   | .If cond thenStmt none => do
       let endLabel ← makeLabel "if_end"
-      let (c, condInstrs) ← emitExp cond
-      let thenInstrs ← emitStatement funcName thenStmt
+      let (c, _, condInstrs) ← emitExp st cond
+      let thenInstrs ← emitStatement st funcName thenStmt
       return condInstrs ++ [.JumpIfZero c endLabel] ++ thenInstrs ++ [.Label endLabel]
   | .If cond thenStmt (some elseStmt) => do
       let elseLabel ← makeLabel "if_else"
       let endLabel  ← makeLabel "if_end"
-      let (c, condInstrs) ← emitExp cond
-      let thenInstrs ← emitStatement funcName thenStmt
-      let elseInstrs ← emitStatement funcName elseStmt
+      let (c, _, condInstrs) ← emitExp st cond
+      let thenInstrs ← emitStatement st funcName thenStmt
+      let elseInstrs ← emitStatement st funcName elseStmt
       return condInstrs ++ [.JumpIfZero c elseLabel] ++ thenInstrs ++
              [.Jump endLabel, .Label elseLabel] ++ elseInstrs ++ [.Label endLabel]
   | .Compound items => do
       let instrs ← items.foldlM (fun acc item => do
-        return acc ++ (← emitBlockItem funcName item)) []
+        return acc ++ (← emitBlockItem st funcName item)) []
       return instrs
-  -- Chapter 8: while loop
   | .While cond body (some base) => do
       let cntLabel := "cnt_" ++ base
       let brkLabel := "brk_" ++ base
-      let (c, condInstrs) ← emitExp cond
-      let bodyInstrs ← emitStatement funcName body
+      let (c, _, condInstrs) ← emitExp st cond
+      let bodyInstrs ← emitStatement st funcName body
       return [.Label cntLabel] ++ condInstrs ++ [.JumpIfZero c brkLabel] ++
              bodyInstrs ++ [.Jump cntLabel, .Label brkLabel]
-  | .While _ _ none => return []   -- unreachable: loop labeling always sets label
-  -- Chapter 8: do-while loop
+  | .While _ _ none => return []
   | .DoWhile body cond (some base) => do
       let startLabel := "start_" ++ base
       let cntLabel   := "cnt_"   ++ base
       let brkLabel   := "brk_"   ++ base
-      let bodyInstrs ← emitStatement funcName body
-      let (c, condInstrs) ← emitExp cond
+      let bodyInstrs ← emitStatement st funcName body
+      let (c, _, condInstrs) ← emitExp st cond
       return [.Label startLabel] ++ bodyInstrs ++ [.Label cntLabel] ++
              condInstrs ++ [.JumpIfNotZero c startLabel, .Label brkLabel]
-  | .DoWhile _ _ none => return []   -- unreachable
-  -- Chapter 8: for loop
+  | .DoWhile _ _ none => return []
   | .For init cond post body (some base) => do
       let startLabel := "start_" ++ base
       let cntLabel   := "cnt_"   ++ base
       let brkLabel   := "brk_"   ++ base
-      let initInstrs ← emitForInit init
+      let initInstrs ← emitForInit st init
       let condInstrs ← match cond with
         | none   => pure []
         | some c => do
-            let (v, instrs) ← emitExp c
+            let (v, _, instrs) ← emitExp st c
             pure (instrs ++ [.JumpIfZero v brkLabel])
-      let bodyInstrs ← emitStatement funcName body
+      let bodyInstrs ← emitStatement st funcName body
       let postInstrs ← match post with
         | none   => pure []
         | some e => do
-            let (_, instrs) ← emitExp e
+            let (_, _, instrs) ← emitExp st e
             pure instrs
       return initInstrs ++ [.Label startLabel] ++ condInstrs ++ bodyInstrs ++
              [.Label cntLabel] ++ postInstrs ++ [.Jump startLabel, .Label brkLabel]
-  | .For _ _ _ _ none => return []   -- unreachable
-  -- Chapter 8: break and continue
+  | .For _ _ _ _ none => return []
   | .Break (some base)    => return [.Jump ("brk_" ++ base)]
-  | .Break none           => return []   -- unreachable after loop labeling
+  | .Break none           => return []
   | .Continue (some base) => return [.Jump ("cnt_" ++ base)]
-  | .Continue none        => return []   -- unreachable after loop labeling
-  -- Chapter 8 extra credit: switch statement
+  | .Continue none        => return []
   | .Switch exp body (some base) cases => do
       let brkLabel := "brk_" ++ base
-      let (v, expInstrs) ← emitExp exp
+      let (v, vTyp, expInstrs) ← emitExp st exp
       let jumpTable ← cases.foldlM (fun acc (caseVal, caseLbl) => do
           match caseVal with
           | some n => do
-              let tmp := Val.Var (← makeTemporary)
-              pure (acc ++ [.Binary .Equal v (.Constant n) tmp,
+              -- Compare switch value against case constant (same type as v)
+              let caseConst := Val.Constant n
+              let tmp := Val.Var (← makeTemporary .Int)
+              pure (acc ++ [.Binary .Equal v caseConst tmp,
                             .JumpIfNotZero tmp caseLbl])
           | none => pure (acc ++ [.Jump caseLbl])) []
-      let noDefault  := cases.all (fun (v, _) => v.isSome)
+      let noDefault   := cases.all (fun (v, _) => v.isSome)
       let fallThrough := if noDefault then [Instruction.Jump brkLabel] else []
-      let bodyInstrs ← emitStatement funcName body
+      let bodyInstrs ← emitStatement st funcName body
       return expInstrs ++ jumpTable ++ fallThrough ++ bodyInstrs ++ [.Label brkLabel]
-  | .Switch _ _ none _ => return []   -- unreachable
-  -- Chapter 8 extra credit: case and default
+  | .Switch _ _ none _ => return []
   | .Case _ body (some lbl) => do
-      return [.Label lbl] ++ (← emitStatement funcName body)
-  | .Case _ _ none => return []   -- unreachable
+      return [.Label lbl] ++ (← emitStatement st funcName body)
+  | .Case _ _ none => return []
   | .Default body (some lbl) => do
-      return [.Label lbl] ++ (← emitStatement funcName body)
-  | .Default _ none => return []   -- unreachable
-  -- Chapter 6 extra credit: labeled statement and goto
+      return [.Label lbl] ++ (← emitStatement st funcName body)
+  | .Default _ none => return []
   | .Labeled label stmt => do
-      let stmtInstrs ← emitStatement funcName stmt
+      let stmtInstrs ← emitStatement st funcName stmt
       return [.Label (funcName ++ "." ++ label)] ++ stmtInstrs
   | .Goto label =>
       return [.Jump (funcName ++ "." ++ label)]
   | .Null => return []
 
-/-- Translate a single block item into a list of TACKY instructions.
-
-    Chapter 10: local static variables (`static int x = n`) have their
-    initializer removed by VarResolution (replaced with `none`).  So
-    `InitDecl { init := none }` for a static var produces no instructions here
-    — the variable is initialized via its `StaticVariable` top-level entry.
-    The variable is still referenced by name in expressions; PseudoReplace
-    will map the name to a `Data` operand. -/
-private partial def emitBlockItem (funcName : String) : AST.BlockItem → GenM (List Instruction)
-  | .S stmt => emitStatement funcName stmt
+private partial def emitBlockItem (st : Semantics.SymbolTable) (funcName : String)
+    : AST.BlockItem → GenM (List Instruction)
+  | .S stmt => emitStatement st funcName stmt
   | .D decl =>
       match decl.init with
       | none   => return []
       | some e => do
-          let (val, instrs) ← emitExp e
+          let (val, _, instrs) ← emitExp st e
           return instrs ++ [.Copy val (.Var decl.name)]
-  | .FD _ =>
-      -- Local function declarations carry no code; skip them.
-      return []
+  | .FD _ => return []
 
 end
 
-/-- Translate an AST function definition to TACKY.
-    Chapter 10: the `global` flag is taken from the symbol table (passed in
-    from the caller).  This flag controls whether the function's symbol is
-    exported (`.globl` directive in the emitter). -/
-private def emitFunctionDef (f : AST.FunctionDef) (isGlobal : Bool) : GenM FunctionDef := do
+-- ---------------------------------------------------------------------------
+-- Function and program emission
+-- ---------------------------------------------------------------------------
+
+/-- Emit a TACKY function definition.
+    Chapter 11: param names are still plain strings (types are in sym table). -/
+private def emitFunctionDef (st : Semantics.SymbolTable) (f : AST.FunctionDef)
+    (isGlobal : Bool) : GenM FunctionDef := do
+  -- Extract just the renamed parameter names (types are in the sym table)
+  let paramNames := f.params.map (·.2)
   let body ← f.body.foldlM (fun acc item => do
-    return acc ++ (← emitBlockItem f.name item)) []
-  return { name := f.name, params := f.params,
+    return acc ++ (← emitBlockItem st f.name item)) []
+  return { name := f.name, params := paramNames,
            body := body ++ [.Return (.Constant 0)],
            global := isGlobal }
 
-/-- Scan the symbol table and collect all static variable entries as
-    `TackyTopLevel.StaticVariable` items.
-
-    Rules:
-      - `Static(Initial(n), global)` → `StaticVariable(name, global, n)`
-      - `Static(Tentative, global)`  → `StaticVariable(name, global, 0)`
-      - `Static(NoInitializer, _)`   → skip (extern ref, no storage in this TU)
-      - `FunAttr(_, _)`              → skip (function entry)
-      - `Local`                      → skip (automatic variable, on the stack) -/
+/-- Collect static variable entries from the symbol table and emit them as
+    TackyTopLevel.StaticVariable items.
+    Chapter 11: includes the variable's type so the emitter can use .long/.quad. -/
 private def emitStaticVars (symTable : Semantics.SymbolTable) : List TackyTopLevel :=
   symTable.filterMap fun (name, entry) =>
-    match entry.attrs with
-    | .Static (.Initial n) isGlobal  => some (.StaticVariable name isGlobal n)
-    | .Static .Tentative   isGlobal  => some (.StaticVariable name isGlobal 0)
-    | .Static .NoInitializer _       => none   -- extern, not defined here
-    | .FunAttr _ _                   => none   -- function entry
-    | .Local                         => none   -- automatic variable
+    match entry.type, entry.attrs with
+    | .Obj t, .Static (.Initial n) isGlobal  => some (.StaticVariable name isGlobal t n)
+    | .Obj t, .Static .Tentative   isGlobal  => some (.StaticVariable name isGlobal t 0)
+    | _,      _                              => none
 
 /-- Entry point for the IR generation pass.
-    Chapter 10:
-      - Takes a `SymbolTable` to determine function linkage (`global` flag) and
-        to generate `StaticVariable` top-level items.
-      - Processes all `FunDef` top-level items.
-      - Skips `FunDecl` and `VarDecl` entries (no code to generate).
-      - After emitting functions, scans the symbol table to emit static vars.
-    The counter is GLOBAL across all functions. -/
+    Returns `(Program, typeEnv)` where `typeEnv` maps each generated temporary
+    name to its scalar type.  The Driver uses this to build the backend symbol
+    table for CodeGen and PseudoReplace. -/
 def emitProgram (p : AST.Program) (symTable : Semantics.SymbolTable)
-    (initCounter : Nat := 0) : Program :=
-  -- Collect only the FunDef top-levels (skip FunDecl and VarDecl)
+    (initCounter : Nat := 0) : Program × List (String × AST.Typ) :=
   let astFuncs := p.topLevels.filterMap fun tl =>
     match tl with
     | .FunDef fd  => some fd
     | .FunDecl _  => none
     | .VarDecl _  => none
-  -- Emit each function sequentially, threading the counter through
   let action : GenM (List TackyTopLevel) :=
     astFuncs.foldlM (fun acc fd => do
-      -- Determine global flag from symbol table
       let isGlobal : Bool := match Semantics.lookupSym symTable fd.name with
         | some { attrs := .FunAttr _ g, .. } => g
-        | _ => true  -- default to global if not found (shouldn't happen)
-      let tackyFd ← emitFunctionDef fd isGlobal
+        | _ => true
+      let tackyFd ← emitFunctionDef symTable fd isGlobal
       return acc ++ [.Function tackyFd]) []
-  let (funcItems, _) := action.run initCounter
-  -- Append StaticVariable items from the symbol table
+  let initState : GenState := { counter := initCounter, typeEnv := [] }
+  let (funcItems, finalState) := action.run initState
   let staticItems := emitStaticVars symTable
-  -- Functions first, then static variables (order matters for readability)
-  { topLevels := funcItems ++ staticItems }
+  ({ topLevels := funcItems ++ staticItems }, finalState.typeEnv)
 
 end Tacky

@@ -1,25 +1,24 @@
+import AST.AST
+
 namespace Tacky
 
 /-
-  TACKY intermediate representation for Chapter 10.
+  TACKY intermediate representation for Chapter 11.
 
-  Chapter 10 additions:
-    - `global : Bool` field on `FunctionDef`: true if the function has external
-      linkage (not declared `static`).  Used by CodeGen to pass along the
-      global flag to the assembly AST.
-    - `TackyTopLevel`: replaces the flat list of FunctionDef values.  A top-level
-      item is now either a function definition or a static variable definition.
-    - `StaticVariable(name, global, init)`: a file-scope or local-static variable
-      with static storage duration.  `name` is the unique identifier (original
-      name for file-scope; renamed `<orig>.<n>` for local static).  `global`
-      indicates external linkage.  `init` is the initial integer value (0 for
-      tentative definitions).
-    - `Program.topLevels : List TackyTopLevel` replaces `Program.funcs`.
+  Chapter 11 additions:
+    - `SignExtend(src, dst)`: sign-extend a 32-bit int value to 64-bit long.
+      Lowers to `movslq` in the assembler.
+    - `Truncate(src, dst)`: truncate a 64-bit long value to 32-bit int.
+      Lowers to `movl` (upper bits are ignored).
+    - `StaticVariable` now carries the variable's scalar type (`AST.Typ`) so
+      that the assembly emitter can choose `.long`/`.zero 4` for Int and
+      `.quad`/`.zero 8` for Long.
 
   ASDL definition:
     program            = Program(top_level*)
     top_level          = Function(function_definition)
-                       | StaticVariable(identifier name, bool global, int init)
+                       | StaticVariable(identifier name, bool global,
+                                        ★ type typ, int init)
     function_definition = Function(identifier name, identifier* params,
                                    instruction* body, bool global)
     instruction        = Return(val)
@@ -31,32 +30,22 @@ namespace Tacky
                        | JumpIfNotZero(val condition, identifier target)
                        | Label(identifier)
                        | FunCall(identifier fun_name, val* args, val dst)
+                       | ★ SignExtend(val src, val dst)
+                       | ★ Truncate(val src, val dst)
     val                = Constant(int) | Var(identifier)
     unary_operator     = Complement | Negate | Not
     binary_operator    = Add | Subtract | Multiply | Divide | Remainder
                        | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight
                        | Equal | NotEqual
                        | LessThan | LessOrEqual | GreaterThan | GreaterOrEqual
-
-  Note: static variables are addressed via the `StaticVariable` top-level, not
-  as stack-allocated pseudoregisters.  The `Var(name)` operand in TACKY
-  instructions refers to the unique name; PseudoReplace will map it to a
-  `Data(name)` (RIP-relative) operand for static variables.
-
-  ASDL built-in types map to Lean as:
-    identifier  →  String
-    int         →  Int
 -/
 
 inductive UnaryOp where
-  | Complement : UnaryOp  -- bitwise ~
-  | Negate     : UnaryOp  -- arithmetic unary -
-  | Not        : UnaryOp  -- logical !  (produces 0 or 1)
+  | Complement : UnaryOp
+  | Negate     : UnaryOp
+  | Not        : UnaryOp
   deriving Repr, BEq
 
-/-- The arithmetic, bitwise, and relational binary operators in TACKY.
-    Logical && and || are NOT represented here; they lower to conditional
-    jumps in TackyGen. -/
 inductive BinaryOp where
   | Add          : BinaryOp
   | Subtract     : BinaryOp
@@ -68,12 +57,12 @@ inductive BinaryOp where
   | BitXor       : BinaryOp
   | ShiftLeft    : BinaryOp
   | ShiftRight   : BinaryOp
-  | Equal        : BinaryOp  -- ==  (result is 0 or 1)
-  | NotEqual     : BinaryOp  -- !=  (result is 0 or 1)
-  | LessThan     : BinaryOp  -- <   (result is 0 or 1)
-  | LessOrEqual  : BinaryOp  -- <=  (result is 0 or 1)
-  | GreaterThan  : BinaryOp  -- >   (result is 0 or 1)
-  | GreaterOrEqual : BinaryOp -- >= (result is 0 or 1)
+  | Equal        : BinaryOp
+  | NotEqual     : BinaryOp
+  | LessThan     : BinaryOp
+  | LessOrEqual  : BinaryOp
+  | GreaterThan  : BinaryOp
+  | GreaterOrEqual : BinaryOp
   deriving Repr, BEq
 
 inductive Val where
@@ -82,48 +71,41 @@ inductive Val where
   deriving Repr, BEq
 
 /-- TACKY instructions.
-    `FunCall` is new in Chapter 9: call a function with a list of argument
-    values and store the return value in `dst`. -/
+    Chapter 11 adds `SignExtend` and `Truncate` for type conversions. -/
 inductive Instruction where
   | Return        : Val → Instruction
-  | Unary         : UnaryOp → Val → Val → Instruction         -- op, src, dst
-  | Binary        : BinaryOp → Val → Val → Val → Instruction  -- op, src1, src2, dst
-  | Copy          : Val → Val → Instruction                   -- src, dst
-  | Jump          : String → Instruction                      -- unconditional jump to target
-  | JumpIfZero    : Val → String → Instruction               -- jump to target if condition == 0
-  | JumpIfNotZero : Val → String → Instruction              -- jump to target if condition != 0
-  | Label         : String → Instruction                      -- defines a jump target
-  | FunCall       : String → List Val → Val → Instruction     -- Chapter 9: call fun(args) → dst
+  | Unary         : UnaryOp → Val → Val → Instruction
+  | Binary        : BinaryOp → Val → Val → Val → Instruction
+  | Copy          : Val → Val → Instruction
+  | Jump          : String → Instruction
+  | JumpIfZero    : Val → String → Instruction
+  | JumpIfNotZero : Val → String → Instruction
+  | Label         : String → Instruction
+  | FunCall       : String → List Val → Val → Instruction
+  /-- Sign-extend `src` (Int) into `dst` (Long): emits `movslq`. -/
+  | SignExtend    : Val → Val → Instruction
+  /-- Truncate `src` (Long) to `dst` (Int): emits `movl` (upper bits discarded). -/
+  | Truncate      : Val → Val → Instruction
   deriving Repr, BEq
 
-/-- A TACKY function definition.
-    Chapter 9 adds `params`.
-    Chapter 10 adds `global`: true if this function has external linkage
-    (i.e. NOT declared with the `static` specifier).  The assembly emitter
-    uses this flag to decide whether to emit a `.globl` directive. -/
+/-- A TACKY function definition. -/
 structure FunctionDef where
-  name   : String           -- function name
-  params : List String      -- renamed parameter variable names (from VarResolution)
+  name   : String
+  params : List String      -- renamed parameter names
   body   : List Instruction
-  global : Bool             -- Chapter 10: true = external linkage, false = internal (static)
+  global : Bool
   deriving Repr, BEq
 
 /-- A top-level item in the TACKY program.
-    Chapter 10 adds `StaticVariable` for file-scope and local-static variables.
-    `StaticVariable(name, global, init)`:
-      - `name`:   the unique identifier (original for file-scope; `<orig>.<n>` for local-static)
-      - `global`: true if externally visible (external linkage)
-      - `init`:   initial value (0 for tentative/zero-initialized definitions)
-    Function definitions that are declared-but-not-defined in this TU are
-    represented as `FunDecl` entries in the AST but produce nothing in TACKY. -/
+    Chapter 11: `StaticVariable` carries the variable type for proper assembly
+    section/directive selection (.long vs .quad, .zero 4 vs .zero 8). -/
 inductive TackyTopLevel where
   | Function       : FunctionDef → TackyTopLevel
-  | StaticVariable : String → Bool → Int → TackyTopLevel   -- name, global, initVal
+  /-- Static variable: name, global flag, scalar type, initial value. -/
+  | StaticVariable : String → Bool → AST.Typ → Int → TackyTopLevel
   deriving Repr, BEq
 
-/-- A complete TACKY program.
-    Chapter 10: the program holds a list of `TackyTopLevel` items, which
-    include both function definitions and static variable definitions. -/
+/-- A complete TACKY program. -/
 structure Program where
   topLevels : List TackyTopLevel
   deriving Repr, BEq

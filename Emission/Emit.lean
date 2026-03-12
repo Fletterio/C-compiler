@@ -3,55 +3,28 @@ import AssemblyAST.AssemblyAST
 /-
   Code emission pass: converts AssemblyAST.Program to x64 AT&T-syntax assembly.
 
-  Chapter 10 additions:
-    - `Data(name)` operands: emitted as `name(%rip)` (RIP-relative addressing).
-    - `StaticVariable(name, global, init)`: emitted as a set of assembly
-      directives in the `.data` (nonzero init) or `.bss` (zero init) section:
-        global, nonzero:   .globl name / .data / .align 4 / name: / .long init
-        global, zero:      .globl name / .bss  / .align 4 / name: / .zero 4
-        local, nonzero:                  .data / .align 4 / name: / .long init
-        local, zero:                     .bss  / .align 4 / name: / .zero 4
-    - Function definitions:
-        - A `.text` directive is emitted before each function (required now
-          that other sections are also emitted by this pass).
-        - The `.globl` directive is emitted only when `FunctionDef.global` is
-          true (internal-linkage functions declared `static` omit it).
-
-  Linux conventions:
-  - Function labels are emitted as-is (no leading underscore).
-  - A .section .note.GNU-stack directive is appended to mark the stack
-    non-executable.
-  - External function calls use the `@PLT` suffix (Position-Independent Code
-    compatible; required for functions not defined in this translation unit).
-
-  Function prologue (emitted before the instruction list):
-      pushq %rbp
-      movq  %rsp, %rbp
-
-  AllocateStack(n) emits the third prologue instruction:
-      subq $n, %rsp
-
-  DeallocateStack(n) emits:
-      addq $n, %rsp
-
-  Push(operand) emits:
-      pushq <64-bit operand>
-
-  Call(name) emits:
-      call name       (if name is locally defined)
-      call name@PLT   (if name is external on Linux)
-
-  Ret emits the full epilogue:
-      movq %rbp, %rsp
-      popq %rbp
-      ret
-
-  Operand formatting:
-    Imm(n)       →  $n
-    Reg(AX)      →  %eax  / %rax  / %al
-    Stack(n)     →  n(%rbp)
-    Data(name)   →  name(%rip)   [Chapter 10: RIP-relative]
-    Pseudo(_)    →  (illegal at this stage — should have been replaced)
+  Chapter 11 additions:
+    - `emitReg4/8/1` extended with `SP`: `%esp` / `%rsp` / `%spl`.
+    - `emitOperand` and `emitOperand8` unchanged (Data → `name(%rip)` etc.).
+    - `emitInstruction` now pattern-matches on typed instructions:
+        `Mov(Longword, ...)` → `movl`
+        `Mov(Quadword, ...)` → `movq`
+        `Movsx src, dst`     → `movslq`
+        `Unary(Longword, Neg, ...)` → `negl`, `(Quadword, ...)` → `negq`, etc.
+        `Binary(Longword, Add, ...)` → `addl`, `(Quadword, ...)` → `addq`, etc.
+        `Idiv(Longword, ...)`  → `idivl`, `(Quadword, ...)` → `idivq`
+        `Cdq(Longword)`        → `cdq`
+        `Cdq(Quadword)`        → `cqo`
+    - `StaticVariable(name, global, alignment, init)`:
+        `IntInit(n != 0)`  → `.data / .align 4 / name: / .long n`
+        `IntInit(0)`       → `.bss  / .align 4 / name: / .zero 4`
+        `LongInit(n != 0)` → `.data / .align 8 / name: / .quad n`
+        `LongInit(0)`      → `.bss  / .align 8 / name: / .zero 8`
+    - `Push` still emits `pushq` (64-bit stack push; unchanged from Ch10).
+    - `Ret` still emits the full epilogue.
+    - The `subq $n, %rsp` for stack-frame allocation is now a regular
+      `Binary(Quadword, Sub, Imm(n), Reg(SP))` instruction and is emitted
+      by the general Binary case.
 -/
 
 namespace Emission
@@ -59,11 +32,10 @@ namespace Emission
 open AssemblyAST
 
 -- ---------------------------------------------------------------------------
--- Register name emission (three sizes)
+-- Register name emission
 -- ---------------------------------------------------------------------------
 
-/-- Emit the 32-bit (4-byte) name of a hardware register.
-    Used for `movl`, `addl`, `subl`, `imull`, `cmpl`, etc. (the default size). -/
+/-- 32-bit (4-byte) register names. -/
 private def emitReg4 : Reg → String
   | .AX  => "%eax"
   | .DX  => "%edx"
@@ -74,9 +46,9 @@ private def emitReg4 : Reg → String
   | .R9  => "%r9d"
   | .R10 => "%r10d"
   | .R11 => "%r11d"
+  | .SP  => "%esp"   -- 32-bit stack pointer (not typically used)
 
-/-- Emit the 64-bit (8-byte) name of a hardware register.
-    Used for `pushq`, `subq`, `addq`, `movq`, and other 64-bit operations. -/
+/-- 64-bit (8-byte) register names. -/
 private def emitReg8 : Reg → String
   | .AX  => "%rax"
   | .DX  => "%rdx"
@@ -87,10 +59,9 @@ private def emitReg8 : Reg → String
   | .R9  => "%r9"
   | .R10 => "%r10"
   | .R11 => "%r11"
+  | .SP  => "%rsp"   -- 64-bit stack pointer
 
-/-- Emit the 8-bit (1-byte) name of a hardware register.
-    Used by `set<cc>` instructions, which write a single byte result,
-    and by `%cl` in shift instructions. -/
+/-- 8-bit (1-byte) register names.  Used by `set<cc>` and shift `%cl`. -/
 private def emitReg1 : Reg → String
   | .AX  => "%al"
   | .DX  => "%dl"
@@ -101,26 +72,27 @@ private def emitReg1 : Reg → String
   | .R9  => "%r9b"
   | .R10 => "%r10b"
   | .R11 => "%r11b"
+  | .SP  => "%spl"
+
+/-- Emit a register name in either 32-bit or 64-bit form based on `AsmType`. -/
+private def emitRegForType (t : AsmType) (r : Reg) : String :=
+  match t with
+  | .Longword => emitReg4 r
+  | .Quadword => emitReg8 r
 
 -- ---------------------------------------------------------------------------
 -- Operand emission
 -- ---------------------------------------------------------------------------
 
-/-- Emit an assembly operand in AT&T syntax using 32-bit register names.
-    - `Imm(n)`: immediate value, prefixed with `$`.
-    - `Reg(r)`: hardware register name (32-bit for normal instructions).
-    - `Stack(n)`: memory address at offset `n` from `%rbp`.
-    - `Data(name)`: Chapter 10 — RIP-relative address `name(%rip)`.
-    - `Pseudo`: must never reach this stage; signals a compiler bug. -/
+/-- Emit an operand using 32-bit register names (for Longword instructions). -/
 private def emitOperand : Operand → String
   | .Imm n    => s!"${n}"
   | .Reg r    => emitReg4 r
   | .Stack n  => s!"{n}(%rbp)"
-  | .Data nm  => s!"{nm}(%rip)"   -- Chapter 10: RIP-relative static variable
+  | .Data nm  => s!"{nm}(%rip)"
   | .Pseudo _ => panic! "Pseudo operand reached emission stage"
 
-/-- Emit an operand using 64-bit register names.
-    Used for `pushq` which operates on 64-bit values. -/
+/-- Emit an operand using 64-bit register names (for Quadword instructions and pushq). -/
 private def emitOperand8 : Operand → String
   | .Imm n    => s!"${n}"
   | .Reg r    => emitReg8 r
@@ -128,10 +100,13 @@ private def emitOperand8 : Operand → String
   | .Data nm  => s!"{nm}(%rip)"
   | .Pseudo _ => panic! "Pseudo operand reached emission stage"
 
-/-- Emit a shift count operand.
-    x64 shift instructions accept either an immediate byte (`$n`) or the
-    single-byte register `%cl` (the low byte of ECX) as the count.
-    When the count is `Reg(CX)` we therefore emit `%cl`, not `%ecx`. -/
+/-- Emit an operand using the register size appropriate for the given `AsmType`. -/
+private def emitOperandForType (t : AsmType) : Operand → String :=
+  match t with
+  | .Longword => emitOperand
+  | .Quadword => emitOperand8
+
+/-- Emit a shift count: `Reg(CX)` → `%cl`, others use the 32-bit form. -/
 private def emitShiftCount : Operand → String
   | .Reg .CX => "%cl"
   | other    => emitOperand other
@@ -144,7 +119,7 @@ private def emitByteOperand : Operand → String
   | .Imm n    => s!"${n}"
   | .Pseudo _ => panic! "Pseudo operand reached emission stage"
 
-/-- Emit a condition code suffix used in `j<cc>` and `set<cc>` mnemonics. -/
+/-- Emit a condition code suffix for `j<cc>` and `set<cc>`. -/
 private def emitCondCode : CondCode → String
   | .E  => "e"
   | .NE => "ne"
@@ -158,50 +133,69 @@ private def emitCondCode : CondCode → String
 -- ---------------------------------------------------------------------------
 
 /-- Emit a single assembly instruction as an indented string.
-    `localDefs` is the list of function names defined in this translation unit,
-    used to decide whether to suffix `@PLT` on `call` instructions. -/
+    `localDefs` is the list of locally-defined function names, used to decide
+    whether to append `@PLT` to external `call` instructions. -/
 private def emitInstruction (localDefs : List String) : Instruction → String
-  | .Mov src dst          => s!"    movl {emitOperand src}, {emitOperand dst}"
-  | .Unary .Neg dst       => s!"    negl {emitOperand dst}"
-  | .Unary .Not dst       => s!"    notl {emitOperand dst}"
-  | .Binary .Add  src dst => s!"    addl {emitOperand src}, {emitOperand dst}"
-  | .Binary .Sub  src dst => s!"    subl {emitOperand src}, {emitOperand dst}"
-  | .Binary .Mult src dst => s!"    imull {emitOperand src}, {emitOperand dst}"
-  | .Binary .And  src dst => s!"    andl {emitOperand src}, {emitOperand dst}"
-  | .Binary .Or   src dst => s!"    orl {emitOperand src}, {emitOperand dst}"
-  | .Binary .Xor  src dst => s!"    xorl {emitOperand src}, {emitOperand dst}"
-  | .Binary .Sal  cnt dst => s!"    sall {emitShiftCount cnt}, {emitOperand dst}"
-  | .Binary .Sar  cnt dst => s!"    sarl {emitShiftCount cnt}, {emitOperand dst}"
-  | .Idiv operand         => s!"    idivl {emitOperand operand}"
-  | .Cdq                  => "    cdq"
-  | .Cmp src dst          => s!"    cmpl {emitOperand src}, {emitOperand dst}"
-  | .Jmp name             => s!"    jmp .L{name}"
-  | .JmpCC cc name        => s!"    j{emitCondCode cc} .L{name}"
-  | .SetCC cc op          => s!"    set{emitCondCode cc} {emitByteOperand op}"
-  | .Label name           => s!".L{name}:"
-  | .AllocateStack n      => s!"    subq ${n}, %rsp"
-  | .DeallocateStack n    => s!"    addq ${n}, %rsp"
-  | .Push operand         => s!"    pushq {emitOperand8 operand}"
-  | .Call name            =>
-      -- On Linux, use @PLT suffix for external functions.
+  -- Typed Mov: movl / movq
+  | .Mov .Longword src dst =>
+      s!"    movl {emitOperand src}, {emitOperand dst}"
+  | .Mov .Quadword src dst =>
+      s!"    movq {emitOperand8 src}, {emitOperand8 dst}"
+  -- Movsx: sign-extend 32-bit int to 64-bit long (movslq)
+  | .Movsx src dst =>
+      s!"    movslq {emitOperand src}, {emitOperand8 dst}"
+  -- Typed Unary
+  | .Unary .Longword .Neg dst => s!"    negl {emitOperand dst}"
+  | .Unary .Quadword .Neg dst => s!"    negq {emitOperand8 dst}"
+  | .Unary .Longword .Not dst => s!"    notl {emitOperand dst}"
+  | .Unary .Quadword .Not dst => s!"    notq {emitOperand8 dst}"
+  -- Typed Binary
+  | .Binary t .Add  src dst =>
+      s!"    add{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
+  | .Binary t .Sub  src dst =>
+      s!"    sub{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
+  | .Binary t .Mult src dst =>
+      s!"    imul{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
+  | .Binary t .And  src dst =>
+      s!"    and{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
+  | .Binary t .Or   src dst =>
+      s!"    or{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
+  | .Binary t .Xor  src dst =>
+      s!"    xor{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
+  | .Binary t .Sal  cnt dst =>
+      s!"    sal{if t == .Longword then "l" else "q"} {emitShiftCount cnt}, {emitOperandForType t dst}"
+  | .Binary t .Sar  cnt dst =>
+      s!"    sar{if t == .Longword then "l" else "q"} {emitShiftCount cnt}, {emitOperandForType t dst}"
+  -- Typed Cmp
+  | .Cmp .Longword src dst => s!"    cmpl {emitOperand src}, {emitOperand dst}"
+  | .Cmp .Quadword src dst => s!"    cmpq {emitOperand8 src}, {emitOperand8 dst}"
+  -- Typed Idiv
+  | .Idiv .Longword op => s!"    idivl {emitOperand op}"
+  | .Idiv .Quadword op => s!"    idivq {emitOperand8 op}"
+  -- Cdq / Cqo
+  | .Cdq .Longword => "    cdq"
+  | .Cdq .Quadword => "    cqo"
+  -- Control flow (no size)
+  | .Jmp name      => s!"    jmp .L{name}"
+  | .JmpCC cc name => s!"    j{emitCondCode cc} .L{name}"
+  | .SetCC cc op   => s!"    set{emitCondCode cc} {emitByteOperand op}"
+  | .Label name    => s!".L{name}:"
+  -- Push: always 64-bit
+  | .Push operand  => s!"    pushq {emitOperand8 operand}"
+  -- Call: @PLT for external functions on Linux
+  | .Call name =>
       if localDefs.contains name then
         s!"    call {name}"
       else
         s!"    call {name}@PLT"
-  | .Ret                  => "    movq %rbp, %rsp\n    popq %rbp\n    ret"
+  -- Ret: full epilogue
+  | .Ret => "    movq %rbp, %rsp\n    popq %rbp\n    ret"
 
 -- ---------------------------------------------------------------------------
 -- Top-level emission
 -- ---------------------------------------------------------------------------
 
-/-- Emit a complete function definition.
-    Chapter 10:
-    - Emits `.text` before the function label (required now that we also emit
-      `.data`/`.bss` sections for static variables).
-    - Emits `.globl name` only when `FunctionDef.global` is true (i.e. the
-      function has external linkage).  Internal-linkage (`static`) functions
-      omit this directive.
-    - Then emits the label, prologue, and instruction list. -/
+/-- Emit a complete function definition. -/
 private def emitFunctionDef (localDefs : List String) (f : FunctionDef) : String :=
   let globalDirective := if f.global then s!"    .globl {f.name}\n" else ""
   let prologue := "    pushq %rbp\n    movq %rsp, %rbp"
@@ -210,58 +204,32 @@ private def emitFunctionDef (localDefs : List String) (f : FunctionDef) : String
   s!"{globalDirective}    .text\n{f.name}:\n{prologue}\n{instrs}"
 
 /-- Emit a static variable definition as assembly directives.
-    Chapter 10: static variables are placed in `.data` (nonzero initializer) or
-    `.bss` (zero initializer).  On Linux we use `.align 4` (2^2 = 4 bytes).
-
-    `global = true, init ≠ 0`:
-        .globl name
-        .data
-        .align 4
-        name:
-        .long init
-
-    `global = true, init = 0`:
-        .globl name
-        .bss
-        .align 4
-        name:
-        .zero 4
-
-    `global = false, init ≠ 0`:
-        .data
-        .align 4
-        name:
-        .long init
-
-    `global = false, init = 0`:
-        .bss
-        .align 4
-        name:
-        .zero 4
--/
-private def emitStaticVariable (name : String) (global : Bool) (init : Int) : String :=
+    Chapter 11: emits `.long`/`.quad` or `.zero 4`/`.zero 8` based on `StaticInit`. -/
+private def emitStaticVariable (name : String) (global : Bool) (alignment : Nat)
+    (init : StaticInit) : String :=
   let globalDirective := if global then s!"    .globl {name}\n" else ""
-  if init != 0 then
-    s!"{globalDirective}    .data\n    .align 4\n{name}:\n    .long {init}"
-  else
-    s!"{globalDirective}    .bss\n    .align 4\n{name}:\n    .zero 4"
+  match init with
+  | .IntInit n =>
+      if n != 0 then
+        s!"{globalDirective}    .data\n    .align {alignment}\n{name}:\n    .long {n}"
+      else
+        s!"{globalDirective}    .bss\n    .align {alignment}\n{name}:\n    .zero 4"
+  | .LongInit n =>
+      if n != 0 then
+        s!"{globalDirective}    .data\n    .align {alignment}\n{name}:\n    .quad {n}"
+      else
+        s!"{globalDirective}    .bss\n    .align {alignment}\n{name}:\n    .zero 8"
 
-/-- Entry point for the emission pass.
-    Chapter 10: emits all top-level items (functions and static variables).
-    - Collects locally-defined function names for `@PLT` decisions.
-    - Emits each top-level item separated by blank lines.
-    - Appends the GNU stack note section at the end. -/
+/-- Entry point for the emission pass. -/
 def emitProgram (p : Program) : String :=
-  -- Collect the names of all locally-defined functions (for @PLT decisions)
   let localDefs := p.topLevels.filterMap fun tl =>
     match tl with
-    | .Function f          => some f.name
-    | .StaticVariable ..   => none
-  -- Emit each top-level item
+    | .Function f         => some f.name
+    | .StaticVariable ..  => none
   let topLevelStrings := p.topLevels.map fun tl =>
     match tl with
-    | .Function f                   => emitFunctionDef localDefs f
-    | .StaticVariable name glob init => emitStaticVariable name glob init
+    | .Function f                      => emitFunctionDef localDefs f
+    | .StaticVariable name glob align init => emitStaticVariable name glob align init
   let body := String.intercalate "\n" topLevelStrings
   s!"{body}\n    .section .note.GNU-stack,\"\",@progbits\n"
 

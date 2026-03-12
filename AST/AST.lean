@@ -1,47 +1,68 @@
 namespace AST
 
 /-
-  Abstract Syntax Tree for Chapter 10.
+  Abstract Syntax Tree for Chapter 11.
 
-  ASDL definition:
+  Chapter 11 additions:
+    - `Typ`: the two scalar types supported: `Int` (32-bit) and `Long` (64-bit).
+    - `Const`: typed integer constants — `ConstInt` vs `ConstLong` — so that the
+       emitter can choose the correct assembly size for literal values.
+    - `Exp.Constant` now wraps a `Const` instead of a raw `Int`.
+    - `Exp.Cast(typ, exp)`: an explicit or implicit cast between `Int` and `Long`.
+      Inserted by the parser for explicit `(long)e` / `(int)e` casts, and by the
+      TypeCheck pass for implicit widening/narrowing conversions.
+    - `Declaration.typ`: the declared type of the variable (default `Int`).
+    - `FunctionDef.params` / `FunctionDecl.params` now carry `(Typ × String)` pairs
+      so that each parameter's declared type is available for TypeCheck and CodeGen.
+    - `FunctionDef.retTyp` / `FunctionDecl.retTyp`: the function's return type.
+
+  ASDL definition (changes from Ch10 marked with ★):
     program            = Program(top_level*)
     top_level          = FunDef(function_def) | FunDecl(function_decl)
-                       | VarDecl(declaration)           -- Chapter 10: file-scope variable
-    function_def       = Function(identifier name, identifier* params, block_item* body,
+                       | VarDecl(declaration)
+    ★ type             = Int | Long
+    ★ const            = ConstInt(int) | ConstLong(int)
+    function_def       = Function(identifier name,
+                                  ★ (type × identifier)* params,
+                                  ★ type retTyp,
+                                  block_item* body,
                                   storage_class? storageClass)
-    function_decl      = FunctionDecl(identifier name, identifier* params,
-                                      storage_class? storageClass)
+    function_decl      = FunctionDecl(identifier name,
+                                       ★ (type × identifier)* params,
+                                       ★ type retTyp,
+                                       storage_class? storageClass)
     block_item         = S(statement) | D(declaration) | FD(function_decl)
-    declaration        = Declaration(identifier name, exp? init,
-                                     storage_class? storageClass)  -- Chapter 10: storage class
-    storage_class      = Static | Extern                           -- Chapter 10
+    declaration        = Declaration(identifier name, ★ type typ, exp? init,
+                                     storage_class? storageClass)
+    storage_class      = Static | Extern
     statement          = Return(exp)
                        | Expression(exp)
                        | If(exp condition, statement then, statement? else)
-                       | Compound(block_item*)               -- Chapter 7: "{ ... }"
-                       | While(exp condition, statement, string? label)     -- Chapter 8
-                       | DoWhile(statement, exp condition, string? label)   -- Chapter 8
-                       | For(for_init, exp? condition, exp? post,           -- Chapter 8
+                       | Compound(block_item*)
+                       | While(exp condition, statement, string? label)
+                       | DoWhile(statement, exp condition, string? label)
+                       | For(for_init, exp? condition, exp? post,
                                statement, string? label)
-                       | Break(string? label)                               -- Chapter 8
-                       | Continue(string? label)                            -- Chapter 8
-                       | Switch(exp, statement, string? label,              -- Chapter 8 EC
+                       | Break(string? label)
+                       | Continue(string? label)
+                       | Switch(exp, statement, string? label,
                                  (int? × string)* cases)
-                       | Case(int, statement, string? label)                -- Chapter 8 EC
-                       | Default(statement, string? label)                  -- Chapter 8 EC
-                       | Labeled(identifier, statement)  -- extra credit ch6: "label: stmt"
-                       | Goto(identifier)               -- extra credit ch6: "goto label;"
+                       | Case(int, statement, string? label)
+                       | Default(statement, string? label)
+                       | Labeled(identifier, statement)
+                       | Goto(identifier)
                        | Null
     for_init           = InitExp(exp?) | InitDecl(declaration)
-    exp                = Constant(int)
+    exp                = ★ Constant(const)
                        | Var(identifier)
+                       | ★ Cast(type, exp)
                        | Unary(unary_operator, exp)
                        | Binary(binary_operator, exp, exp)
                        | Assignment(exp, exp)
                        | Conditional(exp condition, exp, exp)
-                       | PostfixIncr(exp)        -- extra credit: e++
-                       | PostfixDecr(exp)        -- extra credit: e--
-                       | FunCall(identifier, exp*)  -- Chapter 9: function call
+                       | PostfixIncr(exp)
+                       | PostfixDecr(exp)
+                       | FunCall(identifier, exp*)
     unary_operator     = Complement | Negate | Not
     binary_operator    = Add | Subtract | Multiply | Divide | Remainder
                        | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight
@@ -49,20 +70,31 @@ namespace AST
                        | Equal | NotEqual
                        | LessThan | LessOrEqual | GreaterThan | GreaterOrEqual
 
-  Prefix ++ and -- and compound assignment operators (+=, -=, etc.) are
-  desugared into Assignment nodes during parsing and never appear in the AST.
-  Postfix ++ and -- require preserving the original value and so are kept
-  as distinct AST nodes.
-
   ASDL built-in types map to Lean as:
     identifier  →  String
     int         →  Int
 -/
 
+/-- The two scalar integer types supported in Chapter 11.
+    `Int`  is a 32-bit signed integer (C `int`).
+    `Long` is a 64-bit signed integer (C `long`). -/
+inductive Typ where
+  | Int  : Typ   -- 32-bit signed integer
+  | Long : Typ   -- 64-bit signed integer
+  deriving Repr, BEq
+
+/-- A typed integer constant.
+    `ConstInt(n)`:  value fits in (or is explicitly typed as) 32-bit `int`.
+    `ConstLong(n)`: value has the `l`/`L` suffix and is a 64-bit `long`. -/
+inductive Const where
+  | ConstInt  : Int → Const  -- 32-bit integer literal, e.g. 42
+  | ConstLong : Int → Const  -- 64-bit long literal, e.g. 42L
+  deriving Repr, BEq
+
 /-- Storage-class specifier.  Chapter 10 introduces `static` and `extern`.
     `static` at file scope → internal linkage (not visible across TUs).
     `static` at block scope → static storage, no linkage.
-    `extern` at file scope → external linkage, no definition in this TU (unless an initializer is given, which is an error).
+    `extern` at file scope → external linkage, no definition in this TU.
     `extern` at block scope → refers to the file-scope variable of the same name. -/
 inductive StorageClass where
   | Static : StorageClass   -- "static" specifier
@@ -99,35 +131,32 @@ inductive BinaryOp where
   deriving Repr, BEq
 
 /-- Expressions in the C subset.
-    `FunCall` is new in Chapter 9: a function call `foo(a, b, c)`. -/
+    Chapter 11 adds `Cast` for explicit/implicit type conversions, and changes
+    `Constant` to carry a typed `Const` instead of a raw `Int`. -/
 inductive Exp where
-  | Constant    : Int → Exp
-  | Var         : String → Exp              -- variable reference
+  | Constant    : Const → Exp             -- Chapter 11: typed constant
+  | Var         : String → Exp            -- variable reference
+  | Cast        : Typ → Exp → Exp         -- Chapter 11: (type)expr cast
   | Unary       : UnaryOp → Exp → Exp
   | Binary      : BinaryOp → Exp → Exp → Exp
-  | Assignment  : Exp → Exp → Exp           -- lvalue = rhs
-  | Conditional : Exp → Exp → Exp → Exp    -- cond ? e1 : e2
-  | PostfixIncr : Exp → Exp                 -- extra credit: e++
-  | PostfixDecr : Exp → Exp                 -- extra credit: e--
-  | FunCall     : String → List Exp → Exp   -- Chapter 9: foo(a, b, c)
+  | Assignment  : Exp → Exp → Exp         -- lvalue = rhs
+  | Conditional : Exp → Exp → Exp → Exp  -- cond ? e1 : e2
+  | PostfixIncr : Exp → Exp               -- extra credit: e++
+  | PostfixDecr : Exp → Exp               -- extra credit: e--
+  | FunCall     : String → List Exp → Exp -- Chapter 9: foo(a, b, c)
   deriving Repr, BEq
 
 /-- A variable declaration with an optional initializer expression.
-    Chapter 10 adds an optional storage-class specifier (`static` or `extern`).
-    `storageClass = none` means the default storage class for the context
-    (automatic for local variables, external linkage for file-scope). -/
+    Chapter 10 adds an optional storage-class specifier.
+    Chapter 11 adds `typ` for the declared type of the variable. -/
 structure Declaration where
   name         : String
+  typ          : Typ := .Int               -- Chapter 11: variable type (default int)
   init         : Option Exp
-  storageClass : Option StorageClass := none   -- Chapter 10
+  storageClass : Option StorageClass := none
   deriving Repr, BEq
 
-/-- The initial clause of a `for` loop.
-    `InitExp none` represents an absent clause (`for (; ...)`)..
-    `InitExp (some e)` represents an expression clause (`for (e; ...)`).
-    `InitDecl d` represents a variable declaration (`for (int x = 0; ...)`),
-    which introduces `x` into the loop's scope (visible in condition, post,
-    and body, but not outside the loop). -/
+/-- The initial clause of a `for` loop. -/
 inductive ForInit where
   | InitExp  : Option Exp → ForInit
   | InitDecl : Declaration → ForInit
@@ -136,60 +165,40 @@ inductive ForInit where
 /-
   `Statement` and `BlockItem` are mutually recursive: `Compound` holds a
   `List BlockItem`, while each `BlockItem` may contain a `Statement`.
-  Lean 4 requires a `mutual` block for mutually recursive inductives; the
-  `deriving` instances are applied after the block using `deriving instance`.
 -/
 mutual
 
-/-- A statement in the C subset.
-    The `Option String` fields on loop/break/continue/switch/case/default nodes
-    carry an ID label injected by the loop-labeling semantic-analysis pass.
-    After parsing all such fields are `none`; after loop labeling they hold a
-    unique string like `"loop.5"` or `"case.3"`.  TACKY generation uses these
-    IDs to derive the concrete break/continue/jump labels it emits. -/
+/-- A statement in the C subset. -/
 inductive Statement where
   | Return     : Exp → Statement
-  | Expression : Exp → Statement    -- expression statement: "e ;"
+  | Expression : Exp → Statement
   | If         : Exp → Statement → Option Statement → Statement
-  | Compound   : List BlockItem → Statement  -- Chapter 7: "{ ... }"
-  -- Chapter 8: loops
+  | Compound   : List BlockItem → Statement
   | While    : Exp → Statement → Option String → Statement
-    -- while (cond) body; loop label
   | DoWhile  : Statement → Exp → Option String → Statement
-    -- do body while (cond); loop label
   | For      : ForInit → Option Exp → Option Exp → Statement → Option String → Statement
-    -- for (init; cond; post) body; loop label
-  | Break    : Option String → Statement    -- break; loop/switch label
-  | Continue : Option String → Statement    -- continue; loop label
-  -- Chapter 8 extra credit: switch statements
+  | Break    : Option String → Statement
+  | Continue : Option String → Statement
   | Switch   : Exp → Statement → Option String → List (Option Int × String) → Statement
-    -- switch (exp) body; switch label; collected case entries (val×caseLbl)
   | Case     : Int → Statement → Option String → Statement
-    -- case n: body; case jump label
   | Default  : Statement → Option String → Statement
-    -- default: body; default jump label
-  -- Chapter 6 extra credit: labeled statements and goto
-  | Labeled  : String → Statement → Statement  -- "label: stmt"
-  | Goto     : String → Statement              -- "goto label;"
-  | Null     : Statement                       -- null statement: ";"
+  | Labeled  : String → Statement → Statement
+  | Goto     : String → Statement
+  | Null     : Statement
 
-/-- A block item is a statement, a variable declaration, or (Chapter 9) a
-    local function declaration (no body allowed inside a function). -/
+/-- A block item: statement, variable declaration, or local function declaration. -/
 inductive BlockItem where
-  | S  : Statement    → BlockItem  -- statement
-  | D  : Declaration  → BlockItem  -- variable declaration
-  | FD : FunctionDecl → BlockItem  -- local function declaration (Chapter 9)
+  | S  : Statement    → BlockItem
+  | D  : Declaration  → BlockItem
+  | FD : FunctionDecl → BlockItem
 
-/-- A local function declaration — name and parameters only, no body.
-    Used as block items inside function bodies (Chapter 9).
-    Chapter 10 adds an optional storage-class specifier.
-    A `static` storage class on a block-scope function declaration is a
-    semantic error (detected by VarResolution); the parser accepts it so
-    that a clear error message can be reported. -/
+/-- A local function declaration (prototype only, no body).
+    Chapter 11: params now carry type information. -/
 structure FunctionDecl where
-  name         : String        -- function name
-  params       : List String   -- parameter names (for arity checking)
-  storageClass : Option StorageClass := none   -- Chapter 10
+  name         : String
+  params       : List (Typ × String)    -- Chapter 11: typed parameter list
+  retTyp       : Typ := .Int             -- Chapter 11: return type
+  storageClass : Option StorageClass := none
 
 end
 
@@ -197,28 +206,24 @@ deriving instance Repr for Statement
 deriving instance Repr for BlockItem
 deriving instance Repr for FunctionDecl
 
-/-- A complete function definition: name, parameter list, and body.
-    Chapter 9 adds `params`; Chapter 10 adds `storageClass`.
-    `static` → internal linkage (symbol not visible outside this TU).
-    no specifier or `extern` → external linkage. -/
+/-- A complete function definition: name, typed parameter list, body, return type.
+    Chapter 11: params carry types; retTyp records the declared return type. -/
 structure FunctionDef where
-  name         : String        -- function name
-  params       : List String   -- parameter names (renamed by VarResolution)
+  name         : String
+  params       : List (Typ × String)    -- Chapter 11: typed parameter list
+  retTyp       : Typ := .Int             -- Chapter 11: return type
   body         : List BlockItem
-  storageClass : Option StorageClass := none   -- Chapter 10
+  storageClass : Option StorageClass := none
   deriving Repr
 
-/-- Top-level item in a translation unit.
-    Chapter 9: multiple function definitions and declarations.
-    Chapter 10: file-scope variable declarations (`VarDecl`). -/
+/-- Top-level item in a translation unit. -/
 inductive TopLevel where
-  | FunDef  : FunctionDef  → TopLevel   -- function definition (has a body)
-  | FunDecl : FunctionDecl → TopLevel   -- function declaration (prototype only)
-  | VarDecl : Declaration  → TopLevel   -- Chapter 10: file-scope variable declaration
+  | FunDef  : FunctionDef  → TopLevel
+  | FunDecl : FunctionDecl → TopLevel
+  | VarDecl : Declaration  → TopLevel
   deriving Repr
 
-/-- A complete C program: a list of top-level declarations and definitions.
-    Chapter 9 replaces the single `FunctionDef` with a list of `TopLevel` items. -/
+/-- A complete C program: a list of top-level declarations and definitions. -/
 structure Program where
   topLevels : List TopLevel
   deriving Repr

@@ -3,8 +3,10 @@ namespace Lexer
 /-- A single token produced by the lexer. -/
 inductive Token where
   | Identifier : String → Token  -- e.g. "main", "foo"
-  | Constant   : Nat → Token     -- e.g. 2, 42
+  | Constant   : Nat → Token     -- integer literal (no suffix), e.g. 2, 42
+  | LongConstant : Nat → Token   -- Chapter 11: integer literal with l/L suffix, e.g. 100L
   | KwInt      : Token           -- int
+  | KwLong     : Token           -- long  (Chapter 11)
   | KwVoid     : Token           -- void
   | KwReturn   : Token           -- return
   | OpenParen  : Token           -- (
@@ -71,11 +73,13 @@ inductive Token where
 
 /-- Human-readable description of a token, used in parser error messages. -/
 def Token.describe : Token → String
-  | .Identifier s => s!"identifier \"{s}\""
-  | .Constant n   => s!"constant \"{n}\""
-  | .KwInt        => "\"int\""
-  | .KwVoid       => "\"void\""
-  | .KwReturn     => "\"return\""
+  | .Identifier s    => s!"identifier \"{s}\""
+  | .Constant n      => s!"constant \"{n}\""
+  | .LongConstant n  => s!"long constant \"{n}L\""   -- Chapter 11
+  | .KwInt           => "\"int\""
+  | .KwLong          => "\"long\""                    -- Chapter 11
+  | .KwVoid          => "\"void\""
+  | .KwReturn        => "\"return\""
   | .OpenParen    => "\"(\""
   | .CloseParen   => "\")\""
   | .OpenBrace    => "\"{\""

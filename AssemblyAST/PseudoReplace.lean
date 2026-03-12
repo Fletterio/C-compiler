@@ -1,134 +1,120 @@
 import AssemblyAST.AssemblyAST
-import Semantics.SymbolTable
 
 /-
-  Pass 2 of assembly generation: replace every Pseudo operand with a concrete
-  operand — either a Stack slot or a Data (RIP-relative) operand.
+  Pass 2 of assembly generation: replace Pseudo operands with concrete operands.
 
-  Chapter 9: each function processed independently with its own stack map.
-
-  Chapter 10 additions:
-    - Takes the global `SymbolTable` built by VarResolution.
-    - When a Pseudo operand is encountered for the first time, we check the
-      symbol table:
-        - If the entry has `Static` attributes, it is a static variable; map
-          it to `Data(name)` (RIP-relative address, no stack slot allocated).
-        - Otherwise (Local attr or not found — TACKY temporaries are not in the
-          symbol table), assign a new stack slot as before.
-    - Static variables do NOT count toward the function's stack size.
-    - `AsmTopLevel.StaticVariable` entries are passed through unchanged; they
-      carry no instructions and need no pseudoregister replacement.
+  Chapter 11 changes:
+    - Now consults the `BackendSymTable` (instead of the frontend SymbolTable).
+    - Stack slot size is determined by `AsmType`:
+        `Longword` → 4 bytes, 4-byte aligned
+        `Quadword` → 8 bytes, 8-byte aligned
+    - Static variables are still mapped to `Data(name)` (RIP-relative).
+    - `Movsx` instruction is handled (both src and dst may be pseudo).
+    - `AllocateStack`/`DeallocateStack` no longer exist; `Binary(Quadword, Sub/Add, ...)`
+      with `Reg(SP)` are passed through unchanged (no pseudo operands there).
 -/
 
 namespace AssemblyAST
 
-/-- Mutable state threaded through the pseudo-replacement pass for ONE function.
-    `map` is an association list from pseudoregister name to its assigned stack
-    offset or Data label.
-    `maxBytes` tracks the total bytes of stack space allocated so far; the next
-    stack slot will be at offset `-(maxBytes + 4)`. -/
+/-- Mutable state threaded through pseudo-replacement for one function.
+    `map`:      association list from pseudo name to its assigned concrete operand.
+    `maxBytes`: total bytes of stack allocated so far (grows by 4 or 8 per slot). -/
 private structure ReplState where
-  /-- Map from pseudo name to the concrete operand it was assigned. -/
   map      : List (String × Operand)
-  /-- Total stack bytes allocated so far (for Stack-assigned pseudos only). -/
   maxBytes : Nat
 
-/-- The initial replacement state: no pseudoregisters mapped, nothing allocated. -/
 private def ReplState.empty : ReplState := { map := [], maxBytes := 0 }
 
+/-- Round `n` up to a multiple of `align`. -/
+private def alignUp (n : Nat) (align : Nat) : Nat :=
+  ((n + align - 1) / align) * align
+
 /-- Look up or assign a concrete operand for `id`.
-    Consults the symbol table first:
-      - Static attribute → map to `Data(id)` (no stack allocation).
-      - Otherwise → assign next 4-byte stack slot.
-    If `id` already has a mapping from a previous occurrence, return it directly. -/
+    Consults the backend sym table:
+      - `ObjEntry(_, true)` → static variable → `Data(id)`.
+      - `ObjEntry(Longword, false)` → local int → next 4-byte stack slot.
+      - `ObjEntry(Quadword, false)` → local long → next 8-byte stack slot.
+      - Not found (TACKY temporary) → default to 4-byte slot (type default is Longword). -/
 private def ReplState.getOrInsert (s : ReplState) (id : String)
-    (symTable : Semantics.SymbolTable) : ReplState × Operand :=
-  -- Check if we already assigned an operand for this pseudo
+    (bst : BackendSymTable) : ReplState × Operand :=
   match s.map.find? (fun p => p.1 == id) with
   | some (_, op) => (s, op)
   | none =>
-      -- Check the symbol table to determine storage duration
-      let isStatic : Bool := match Semantics.lookupSym symTable id with
-        | some { attrs := .Static _ _, .. } => true
-        | _                                 => false
-      if isStatic then
-        -- Static variable: use RIP-relative Data operand, no stack space needed
-        let op := Operand.Data id
-        ({ s with map := s.map ++ [(id, op)] }, op)
-      else
-        -- Automatic variable or TACKY temporary: assign a 4-byte stack slot
-        let bytes  := s.maxBytes + 4
-        let offset : Int := -(bytes : Int)
-        let op := Operand.Stack offset
-        ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
+      match lookupBst bst id with
+      | some (.ObjEntry _ true) =>
+          -- Static variable: RIP-relative Data operand
+          let op := Operand.Data id
+          ({ s with map := s.map ++ [(id, op)] }, op)
+      | some (.ObjEntry .Quadword false) =>
+          -- Local long (8-byte): align maxBytes to 8, then allocate 8 bytes
+          let aligned := alignUp s.maxBytes 8
+          let bytes   := aligned + 8
+          let offset  : Int := -(bytes : Int)
+          let op      := Operand.Stack offset
+          ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
+      | _ =>
+          -- Local int (4-byte) or unknown temporary: 4-byte slot
+          let bytes  := s.maxBytes + 4
+          let offset : Int := -(bytes : Int)
+          let op     := Operand.Stack offset
+          ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
 
-/-- Replace a single operand if it is a `Pseudo`.
-    Non-pseudo operands are returned unchanged together with the unmodified state.
-    Chapter 10: consults the symbol table to decide Stack vs. Data. -/
-private def replaceOp (s : ReplState) (symTable : Semantics.SymbolTable) : Operand → ReplState × Operand
-  | .Pseudo id => s.getOrInsert id symTable
+private def replaceOp (s : ReplState) (bst : BackendSymTable) : Operand → ReplState × Operand
+  | .Pseudo id => s.getOrInsert id bst
   | op         => (s, op)
 
-/-- Replace all `Pseudo` operands in a single instruction.
-    Chapter 10: passes `symTable` to `replaceOp` for static vs. local decisions.
-    All instruction shapes handled:
-    - Two-operand: Mov, Binary, Cmp (both src and dst may be pseudo)
-    - One-operand: Unary, Idiv, SetCC, Push
-    - No operand: Ret, Cdq, AllocateStack, DeallocateStack, Call, Jmp, JmpCC, Label
-    Returns the updated state plus the rewritten instruction list. -/
-private def replaceInstr (s : ReplState) (symTable : Semantics.SymbolTable)
+/-- Replace all Pseudo operands in a single instruction.
+    Chapter 11: handles all typed instruction variants and Movsx. -/
+private def replaceInstr (s : ReplState) (bst : BackendSymTable)
     : Instruction → ReplState × List Instruction
-  | .Mov src dst =>
-      let (s, src') := replaceOp s symTable src
-      let (s, dst') := replaceOp s symTable dst
-      (s, [.Mov src' dst'])
-  | .Unary op operand =>
-      let (s, op') := replaceOp s symTable operand
-      (s, [.Unary op op'])
-  | .Binary op src dst =>
-      let (s, src') := replaceOp s symTable src
-      let (s, dst') := replaceOp s symTable dst
-      (s, [.Binary op src' dst'])
-  | .Idiv operand =>
-      let (s, op') := replaceOp s symTable operand
-      (s, [.Idiv op'])
-  | .Cmp src dst =>
-      let (s, src') := replaceOp s symTable src
-      let (s, dst') := replaceOp s symTable dst
-      (s, [.Cmp src' dst'])
+  | .Mov t src dst =>
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Mov t src' dst'])
+  | .Movsx src dst =>
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Movsx src' dst'])
+  | .Unary t op operand =>
+      let (s, op') := replaceOp s bst operand
+      (s, [.Unary t op op'])
+  | .Binary t op src dst =>
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Binary t op src' dst'])
+  | .Idiv t operand =>
+      let (s, op') := replaceOp s bst operand
+      (s, [.Idiv t op'])
+  | .Cmp t src dst =>
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Cmp t src' dst'])
   | .SetCC cc operand =>
-      let (s, op') := replaceOp s symTable operand
+      let (s, op') := replaceOp s bst operand
       (s, [.SetCC cc op'])
   | .Push operand =>
-      -- Chapter 9: Push may have a Pseudo operand; replace it.
-      let (s, op') := replaceOp s symTable operand
+      let (s, op') := replaceOp s bst operand
       (s, [.Push op'])
-  | instr => (s, [instr])  -- Ret, Cdq, AllocateStack, DeallocateStack, Call, Jmp, etc.
+  | instr => (s, [instr])  -- Ret, Cdq, Jmp, JmpCC, Label, Call pass through
 
-/-- Replace pseudoregisters in a single function definition.
-    Processes the instruction list with a fresh ReplState, then stores the
-    resulting stack size (only from Stack-allocated pseudos) in stackSize. -/
-private def replaceFunctionDef (f : FunctionDef) (symTable : Semantics.SymbolTable) : FunctionDef :=
+/-- Replace pseudoregisters in a single function definition. -/
+private def replaceFunctionDef (f : FunctionDef) (bst : BackendSymTable) : FunctionDef :=
   let (finalState, instrs) :=
     f.instructions.foldl
       (fun (acc : ReplState × List Instruction) instr =>
         let (s, out) := acc
-        let (s', new) := replaceInstr s symTable instr
+        let (s', new) := replaceInstr s bst instr
         (s', out ++ new))
       (ReplState.empty, [])
   { f with instructions := instrs, stackSize := finalState.maxBytes }
 
 /-- Entry point for pass 2.
-    Chapter 10: takes the global symbol table.
-    - `AsmTopLevel.Function(fd)`: processes each function independently with a
-      fresh pseudo map and stack byte count.
-    - `AsmTopLevel.StaticVariable(...)`: passed through unchanged (no
-      pseudoregisters in static variable definitions). -/
-def replacePseudos (p : Program) (symTable : Semantics.SymbolTable) : Program :=
+    Processes each `AsmTopLevel.Function`; passes `StaticVariable` items through. -/
+def replacePseudos (p : Program) (bst : BackendSymTable) : Program :=
   let topLevels := p.topLevels.map fun tl =>
     match tl with
-    | .Function fd           => AsmTopLevel.Function (replaceFunctionDef fd symTable)
-    | sv@(.StaticVariable ..) => sv  -- no instructions, nothing to replace
+    | .Function fd            => AsmTopLevel.Function (replaceFunctionDef fd bst)
+    | sv@(.StaticVariable ..) => sv
   { topLevels }
 
 end AssemblyAST

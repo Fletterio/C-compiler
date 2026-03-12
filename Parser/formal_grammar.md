@@ -1,6 +1,6 @@
-# Formal Grammar — Chapter 10
+# Formal Grammar — Chapter 11
 
-Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter 10.
+Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter 11.
 
 ```
 <program>     ::= { <declaration> }
@@ -8,16 +8,20 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 <declaration> ::= <function-declaration>
                 | <variable-declaration>
 
-<function-declaration> ::= [ <storage-class> ] "int" [ <storage-class> ]
-                           <identifier> "(" <param-list> ")" ( ";" | <block> )
+<function-declaration> ::= <decl-spec>+ <identifier> "(" <param-list> ")" ( ";" | <block> )
 
-<variable-declaration> ::= [ <storage-class> ] "int" [ <storage-class> ]
-                           <identifier> [ "=" <exp> ] ";"
+<variable-declaration> ::= <decl-spec>+ <identifier> [ "=" <exp> ] ";"
+
+<decl-spec>     ::= <type> | <storage-class>
+
+<type>          ::= "int" | "long"
+                  (Note: "int" and "long" may both appear, in any order, to form type "long")
 
 <storage-class> ::= "static" | "extern"
 
 <param-list>  ::= "void"
-                | "int" <identifier> { "," "int" <identifier> }
+                | <type> <identifier> { "," <type> <identifier> }
+                  (Note: <type> may be "int", "long", "int long", or "long int")
 
 <block>       ::= "{" { <block-item> } "}"
 
@@ -48,6 +52,8 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
                 | <exp> <assign-op> <exp>
 
 <factor>      ::= <int>
+                | <long>                               (Chapter 11: long constant, e.g. 100l)
+                | "(" <type> ")" <factor>              (Chapter 11: explicit cast)
                 | <identifier> "(" <arg-list> ")"
                 | <identifier>
                 | <unop> <factor>
@@ -67,7 +73,9 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 
 <identifier>  ::= ? An identifier token ?
 
-<int>         ::= ? A constant token ?
+<int>         ::= ? A constant token (decimal integer literal without suffix) ?
+<long>        ::= ? A long constant token (decimal integer literal with l/L suffix, or
+                    a decimal constant too large to fit in a signed 32-bit int) ?
 ```
 
 ## Conventions
@@ -77,6 +85,30 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 - Symbols wrapped in `? question marks ?` are terminals whose values vary.
 - `{ x }` denotes zero or more repetitions of `x`.
 - `[ x ]` denotes zero or one occurrence of `x` (optional).
+
+## Chapter 11 Changes
+
+- **`long` type**: `long` (or `int long` / `long int`) is now a valid type specifier.
+  - `long` variables occupy 8 bytes (Quadword); `int` variables occupy 4 bytes (Longword).
+  - Type specifiers and storage-class specifiers may appear in **any order** in a declaration
+    (`int static long x`, `static int long x`, `long static x` are all equivalent).
+- **Long constants**: integer literals with an `l` or `L` suffix have type `long`.
+  Decimal constants without a suffix that exceed `INT_MAX` (2 147 483 647) are
+  automatically given type `long` (C §6.4.4.1).
+- **Explicit casts**: `(int) expr` and `(long) expr` cast expressions to the named type.
+- **Implicit conversions** (inserted by the type-checking pass):
+  - Binary `+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`: usual arithmetic conversions — the
+    narrower operand is sign-extended to the wider type.
+  - Shift operators `<<`, `>>`: the result type is that of the **left** operand; the
+    right operand is NOT subject to usual arithmetic conversions.
+  - Relational/equality/logical operators: always produce `int` (0 or 1).
+  - Assignment, return, function-call arguments: the value is cast to the target type.
+- **Switch case truncation**: when the switch controlling expression has type `int`, each
+  `case` constant is converted to `int` (wraparound modulo 2^32). This is done by the
+  type-checking pass so that duplicate detection (SwitchCollection) operates on the
+  already-truncated values.
+- **Pipeline order** (Ch11): VarResolution → LoopLabeling → TypeCheck → SwitchCollection
+  → LabelResolution → TackyGen → CodeGen → PseudoReplace → FixUp → Emit.
 
 ## Chapter 10 Changes
 
