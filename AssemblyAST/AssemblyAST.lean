@@ -91,17 +91,23 @@ inductive BinaryOp where
   | And  : BinaryOp   -- andl / andq
   | Or   : BinaryOp   -- orl  / orq
   | Xor  : BinaryOp   -- xorl / xorq
-  | Sal  : BinaryOp   -- sall / salq  (shift left)
-  | Sar  : BinaryOp   -- sarl / sarq  (shift right)
+  | Sal  : BinaryOp   -- sall / salq  (arithmetic/logical shift left)
+  | Sar  : BinaryOp   -- sarl / sarq  (arithmetic shift right — for signed)
+  | Shr  : BinaryOp   -- shrl / shrq  (logical shift right — for unsigned, Ch12)
   deriving Repr, BEq
 
 inductive CondCode where
-  | E  : CondCode
-  | NE : CondCode
-  | G  : CondCode
-  | GE : CondCode
-  | L  : CondCode
-  | LE : CondCode
+  | E  : CondCode   -- equal (signed/unsigned)
+  | NE : CondCode   -- not equal (signed/unsigned)
+  | G  : CondCode   -- greater than (signed)
+  | GE : CondCode   -- greater or equal (signed)
+  | L  : CondCode   -- less than (signed)
+  | LE : CondCode   -- less or equal (signed)
+  -- Chapter 12: unsigned comparison condition codes
+  | A  : CondCode   -- above (unsigned greater than)
+  | AE : CondCode   -- above or equal (unsigned greater or equal)
+  | B  : CondCode   -- below (unsigned less than)
+  | BE : CondCode   -- below or equal (unsigned less or equal)
   deriving Repr, BEq
 
 /-- Assembly instructions.
@@ -113,10 +119,15 @@ inductive Instruction where
   | Mov            : AsmType → Operand → Operand → Instruction
   /-- Sign-extend 32-bit int to 64-bit long: `movslq src, dst`. -/
   | Movsx          : Operand → Operand → Instruction
+  /-- Zero-extend 32-bit unsigned to 64-bit: `movl src32, dst32`.
+      On x86-64, writing to a 32-bit register automatically zeroes the upper 32 bits. -/
+  | MovZeroExtend  : Operand → Operand → Instruction
   | Unary          : AsmType → UnaryOp → Operand → Instruction
   | Binary         : AsmType → BinaryOp → Operand → Operand → Instruction
   | Cmp            : AsmType → Operand → Operand → Instruction
   | Idiv           : AsmType → Operand → Instruction
+  /-- Unsigned division: `divl`/`divq`. Divides rdx:rax by operand (rdx must be 0). -/
+  | Div            : AsmType → Operand → Instruction
   /-- Sign-extend for division: Longword → `cdq`, Quadword → `cqo`. -/
   | Cdq            : AsmType → Instruction
   | Jmp            : String → Instruction
@@ -130,11 +141,15 @@ inductive Instruction where
   deriving Repr, BEq
 
 /-- A typed static variable initializer.
-    `IntInit(n)` → `.long n` / `.zero 4` (4-byte).
-    `LongInit(n)` → `.quad n` / `.zero 8` (8-byte). -/
+    `IntInit(n)` → `.long n` / `.zero 4` (4-byte, signed int).
+    `LongInit(n)` → `.quad n` / `.zero 8` (8-byte, signed long).
+    `UIntInit(n)` → `.long n` / `.zero 4` (4-byte, unsigned int, Chapter 12).
+    `ULongInit(n)` → `.quad n` / `.zero 8` (8-byte, unsigned long, Chapter 12). -/
 inductive StaticInit where
-  | IntInit  : Int → StaticInit   -- 32-bit initializer
-  | LongInit : Int → StaticInit   -- 64-bit initializer
+  | IntInit   : Int → StaticInit   -- 32-bit signed initializer
+  | LongInit  : Int → StaticInit   -- 64-bit signed initializer
+  | UIntInit  : Int → StaticInit   -- 32-bit unsigned initializer (Chapter 12)
+  | ULongInit : Int → StaticInit   -- 64-bit unsigned initializer (Chapter 12)
   deriving Repr, BEq
 
 structure FunctionDef where
@@ -162,15 +177,17 @@ structure Program where
 -- ---------------------------------------------------------------------------
 
 /-- A backend symbol table entry.
-    `ObjEntry(asmType, isStatic)`: a scalar variable.
-      - `asmType`: determines instruction sizes (Longword for int, Quadword for long).
+    `ObjEntry(asmType, isSigned, isStatic)`: a scalar variable.
+      - `asmType`:  determines instruction sizes (Longword for int/uint, Quadword for long/ulong).
+      - `isSigned`: true for signed types (int, long); false for unsigned (uint, ulong).
+                    Used by CodeGen to choose `idiv`/`div` and signed/unsigned condition codes.
       - `isStatic`: true → mapped to a `Data` (RIP-relative) operand by PseudoReplace;
                     false → assigned a stack slot.
     `FunEntry(isDefined, retAsmType)`: a function.
       - `isDefined`: true if the function body is in this translation unit.
       - `retAsmType`: determines the size of the `Mov` from AX after a call. -/
 inductive BackendSymEntry where
-  | ObjEntry : AsmType → Bool → BackendSymEntry
+  | ObjEntry : AsmType → Bool → Bool → BackendSymEntry   -- asmType, isSigned, isStatic
   | FunEntry : Bool → AsmType → BackendSymEntry
   deriving Repr, BEq
 

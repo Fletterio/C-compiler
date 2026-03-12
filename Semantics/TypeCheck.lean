@@ -29,49 +29,73 @@ namespace Semantics
 -- Type helpers
 -- ---------------------------------------------------------------------------
 
-/-- Return the common type for a binary operation:
-    if both operands have the same type, that type; otherwise Long (C's "usual
-    arithmetic conversions" widen the narrower Int to Long). -/
+/-- Return the common type for a binary operation (C "usual arithmetic conversions").
+    Chapter 12: extends to 4 types (Int, Long, UInt, ULong).
+    Rules (C §6.3.1.8):
+      1. Same type → that type.
+      2. Both signed or both unsigned → wider type.
+         Int  + Long  → Long;   UInt + ULong → ULong.
+      3. Same rank, mixed sign → unsigned wins.
+         Int  + UInt  → UInt;   Long + ULong → ULong.
+      4. Unsigned rank > signed rank → unsigned wins.
+         Int  + ULong → ULong;  UInt + Long  is handled by rule 5.
+      5. Signed rank > unsigned rank AND signed can represent all unsigned values → signed.
+         UInt + Long  → Long (Long can represent all UInt values [0, 2^32−1]).
+      (Rule 6, converting both to unsigned of the signed type, is not reachable here.) -/
 private def commonType (t1 t2 : AST.Typ) : AST.Typ :=
-  if t1 == .Long || t2 == .Long then .Long else .Int
+  if t1 == t2 then t1
+  -- Same rank, mixed signedness: unsigned wins
+  else if (t1 == .Int && t2 == .UInt) || (t1 == .UInt && t2 == .Int) then .UInt
+  else if (t1 == .Long && t2 == .ULong) || (t1 == .ULong && t2 == .Long) then .ULong
+  -- ULong is the widest type; wins over everything else
+  else if t1 == .ULong || t2 == .ULong then .ULong
+  -- Long beats Int and UInt (Long can represent all UInt values)
+  else if t1 == .Long || t2 == .Long then .Long
+  -- Remaining: Int + UInt handled above; shouldn't be reached
+  else t1
 
 /-- Wrap `e` in a `Cast` node only when the target type differs from `current`. -/
 private def castTo (target : AST.Typ) (current : AST.Typ) (e : AST.Exp) : AST.Exp :=
   if target == current then e else .Cast target e
 
-/-- Truncate an integer value `n` to the signed 32-bit range.
-    C §6.4.4.1: when a case constant is used in an `int` switch, it is
-    converted to `int`, which wraps modulo 2^32 into the signed range. -/
+/-- Truncate an integer value `n` to the signed 32-bit range [−2^31, 2^31−1].
+    Used when a `case` constant appears in an `int`-controlled switch. -/
 private def truncToInt32 (n : Int) : Int :=
   let modulus : Int := 4294967296  -- 2^32
   let r := n % modulus
-  -- Adjust to signed range: [-2^31, 2^31-1]
   if r >= 2147483648 then r - modulus
   else if r < -2147483648 then r + modulus
   else r
+
+/-- Truncate an integer value `n` to the unsigned 32-bit range [0, 2^32−1].
+    Used when a `case` constant appears in an `unsigned int`-controlled switch. -/
+private def truncToUInt32 (n : Int) : Int :=
+  let modulus : Int := 4294967296  -- 2^32
+  let r := n % modulus
+  if r < 0 then r + modulus else r
 
 -- truncateSwitchCases and truncateSwitchCasesItem are mutually recursive:
 -- truncateSwitchCases calls truncateSwitchCasesItem for Compound items,
 -- and truncateSwitchCasesItem calls truncateSwitchCases for Statement items.
 mutual
 
-/-- Walk a statement and truncate all `Case` values to the signed int32 range.
-    Used when a switch's controlling expression has type `Int`. -/
-private partial def truncateSwitchCases : AST.Statement → AST.Statement
-  | .Case n body lbl   => .Case (truncToInt32 n) body lbl
-  | .Default body lbl  => .Default body lbl
-  | .Compound items    => .Compound (items.map truncateSwitchCasesItem)
-  | .If cond t eOpt    => .If cond (truncateSwitchCases t) (eOpt.map truncateSwitchCases)
-  | .While cond b lbl  => .While cond (truncateSwitchCases b) lbl
-  | .DoWhile b cond lbl => .DoWhile (truncateSwitchCases b) cond lbl
-  | .For init c p b lbl => .For init c p (truncateSwitchCases b) lbl
-  | .Labeled lbl s     => .Labeled lbl (truncateSwitchCases s)
+/-- Walk a statement and apply `truncFn` to every `Case` value within this switch level.
+    Stops recursing into nested `Switch` statements (their cases belong to them). -/
+private partial def truncateSwitchCases (truncFn : Int → Int) : AST.Statement → AST.Statement
+  | .Case n body lbl    => .Case (truncFn n) body lbl
+  | .Default body lbl   => .Default body lbl
+  | .Compound items     => .Compound (items.map (truncateSwitchCasesItem truncFn))
+  | .If cond t eOpt     => .If cond (truncateSwitchCases truncFn t) (eOpt.map (truncateSwitchCases truncFn))
+  | .While cond b lbl   => .While cond (truncateSwitchCases truncFn b) lbl
+  | .DoWhile b cond lbl => .DoWhile (truncateSwitchCases truncFn b) cond lbl
+  | .For init c p b lbl => .For init c p (truncateSwitchCases truncFn b) lbl
+  | .Labeled lbl s      => .Labeled lbl (truncateSwitchCases truncFn s)
   -- Nested switch: stop — its cases belong to that inner switch
-  | s@(.Switch ..)     => s
-  | s                  => s
+  | s@(.Switch ..)      => s
+  | s                   => s
 
-private partial def truncateSwitchCasesItem : AST.BlockItem → AST.BlockItem
-  | .S s => .S (truncateSwitchCases s)
+private partial def truncateSwitchCasesItem (truncFn : Int → Int) : AST.BlockItem → AST.BlockItem
+  | .S s => .S (truncateSwitchCases truncFn s)
   | item => item
 
 end
@@ -104,8 +128,10 @@ private def lookupVarTyp (st : SymbolTable) (name : String) : TcM AST.Typ :=
     Returns the (possibly rewritten) expression and its type. -/
 private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- Typed constants: preserve the constant's declared type
-  | .Constant (.ConstInt n)  => return (.Constant (.ConstInt n),  .Int)
-  | .Constant (.ConstLong n) => return (.Constant (.ConstLong n), .Long)
+  | .Constant (.ConstInt n)   => return (.Constant (.ConstInt n),   .Int)
+  | .Constant (.ConstLong n)  => return (.Constant (.ConstLong n),  .Long)
+  | .Constant (.ConstUInt n)  => return (.Constant (.ConstUInt n),  .UInt)   -- Chapter 12
+  | .Constant (.ConstULong n) => return (.Constant (.ConstULong n), .ULong)  -- Chapter 12
   -- Variable reference: look up type
   | .Var v => do
       let t ← lookupVarTyp st v
@@ -241,10 +267,15 @@ private partial def typeCheckStmt (st : SymbolTable) (retTyp : AST.Typ) : AST.St
   | .Switch exp body lbl cases => do
       let (exp', expTyp) ← typeCheckExp st exp
       let body' ← typeCheckStmt st retTyp body
-      -- C §6.8.4.2: if the switch controlling expression is int, each case
-      -- constant is converted to int (with wraparound modulo 2^32).
-      -- We must do this BEFORE SwitchCollection validates for duplicates.
-      let body'' := if expTyp == .Int then truncateSwitchCases body' else body'
+      -- C §6.8.4.2: if the switch controlling expression has 32-bit type,
+      -- truncate each case constant to that type's range.
+      --   Int  switch → truncate to signed   int32 range.
+      --   UInt switch → truncate to unsigned uint32 range.
+      -- This must run BEFORE SwitchCollection validates for duplicates.
+      let body'' := match expTyp with
+        | .Int  => truncateSwitchCases truncToInt32  body'
+        | .UInt => truncateSwitchCases truncToUInt32 body'
+        | _     => body'   -- Long/ULong: no truncation needed
       return .Switch exp' body'' lbl cases
   | .Case n body lbl => do
       let body' ← typeCheckStmt st retTyp body

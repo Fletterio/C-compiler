@@ -97,6 +97,23 @@ private def fixInstr : Instruction → List Instruction
   | .Idiv t (.Imm n) =>
       [.Mov t (.Imm n) (.Reg .R10), .Idiv t (.Reg .R10)]
   -- ----------------------------------------------------------------
+  -- Div (unsigned): same constraint as Idiv — operand cannot be an immediate
+  -- ----------------------------------------------------------------
+  | .Div t (.Imm n) =>
+      [.Mov t (.Imm n) (.Reg .R10), .Div t (.Reg .R10)]
+  -- ----------------------------------------------------------------
+  -- MovZeroExtend: zero-extend 32-bit uint to 64-bit (Chapter 12)
+  --   If dst is memory, we can't movl directly (only 4 bytes written).
+  --   Fix: movl src, R11d (zero-extends R11 to 64 bits), then movq R11, dst.
+  --   If dst is a register, movl to the 32-bit register naturally zero-extends.
+  -- ----------------------------------------------------------------
+  | .MovZeroExtend src dst =>
+      if isMem dst then
+        [.Mov .Longword src (.Reg .R11),
+         .Mov .Quadword (.Reg .R11) dst]
+      else
+        [.MovZeroExtend src dst]
+  -- ----------------------------------------------------------------
   -- Binary: mem-to-mem, large Quadword immediate, Mult mem-dst
   -- ----------------------------------------------------------------
   | .Binary t op src dst =>

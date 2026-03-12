@@ -93,8 +93,10 @@ private def convertBinop : AST.BinaryOp → BinaryOp
     - Other binary operators produce the common type of their operands.
       (TypeCheck has already inserted Casts so operands have the same type.) -/
 private def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val × AST.Typ × List Instruction)
-  | .Constant (.ConstInt n)  => return (.Constant n, .Int,  [])
-  | .Constant (.ConstLong n) => return (.Constant n, .Long, [])
+  | .Constant (.ConstInt n)   => return (.Constant n, .Int,   [])
+  | .Constant (.ConstLong n)  => return (.Constant n, .Long,  [])
+  | .Constant (.ConstUInt n)  => return (.Constant n, .UInt,  [])  -- Chapter 12
+  | .Constant (.ConstULong n) => return (.Constant n, .ULong, [])  -- Chapter 12
   | .Var v => do
       -- Look up the variable's type from the symbol table
       let t : AST.Typ := match Semantics.lookupSym st v with
@@ -109,15 +111,22 @@ private def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val × AST.
       else
         let dst := Val.Var (← makeTemporary targetTyp)
         match targetTyp, srcTyp with
-        | .Long, .Int =>
-            -- Sign-extend 32-bit int to 64-bit long
-            return (dst, .Long, instrs ++ [.SignExtend src dst])
-        | .Int, .Long =>
-            -- Truncate 64-bit long to 32-bit int
-            return (dst, .Int, instrs ++ [.Truncate src dst])
-        | _, _ =>
-            -- Same type (redundant cast): pass through
-            return (src, targetTyp, instrs)
+        -- Widening sign-extend (signed int → wider signed or unsigned type)
+        | .Long,  .Int  => return (dst, .Long,  instrs ++ [.SignExtend src dst])
+        | .ULong, .Int  => return (dst, .ULong, instrs ++ [.SignExtend src dst])
+        -- Widening zero-extend (unsigned int → wider type)
+        | .Long,  .UInt => return (dst, .Long,  instrs ++ [.ZeroExtend src dst])
+        | .ULong, .UInt => return (dst, .ULong, instrs ++ [.ZeroExtend src dst])
+        -- Narrowing truncation (64-bit → 32-bit: keep lower 32 bits)
+        | .Int,  .Long  => return (dst, .Int,  instrs ++ [.Truncate src dst])
+        | .UInt, .Long  => return (dst, .UInt, instrs ++ [.Truncate src dst])
+        | .Int,  .ULong => return (dst, .Int,  instrs ++ [.Truncate src dst])
+        | .UInt, .ULong => return (dst, .UInt, instrs ++ [.Truncate src dst])
+        -- Same-size reinterpret (int↔uint or long↔ulong): copy into a new typed
+        -- temporary so the backend sym table sees the correct signedness.
+        -- Without this, cmpIsSigned would look up the original var and use the wrong
+        -- signed/unsigned condition codes for relational instructions.
+        | _, _ => return (dst, targetTyp, instrs ++ [.Copy src dst])
   | .Unary .Not inner => do
       -- Logical NOT: result is always Int (0 or 1)
       let (src, _, instrs) ← emitExp st inner
@@ -171,11 +180,16 @@ private def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val × AST.
       -- Relational operators always produce Int.
       -- Shift operators: result type is the type of the LEFT operand (C §6.5.7).
       -- Other arithmetic operators produce the common type of both operands.
+      -- After TypeCheck, both operands of arithmetic ops have the same type (casts inserted).
+      -- Relational ops always produce Int (0 or 1).
+      -- Shift ops: result type = left operand's type (C §6.5.7).
+      -- All other arithmetic ops: result type = common type of operands (= t1 after TypeCheck).
       let resultTyp : AST.Typ := match op with
         | .Equal | .NotEqual | .LessThan | .LessOrEqual
         | .GreaterThan | .GreaterOrEqual => .Int
-        | .ShiftLeft | .ShiftRight => t1   -- type of left operand, not common type
-        | _ => if t1 == .Long || t2 == .Long then .Long else .Int
+        | .ShiftLeft | .ShiftRight => t1   -- type of left operand (C §6.5.7)
+        | .And | .Or               => .Int -- logical ops (handled separately, shouldn't reach here)
+        | _                        => t1   -- arithmetic ops: t1 == t2 after TypeCheck
       let dst := Val.Var (← makeTemporary resultTyp)
       return (dst, resultTyp, instrs1 ++ instrs2 ++ [.Binary (convertBinop op) src1 src2 dst])
   | .Conditional cond e1 e2 => do

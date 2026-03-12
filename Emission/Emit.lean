@@ -127,6 +127,11 @@ private def emitCondCode : CondCode → String
   | .GE => "ge"
   | .L  => "l"
   | .LE => "le"
+  -- Chapter 12: unsigned comparison condition codes
+  | .A  => "a"
+  | .AE => "ae"
+  | .B  => "b"
+  | .BE => "be"
 
 -- ---------------------------------------------------------------------------
 -- Instruction emission
@@ -144,6 +149,11 @@ private def emitInstruction (localDefs : List String) : Instruction → String
   -- Movsx: sign-extend 32-bit int to 64-bit long (movslq)
   | .Movsx src dst =>
       s!"    movslq {emitOperand src}, {emitOperand8 dst}"
+  -- MovZeroExtend: zero-extend 32-bit uint to 64-bit (Chapter 12)
+  -- On x86-64, writing to a 32-bit register name zeros the upper 32 bits.
+  -- FixUp ensures dst is always a register here (memory dst was replaced in FixUp).
+  | .MovZeroExtend src dst =>
+      s!"    movl {emitOperand src}, {emitOperand dst}"
   -- Typed Unary
   | .Unary .Longword .Neg dst => s!"    negl {emitOperand dst}"
   | .Unary .Quadword .Neg dst => s!"    negq {emitOperand8 dst}"
@@ -166,12 +176,18 @@ private def emitInstruction (localDefs : List String) : Instruction → String
       s!"    sal{if t == .Longword then "l" else "q"} {emitShiftCount cnt}, {emitOperandForType t dst}"
   | .Binary t .Sar  cnt dst =>
       s!"    sar{if t == .Longword then "l" else "q"} {emitShiftCount cnt}, {emitOperandForType t dst}"
+  -- Chapter 12: logical shift right (unsigned)
+  | .Binary t .Shr  cnt dst =>
+      s!"    shr{if t == .Longword then "l" else "q"} {emitShiftCount cnt}, {emitOperandForType t dst}"
   -- Typed Cmp
   | .Cmp .Longword src dst => s!"    cmpl {emitOperand src}, {emitOperand dst}"
   | .Cmp .Quadword src dst => s!"    cmpq {emitOperand8 src}, {emitOperand8 dst}"
-  -- Typed Idiv
+  -- Typed Idiv (signed division)
   | .Idiv .Longword op => s!"    idivl {emitOperand op}"
   | .Idiv .Quadword op => s!"    idivq {emitOperand8 op}"
+  -- Typed Div (unsigned division, Chapter 12)
+  | .Div .Longword op => s!"    divl {emitOperand op}"
+  | .Div .Quadword op => s!"    divq {emitOperand8 op}"
   -- Cdq / Cqo
   | .Cdq .Longword => "    cdq"
   | .Cdq .Quadword => "    cqo"
@@ -209,12 +225,12 @@ private def emitStaticVariable (name : String) (global : Bool) (alignment : Nat)
     (init : StaticInit) : String :=
   let globalDirective := if global then s!"    .globl {name}\n" else ""
   match init with
-  | .IntInit n =>
+  | .IntInit n | .UIntInit n =>
       if n != 0 then
         s!"{globalDirective}    .data\n    .align {alignment}\n{name}:\n    .long {n}"
       else
         s!"{globalDirective}    .bss\n    .align {alignment}\n{name}:\n    .zero 4"
-  | .LongInit n =>
+  | .LongInit n | .ULongInit n =>
       if n != 0 then
         s!"{globalDirective}    .data\n    .align {alignment}\n{name}:\n    .quad {n}"
       else

@@ -85,40 +85,25 @@ private def assignmentOp : Token → Option (Option BinaryOp)
 -- Type specifier parsing (Chapter 11)
 -- ---------------------------------------------------------------------------
 
-/-- Parse a type specifier token or pair.
-    Chapter 11: `int long` and `long int` are both equivalent to `long`.
-    Used for cast expressions and parameter types (no storage class).
-    Returns the `AST.Typ` and the remaining tokens. -/
-private def parseType (tokens : List Token) : Except String (Typ × List Token) :=
-  match tokens with
-  -- Two-keyword combinations: `int long` and `long int` → Long
-  | .KwInt  :: .KwLong :: rest => .ok (.Long, rest)
-  | .KwLong :: .KwInt  :: rest => .ok (.Long, rest)
-  -- Single keywords
-  | .KwInt  :: rest => .ok (.Int,  rest)
-  | .KwLong :: rest => .ok (.Long, rest)
-  | []              => .error "Expected type specifier (int or long) but reached end of input"
-  | t :: _          => .error s!"Expected type specifier (int or long) but found {t.describe}"
-
-/-- True if the token is a type specifier (`int` or `long`). -/
-private def isTypeToken : Token → Bool
-  | .KwInt  => true
-  | .KwLong => true
-  | _       => false
-
 /-- True if the token is a declaration specifier (type or storage class). -/
 private def isDeclSpecToken : Token → Bool
-  | .KwInt    => true
-  | .KwLong   => true
-  | .KwStatic => true
-  | .KwExtern => true
-  | _         => false
+  | .KwInt      => true
+  | .KwLong     => true
+  | .KwUnsigned => true   -- Chapter 12
+  | .KwSigned   => true   -- Chapter 12
+  | .KwStatic   => true
+  | .KwExtern   => true
+  | _           => false
 
 /-- Parse all declaration specifiers in any order (C allows intermixing).
-    Collects `int`, `long`, `static`, `extern` in any order, then returns
-    the resolved type and storage class.
+    Collects `int`, `long`, `unsigned`, `static`, `extern` in any order, then
+    returns the resolved type and storage class.
 
-    Valid type combos: `int`, `long`, `int long`, `long int` (all → Int or Long).
+    Valid type combos (Chapter 12):
+      `int`, `long`, `int long`, `long int` → Int / Long (signed)
+      `unsigned`, `unsigned int`, `int unsigned` → UInt
+      `unsigned long`, `long unsigned`, `unsigned long int`, … → ULong
+
     At most one storage class (`static` or `extern`).
 
     Used for top-level and block-scope declarations where C allows
@@ -126,28 +111,55 @@ private def isDeclSpecToken : Token → Bool
 private def parseDeclSpecs (tokens : List Token)
     : Except String (Typ × Option StorageClass × List Token) :=
   let rec loop (toks : List Token) (sawInt : Bool) (sawLong : Bool)
+               (sawUnsigned : Bool) (sawSigned : Bool)
                (sc : Option StorageClass) : Except String (Typ × Option StorageClass × List Token) :=
     match toks with
     | .KwInt :: rest =>
         if sawInt then .error "Duplicate type specifier 'int'"
-        else loop rest true sawLong sc
+        else loop rest true sawLong sawUnsigned sawSigned sc
     | .KwLong :: rest =>
         if sawLong then .error "Duplicate type specifier 'long'"
-        else loop rest sawInt true sc
+        else loop rest sawInt true sawUnsigned sawSigned sc
+    | .KwUnsigned :: rest =>
+        if sawUnsigned then .error "Duplicate type specifier 'unsigned'"
+        else if sawSigned then .error "Conflicting type specifiers 'signed' and 'unsigned'"
+        else loop rest sawInt sawLong true sawSigned sc
+    | .KwSigned :: rest =>
+        -- `signed` just means the type is signed (all int/long are already signed).
+        -- It may appear multiple times only as `signed signed`? No — just allow once.
+        if sawUnsigned then .error "Conflicting type specifiers 'unsigned' and 'signed'"
+        else loop rest sawInt sawLong sawUnsigned true sc
     | .KwStatic :: rest =>
         match sc with
         | some _ => .error "Multiple storage class specifiers"
-        | none   => loop rest sawInt sawLong (some .Static)
+        | none   => loop rest sawInt sawLong sawUnsigned sawSigned (some .Static)
     | .KwExtern :: rest =>
         match sc with
         | some _ => .error "Multiple storage class specifiers"
-        | none   => loop rest sawInt sawLong (some .Extern)
+        | none   => loop rest sawInt sawLong sawUnsigned sawSigned (some .Extern)
     | _ =>
-        -- End of declaration specifiers; determine the type
-        if sawLong then .ok (.Long, sc, toks)
-        else if sawInt then .ok (.Int, sc, toks)
-        else .error "Expected type specifier (int or long)"
-  loop tokens false false none
+        -- End of declaration specifiers; determine the type.
+        -- `signed` alone defaults to int; `unsigned` alone defaults to uint.
+        let typ : Except String Typ :=
+          if sawUnsigned then
+            if sawLong then .ok .ULong   -- unsigned long [int]
+            else .ok .UInt               -- unsigned [int]
+          else if sawLong then .ok .Long  -- [signed] [int] long
+          else if sawInt || sawSigned then .ok .Int  -- [signed] int
+          else .error "Expected type specifier (int, long, unsigned, signed, etc.)"
+        match typ with
+        | .error e => .error e
+        | .ok t    => .ok (t, sc, toks)
+  loop tokens false false false false none
+
+/-- Parse a type specifier for use in cast expressions and parameters.
+    Delegates to `parseDeclSpecs` and strips storage-class info.
+    Chapter 12: handles all combinations of int/long/unsigned/signed. -/
+private def parseType (tokens : List Token) : Except String (Typ × List Token) := do
+  match parseDeclSpecs tokens with
+  | .ok (_, some _, _) => .error "Storage class specifier not allowed in type name"
+  | .ok (typ, none, rest) => .ok (typ, rest)
+  | .error e => .error e
 
 -- ---------------------------------------------------------------------------
 -- Expression parsing (precedence climbing)
@@ -158,9 +170,15 @@ mutual
 /-- Parse a factor.
     Chapter 11 additions:
     - `LongConstant n` → `Exp.Constant(.ConstLong n)`
-    - `Constant n`     → `Exp.Constant(.ConstInt n)` (was plain `Constant n`)
-    - `(int)  <factor>` → `Exp.Cast(.Int,  e)` (explicit cast to int)
-    - `(long) <factor>` → `Exp.Cast(.Long, e)` (explicit cast to long)
+    - `Constant n`     → `Exp.Constant(.ConstInt n)` (auto-promote to Long if > INT_MAX)
+    - `(int)  <factor>` → `Exp.Cast(.Int,  e)`
+    - `(long) <factor>` → `Exp.Cast(.Long, e)`
+
+    Chapter 12 additions:
+    - `UIntConstant n`  → `Exp.Constant(.ConstUInt n)` (or ConstULong if > UINT_MAX)
+    - `ULongConstant n` → `Exp.Constant(.ConstULong n)`
+    - `(unsigned) <factor>` / `(unsigned int)` → `Exp.Cast(.UInt, e)`
+    - `(unsigned long)` / `(long unsigned)` → `Exp.Cast(.ULong, e)`
 
     Prefix `++e` desugars to `Assignment(e, Binary(Add, e, ConstInt(1)))`.
     Prefix `--e` desugars to `Assignment(e, Binary(Subtract, e, ConstInt(1)))`. -/
@@ -169,6 +187,15 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
   | []                       => .error "Expected expression but reached end of input"
   -- Chapter 11: long integer constant (e.g. 100L — has l/L suffix)
   | .LongConstant n :: rest  => .ok (.Constant (.ConstLong n), rest)
+  -- Chapter 12: unsigned long constant (e.g. 100UL — has ul/lu suffix)
+  | .ULongConstant n :: rest => .ok (.Constant (.ConstULong (n : Int)), rest)
+  -- Chapter 12: unsigned int constant (e.g. 100U — has u/U suffix)
+  -- Auto-promote to ULong if value exceeds UINT_MAX (4294967295)
+  | .UIntConstant n :: rest =>
+      if n > 4294967295 then
+        .ok (.Constant (.ConstULong (n : Int)), rest)
+      else
+        .ok (.Constant (.ConstUInt (n : Int)), rest)
   -- Regular integer constant: auto-promote to Long if value exceeds INT_MAX.
   -- (C §6.4.4.1: a decimal constant without a suffix is promoted to the
   -- smallest type that can represent it — int, then long.)
@@ -187,14 +214,26 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
   | .MinusMinus :: rest => do
       let (e, rest') ← parseFactor rest
       .ok (.Assignment e (.Binary .Subtract e (.Constant (.ConstInt 1))), rest')
-  -- Chapter 11: explicit cast expressions `(int)e` or `(long)e`
+  -- Explicit cast expressions: `(type)e`
   -- These must be checked BEFORE the generic `(expr)` case.
-  | .OpenParen :: .KwInt  :: .CloseParen :: rest => do
-      let (e, rest') ← parseFactor rest
-      .ok (.Cast .Int e, rest')
-  | .OpenParen :: .KwLong :: .CloseParen :: rest => do
-      let (e, rest') ← parseFactor rest
-      .ok (.Cast .Long e, rest')
+  -- Chapter 11: (int)e, (long)e, (int long)e, (long int)e
+  -- Chapter 12: (unsigned)e, (unsigned int)e, (unsigned long)e, etc.
+  | .OpenParen :: rest =>
+      -- Try to parse a type specifier followed by CloseParen; if it matches,
+      -- this is a cast expression.  Otherwise fall through to parenthesised exp.
+      match parseType rest with
+      | .ok (castTyp, .CloseParen :: afterParen) => do
+          let (e, rest') ← parseFactor afterParen
+          .ok (.Cast castTyp e, rest')
+      | _ =>
+          -- Not a cast; parse a parenthesised expression
+          do
+            let (e, rest')  ← parseExp 0 rest
+            let rest''      ← expect .CloseParen rest'
+            match rest'' with
+            | .PlusPlus   :: rest''' => .ok (.PostfixIncr e, rest''')
+            | .MinusMinus :: rest''' => .ok (.PostfixDecr e, rest''')
+            | _                      => .ok (e, rest'')
   -- Function call: `identifier "(" args ")"`
   | .Identifier v :: .OpenParen :: rest => do
       let (args, rest') ← parseArgList rest
@@ -207,14 +246,6 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
       | .PlusPlus   :: rest' => .ok (.PostfixIncr (.Var v), rest')
       | .MinusMinus :: rest' => .ok (.PostfixDecr (.Var v), rest')
       | _                    => .ok (.Var v, rest)
-  -- Parenthesised expression
-  | .OpenParen :: rest  => do
-      let (e, rest')  ← parseExp 0 rest
-      let rest''      ← expect .CloseParen rest'
-      match rest'' with
-      | .PlusPlus   :: rest''' => .ok (.PostfixIncr e, rest''')
-      | .MinusMinus :: rest''' => .ok (.PostfixDecr e, rest''')
-      | _                      => .ok (e, rest'')
   | t :: _  => .error s!"Expected expression but found {t.describe}"
 
 private partial def parseArgList (tokens : List Token) : Except String (List Exp × List Token) :=
@@ -488,6 +519,14 @@ private partial def parseStatement (tokens : List Token) : Except String (Statem
       let (stmt, rest') ← parseStatement rest
       .ok (.Case (-(n : Int)) stmt none, rest')
   | .KwCase :: .LongConstant n :: .Colon :: rest => do
+      let (stmt, rest') ← parseStatement rest
+      .ok (.Case (n : Int) stmt none, rest')
+  -- Chapter 12: case with unsigned int constant (e.g. `case 42u:`)
+  | .KwCase :: .UIntConstant n :: .Colon :: rest => do
+      let (stmt, rest') ← parseStatement rest
+      .ok (.Case (n : Int) stmt none, rest')
+  -- Chapter 12: case with unsigned long constant (e.g. `case 100ul:`)
+  | .KwCase :: .ULongConstant n :: .Colon :: rest => do
       let (stmt, rest') ← parseStatement rest
       .ok (.Case (n : Int) stmt none, rest')
   | .KwCase :: _ => .error "case expression must be an integer constant"

@@ -3,7 +3,11 @@ import AST.AST
 namespace Tacky
 
 /-
-  TACKY intermediate representation for Chapter 11.
+  TACKY intermediate representation for Chapter 12.
+
+  Chapter 12 additions:
+    - `ZeroExtend(src, dst)`: zero-extend a 32-bit unsigned int to 64-bit.
+      Lowers to `movl` (writing a 32-bit register zeros its upper 32 bits on x86-64).
 
   Chapter 11 additions:
     - `SignExtend(src, dst)`: sign-extend a 32-bit int value to 64-bit long.
@@ -18,7 +22,7 @@ namespace Tacky
     program            = Program(top_level*)
     top_level          = Function(function_definition)
                        | StaticVariable(identifier name, bool global,
-                                        ★ type typ, int init)
+                                        type typ, int init)
     function_definition = Function(identifier name, identifier* params,
                                    instruction* body, bool global)
     instruction        = Return(val)
@@ -30,8 +34,9 @@ namespace Tacky
                        | JumpIfNotZero(val condition, identifier target)
                        | Label(identifier)
                        | FunCall(identifier fun_name, val* args, val dst)
-                       | ★ SignExtend(val src, val dst)
-                       | ★ Truncate(val src, val dst)
+                       | SignExtend(val src, val dst)
+                       | Truncate(val src, val dst)
+                       | ★ ZeroExtend(val src, val dst)
     val                = Constant(int) | Var(identifier)
     unary_operator     = Complement | Negate | Not
     binary_operator    = Add | Subtract | Multiply | Divide | Remainder
@@ -82,10 +87,14 @@ inductive Instruction where
   | JumpIfNotZero : Val → String → Instruction
   | Label         : String → Instruction
   | FunCall       : String → List Val → Val → Instruction
-  /-- Sign-extend `src` (Int) into `dst` (Long): emits `movslq`. -/
+  /-- Sign-extend `src` (Int/Long-signed) into `dst` (Long/ULong): emits `movslq`. -/
   | SignExtend    : Val → Val → Instruction
-  /-- Truncate `src` (Long) to `dst` (Int): emits `movl` (upper bits discarded). -/
+  /-- Truncate `src` (Long/ULong) to `dst` (Int/UInt): emits `movl` (upper bits discarded). -/
   | Truncate      : Val → Val → Instruction
+  /-- Zero-extend `src` (UInt, 32-bit) into `dst` (Long/ULong, 64-bit).
+      Emits `movl src, dst32` — writing to a 32-bit register zeroes the upper
+      32 bits of the 64-bit register on x86-64. -/
+  | ZeroExtend    : Val → Val → Instruction
   deriving Repr, BEq
 
 /-- A TACKY function definition. -/

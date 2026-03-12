@@ -67,7 +67,8 @@ private def convertBinop : Tacky.BinaryOp → BinaryOp
   | .BitXor     => .Xor
   | _           => .Add  -- Divide/Remainder/Shift/relational handled separately
 
-private def relCondCode : Tacky.BinaryOp → Option CondCode
+/-- Condition codes for signed comparisons. -/
+private def relCondCodeSigned : Tacky.BinaryOp → Option CondCode
   | .Equal          => some .E
   | .NotEqual       => some .NE
   | .LessThan       => some .L
@@ -76,40 +77,81 @@ private def relCondCode : Tacky.BinaryOp → Option CondCode
   | .GreaterOrEqual => some .GE
   | _               => none
 
+/-- Condition codes for unsigned comparisons (Chapter 12). -/
+private def relCondCodeUnsigned : Tacky.BinaryOp → Option CondCode
+  | .Equal          => some .E    -- equality is same for signed/unsigned
+  | .NotEqual       => some .NE
+  | .LessThan       => some .B    -- below
+  | .LessOrEqual    => some .BE   -- below or equal
+  | .GreaterThan    => some .A    -- above
+  | .GreaterOrEqual => some .AE   -- above or equal
+  | _               => none
+
 private def convertVal : Tacky.Val → Operand
   | .Constant n => .Imm n
   | .Var id     => .Pseudo id
 
 /-- Look up the `AsmType` of a TACKY value from the backend symbol table.
     - `Var(id)`: look up in bst; default to `Longword` if not found.
-    - `Constant n`: Quadword if `n` doesn't fit in a signed 32-bit integer,
-      Longword otherwise.  This handles auto-promoted large long constants
-      (e.g. `19327352832` or `34359738368l`) that appear as raw `Constant n`
-      in TACKY but need 64-bit instructions. -/
+    - `Constant n`: Quadword if `n` doesn't fit in a signed 32-bit integer AND
+      also doesn't fit in an unsigned 32-bit integer (> UINT_MAX).
+      Values in (INT_MAX, UINT_MAX] might be UInt (Longword) — use Longword for them. -/
 private def valAsmType (bst : BackendSymTable) : Tacky.Val → AsmType
   | .Var id     => match lookupBst bst id with
-                   | some (.ObjEntry t _) => t
-                   | _                    => .Longword
+                   | some (.ObjEntry t _ _) => t
+                   | _                      => .Longword
   | .Constant n =>
-      -- A constant that doesn't fit in int32 must be treated as 64-bit (Long).
-      if n > 2147483647 || n < -2147483648 then .Quadword else .Longword
+      -- Values that don't fit in 64-bit unsigned (impossible in practice) → Quadword
+      -- Values that don't fit in uint32 (> 2^32−1 or < 0 negatives) → Quadword
+      -- Values in [0, 2^32-1] → Longword (could be signed or unsigned 32-bit)
+      if n > 4294967295 || n < -2147483648 then .Quadword else .Longword
+
+/-- Determine whether a TACKY value has a signed type (from the backend sym table).
+    Constants are assumed signed; named variables check the `isSigned` flag.  -/
+private def valIsSigned (bst : BackendSymTable) : Tacky.Val → Bool
+  | .Var id     => match lookupBst bst id with
+                   | some (.ObjEntry _ isSigned _) => isSigned
+                   | _                              => true   -- default: signed
+  | .Constant _ => true  -- bare integer constants are treated as signed
 
 /-- Determine the AsmType for a binary instruction from its operands.
     Prefers the type of Var operands over constants; looks at dst first. -/
 private def instrAsmType (bst : BackendSymTable) (src dst : Tacky.Val) : AsmType :=
   match dst with
   | .Var id => match lookupBst bst id with
-               | some (.ObjEntry t _) => t
+               | some (.ObjEntry t _ _) => t
                | _ => valAsmType bst src
   | .Constant _ => valAsmType bst src
 
+/-- Determine the signedness for a binary instruction from its operands.
+    Uses the destination first (mirrors instrAsmType). -/
+private def instrIsSigned (bst : BackendSymTable) (src dst : Tacky.Val) : Bool :=
+  match dst with
+  | .Var id => match lookupBst bst id with
+               | some (.ObjEntry _ isSigned _) => isSigned
+               | _ => valIsSigned bst src
+  | .Constant _ => valIsSigned bst src
+
 /-- Determine the AsmType for a comparison/relational instruction.
     The comparison must use the type of the *operands* (not the result, which
-    is always Int for relational ops).  Take the wider of the two operand types. -/
+    is always Int for relational ops).
+    Chapter 12: prefers Var operand types over constant types (avoids
+    misinterpreting large UInt constants as Quadword). -/
 private def cmpAsmType (bst : BackendSymTable) (src1 src2 : Tacky.Val) : AsmType :=
-  if valAsmType bst src1 == .Quadword || valAsmType bst src2 == .Quadword
-  then .Quadword
-  else .Longword
+  -- Prefer Var-based types; constants may be ambiguous in sign/size.
+  match src1, src2 with
+  | .Var _, _  => valAsmType bst src1
+  | _, .Var _  => valAsmType bst src2
+  | _, _       =>
+      if valAsmType bst src1 == .Quadword || valAsmType bst src2 == .Quadword
+      then .Quadword else .Longword
+
+/-- Determine signedness for a comparison.  Uses the same operand priority as cmpAsmType. -/
+private def cmpIsSigned (bst : BackendSymTable) (src1 src2 : Tacky.Val) : Bool :=
+  match src1, src2 with
+  | .Var _, _  => valIsSigned bst src1
+  | _, .Var _  => valIsSigned bst src2
+  | _, _       => valIsSigned bst src1
 
 /-- Emit parameter-copy instructions at function entry.
     Consults the backend sym table to choose the correct Mov type for each param. -/
@@ -117,8 +159,8 @@ private def emitParamCopies (params : List String) (bst : BackendSymTable) : Lis
   let indexed : List (Nat × String) := (List.range params.length).zip params
   indexed.map fun (i, paramName) =>
     let t : AsmType := match lookupBst bst paramName with
-      | some (.ObjEntry asmT _) => asmT
-      | _                       => .Longword
+      | some (.ObjEntry asmT _ _) => asmT
+      | _                         => .Longword
     let dst := Operand.Pseudo paramName
     if i < 6 then
       let argRegsArr : Array Reg := #[.DI, .SI, .DX, .CX, .R8, .R9]
@@ -173,7 +215,7 @@ private def convertFunCall (name : String) (args : List Tacky.Val) (dst : Tacky.
   -- Retrieve return value; use the function's return type from backend sym table
   let retAsmType : AsmType := match lookupBst bst name with
     | some (.FunEntry _ rt) => rt
-    | _                     => .Longword  -- default: int-returning
+    | _                     => .Longword   -- default: int-returning
   let retInstrs : List Instruction := [.Mov retAsmType (.Reg .AX) (convertVal dst)]
   padInstrs ++ regInstrs ++ pushInstrs ++ callInstr ++ deallocInstrs ++ retInstrs
 
@@ -186,11 +228,15 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
       let t := valAsmType bst v
       [.Mov t (convertVal v) (.Reg .AX), .Ret]
   | .SignExtend src dst =>
-      -- movslq: sign-extend 32-bit int to 64-bit long
+      -- movslq: sign-extend 32-bit int to 64-bit long/ulong
       [.Movsx (convertVal src) (convertVal dst)]
   | .Truncate src dst =>
       -- movl: copy low 32 bits (truncation; upper 32 bits discarded)
       [.Mov .Longword (convertVal src) (convertVal dst)]
+  | .ZeroExtend src dst =>
+      -- Chapter 12: zero-extend 32-bit uint to 64-bit long/ulong
+      -- On x86-64, movl to a 32-bit register automatically zeros the upper 32 bits.
+      [.MovZeroExtend (convertVal src) (convertVal dst)]
   | .Unary .Not src dst =>
       -- Logical NOT: cmp $0, src (using src's type); movl $0, dst; sete dst.
       -- The dst is always Int (result of !expr is 0 or 1), so use Longword for
@@ -205,17 +251,33 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
       [.Mov t (convertVal src) (convertVal dst),
        .Unary t (convertUnop op) (convertVal dst)]
   | .Binary .Divide src1 src2 dst =>
-      let t := instrAsmType bst src1 dst
-      [.Mov t (convertVal src1) (.Reg .AX),
-       .Cdq t,
-       .Idiv t (convertVal src2),
-       .Mov t (.Reg .AX) (convertVal dst)]
+      let t      := instrAsmType bst src1 dst
+      let signed := instrIsSigned bst src1 dst
+      if signed then
+        -- Signed division: sign-extend AX into DX:AX via cdq/cqo, then idiv
+        [.Mov t (convertVal src1) (.Reg .AX),
+         .Cdq t,
+         .Idiv t (convertVal src2),
+         .Mov t (.Reg .AX) (convertVal dst)]
+      else
+        -- Unsigned division (Chapter 12): zero DX (no sign-extend), then div
+        [.Mov t (convertVal src1) (.Reg .AX),
+         .Mov t (.Imm 0) (.Reg .DX),
+         .Div t (convertVal src2),
+         .Mov t (.Reg .AX) (convertVal dst)]
   | .Binary .Remainder src1 src2 dst =>
-      let t := instrAsmType bst src1 dst
-      [.Mov t (convertVal src1) (.Reg .AX),
-       .Cdq t,
-       .Idiv t (convertVal src2),
-       .Mov t (.Reg .DX) (convertVal dst)]
+      let t      := instrAsmType bst src1 dst
+      let signed := instrIsSigned bst src1 dst
+      if signed then
+        [.Mov t (convertVal src1) (.Reg .AX),
+         .Cdq t,
+         .Idiv t (convertVal src2),
+         .Mov t (.Reg .DX) (convertVal dst)]
+      else
+        [.Mov t (convertVal src1) (.Reg .AX),
+         .Mov t (.Imm 0) (.Reg .DX),
+         .Div t (convertVal src2),
+         .Mov t (.Reg .DX) (convertVal dst)]
   | .Binary .ShiftLeft src1 src2 dst =>
       let t := instrAsmType bst src1 dst
       -- Shift count must be in %cl or be an immediate
@@ -223,16 +285,21 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
        .Mov .Longword (convertVal src2) (.Reg .CX),
        .Binary t .Sal (.Reg .CX) (convertVal dst)]
   | .Binary .ShiftRight src1 src2 dst =>
-      let t := instrAsmType bst src1 dst
+      let t      := instrAsmType bst src1 dst
+      let signed := instrIsSigned bst src1 dst
+      -- Signed → arithmetic shift right (sar); unsigned → logical shift right (shr)
+      let shiftOp := if signed then BinaryOp.Sar else BinaryOp.Shr
       [.Mov t (convertVal src1) (convertVal dst),
        .Mov .Longword (convertVal src2) (.Reg .CX),
-       .Binary t .Sar (.Reg .CX) (convertVal dst)]
+       .Binary t shiftOp (.Reg .CX) (convertVal dst)]
   | .Binary op src1 src2 dst =>
-      match relCondCode op with
+      let isSigned := cmpIsSigned bst src1 src2
+      match (if isSigned then relCondCodeSigned op else relCondCodeUnsigned op) with
       | some cc =>
           -- Relational: compare src1 and src2; result is always Int, but the
           -- comparison instruction must use the operands' type (could be Quadword
           -- even though the result is Int).  Use cmpAsmType to pick the wider type.
+          -- Chapter 12: use unsigned condition codes (A/AE/B/BE) for unsigned operands.
           let t := cmpAsmType bst src1 src2
           [.Cmp t (convertVal src2) (convertVal src1),
            .Mov .Longword (.Imm 0) (convertVal dst),
@@ -268,12 +335,15 @@ private def convertFunctionDef (f : Tacky.FunctionDef) (bst : BackendSymTable) :
     stackSize    := 0 }
 
 /-- Convert a typed TACKY StaticVariable to an assembly StaticVariable.
-    Chapter 11: sets alignment (4 for Int, 8 for Long) and typed init. -/
+    Chapter 11: sets alignment (4 for Int, 8 for Long) and typed init.
+    Chapter 12: adds UInt (align 4, UIntInit) and ULong (align 8, ULongInit). -/
 private def convertStaticVar (name : String) (global : Bool) (typ : AST.Typ) (init : Int)
     : AsmTopLevel :=
   match typ with
-  | .Int  => .StaticVariable name global 4 (.IntInit init)
-  | .Long => .StaticVariable name global 8 (.LongInit init)
+  | .Int   => .StaticVariable name global 4 (.IntInit init)
+  | .Long  => .StaticVariable name global 8 (.LongInit init)
+  | .UInt  => .StaticVariable name global 4 (.UIntInit init)   -- Chapter 12
+  | .ULong => .StaticVariable name global 8 (.ULongInit init)  -- Chapter 12
 
 /-- Entry point for pass 1: TACKY → Assembly AST with pseudoregisters. -/
 def genProgram (p : Tacky.Program) (bst : BackendSymTable) : Program :=

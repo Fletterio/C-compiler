@@ -1,6 +1,6 @@
-# Formal Grammar — Chapter 11
+# Formal Grammar — Chapter 12
 
-Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter 11.
+Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Chapter 12.
 
 ```
 <program>     ::= { <declaration> }
@@ -12,16 +12,16 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 
 <variable-declaration> ::= <decl-spec>+ <identifier> [ "=" <exp> ] ";"
 
-<decl-spec>     ::= <type> | <storage-class>
+<decl-spec>     ::= <type-spec> | <storage-class>
 
-<type>          ::= "int" | "long"
-                  (Note: "int" and "long" may both appear, in any order, to form type "long")
+<type-spec>     ::= "int" | "long" | "unsigned" | "signed"
+                  (One or more type specifiers form a type; see type-spec rules below)
 
 <storage-class> ::= "static" | "extern"
 
 <param-list>  ::= "void"
-                | <type> <identifier> { "," <type> <identifier> }
-                  (Note: <type> may be "int", "long", "int long", or "long int")
+                | <type-spec>+ <identifier> { "," <type-spec>+ <identifier> }
+                  (Note: storage-class specifiers are NOT allowed in parameter types)
 
 <block>       ::= "{" { <block-item> } "}"
 
@@ -53,7 +53,9 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 
 <factor>      ::= <int>
                 | <long>                               (Chapter 11: long constant, e.g. 100l)
-                | "(" <type> ")" <factor>              (Chapter 11: explicit cast)
+                | <uint>                               (Chapter 12: unsigned int constant, e.g. 42u)
+                | <ulong>                              (Chapter 12: unsigned long constant, e.g. 42ul)
+                | "(" <type-spec>+ ")" <factor>        (Chapter 11: explicit cast; no storage class)
                 | <identifier> "(" <arg-list> ")"
                 | <identifier>
                 | <unop> <factor>
@@ -76,6 +78,10 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 <int>         ::= ? A constant token (decimal integer literal without suffix) ?
 <long>        ::= ? A long constant token (decimal integer literal with l/L suffix, or
                     a decimal constant too large to fit in a signed 32-bit int) ?
+<uint>        ::= ? An unsigned int constant token (decimal integer literal with u/U suffix,
+                    value ≤ UINT_MAX = 4294967295; larger values become <ulong>) ?
+<ulong>       ::= ? An unsigned long constant token (decimal integer literal with ul/lu/UL/LU
+                    suffix, or a u/U-suffixed constant whose value exceeds UINT_MAX) ?
 ```
 
 ## Conventions
@@ -85,6 +91,34 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented in Chapter
 - Symbols wrapped in `? question marks ?` are terminals whose values vary.
 - `{ x }` denotes zero or more repetitions of `x`.
 - `[ x ]` denotes zero or one occurrence of `x` (optional).
+
+## Chapter 12 Changes
+
+- **`unsigned int` and `unsigned long` types**: `unsigned` (or `unsigned int`) and `unsigned long`
+  (or `unsigned long int`, `long unsigned`, etc.) are now valid type specifiers.
+- **`signed` keyword**: `signed int` = `int`; `signed long` = `long`. The `signed` keyword may
+  appear alone or alongside `int`/`long` in any order. Combining `signed` and `unsigned` is an error.
+- **Type-specifier combinations** (any order; one of each category):
+  - `int`, `signed`, `signed int`, `int signed` → `Int`
+  - `long`, `signed long`, `long int`, `int long`, `long signed`, etc. → `Long`
+  - `unsigned`, `unsigned int`, `int unsigned` → `UInt`
+  - `unsigned long`, `long unsigned`, `unsigned long int`, `long unsigned int`, etc. → `ULong`
+- **Unsigned integer constants**: `u`/`U` suffix → `unsigned int` (or `unsigned long` if > UINT_MAX);
+  `ul`/`lu`/`UL`/`LU`/`uL`/`lU`/`Ul`/`Lu` suffix → `unsigned long`.
+- **Usual arithmetic conversions** (for Ch12): `ULong` > `Long` > `UInt` > `Int` in rank order.
+  When mixing signed and unsigned operands:
+  - `Int + UInt` → `UInt`; `Int + Long` → `Long`; `Int + ULong` → `ULong`
+  - `UInt + Long` → `Long`; `UInt + ULong` → `ULong`; `Long + ULong` → `ULong`
+- **Same-size reinterpretation casts** (`Int↔UInt`, `Long↔ULong`): a `Copy` instruction is
+  emitted to a fresh typed temp so the backend sym table reflects the correct signedness.
+- **Unsigned division** (`/`, `%` on unsigned types): uses x86 `div` instruction (not `idiv`);
+  DX must be zeroed first (via `movl/movq $0, %edx/%rdx`).
+- **Logical shift right** (`>>` on unsigned types): uses `shr` (not `sar`).
+- **Unsigned comparisons**: condition codes A/AE/B/BE (above/below) for unsigned relational ops.
+- **Switch controlling expression** can be `unsigned int`: case constants are truncated modulo 2^32
+  without sign-extension (so `case 4294967295u:` is a valid unsigned int case).
+- **`parseType`** (for casts/parameters) delegates to `parseDeclSpecs` but rejects storage-class
+  specifiers; must be defined AFTER `parseDeclSpecs` in the source.
 
 ## Chapter 11 Changes
 

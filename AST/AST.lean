@@ -1,7 +1,12 @@
 namespace AST
 
 /-
-  Abstract Syntax Tree for Chapter 11.
+  Abstract Syntax Tree for Chapter 12.
+
+  Chapter 12 additions (on top of Ch11):
+    - `Typ`: adds `UInt` (32-bit unsigned) and `ULong` (64-bit unsigned).
+    - `Const`: adds `ConstUInt` and `ConstULong` for unsigned literal values.
+    - Cast and implicit conversions now also cover unsigned types.
 
   Chapter 11 additions:
     - `Typ`: the two scalar types supported: `Int` (32-bit) and `Long` (64-bit).
@@ -16,12 +21,12 @@ namespace AST
       so that each parameter's declared type is available for TypeCheck and CodeGen.
     - `FunctionDef.retTyp` / `FunctionDecl.retTyp`: the function's return type.
 
-  ASDL definition (changes from Ch10 marked with ★):
+  ASDL definition (changes from Ch11 marked with ★★):
     program            = Program(top_level*)
     top_level          = FunDef(function_def) | FunDecl(function_decl)
                        | VarDecl(declaration)
-    ★ type             = Int | Long
-    ★ const            = ConstInt(int) | ConstLong(int)
+    ★★ type            = Int | Long | UInt | ULong
+    ★★ const           = ConstInt(int) | ConstLong(int) | ConstUInt(int) | ConstULong(int)
     function_def       = Function(identifier name,
                                   ★ (type × identifier)* params,
                                   ★ type retTyp,
@@ -75,20 +80,28 @@ namespace AST
     int         →  Int
 -/
 
-/-- The two scalar integer types supported in Chapter 11.
-    `Int`  is a 32-bit signed integer (C `int`).
-    `Long` is a 64-bit signed integer (C `long`). -/
+/-- The four scalar integer types supported in Chapter 12.
+    `Int`   is a 32-bit signed integer   (C `int`).
+    `Long`  is a 64-bit signed integer   (C `long`).
+    `UInt`  is a 32-bit unsigned integer (C `unsigned int`).
+    `ULong` is a 64-bit unsigned integer (C `unsigned long`). -/
 inductive Typ where
-  | Int  : Typ   -- 32-bit signed integer
-  | Long : Typ   -- 64-bit signed integer
+  | Int   : Typ  -- 32-bit signed integer
+  | Long  : Typ  -- 64-bit signed integer
+  | UInt  : Typ  -- 32-bit unsigned integer  (Chapter 12)
+  | ULong : Typ  -- 64-bit unsigned integer  (Chapter 12)
   deriving Repr, BEq
 
 /-- A typed integer constant.
-    `ConstInt(n)`:  value fits in (or is explicitly typed as) 32-bit `int`.
-    `ConstLong(n)`: value has the `l`/`L` suffix and is a 64-bit `long`. -/
+    `ConstInt(n)`:   value fits in (or is explicitly typed as) 32-bit `int`.
+    `ConstLong(n)`:  value has the `l`/`L` suffix and is a 64-bit `long`.
+    `ConstUInt(n)`:  value has the `u`/`U` suffix — 32-bit unsigned int.    (Ch12)
+    `ConstULong(n)`: value has the `ul`/`lu` suffix — 64-bit unsigned long. (Ch12) -/
 inductive Const where
-  | ConstInt  : Int → Const  -- 32-bit integer literal, e.g. 42
-  | ConstLong : Int → Const  -- 64-bit long literal, e.g. 42L
+  | ConstInt   : Int → Const  -- 32-bit signed integer literal, e.g. 42
+  | ConstLong  : Int → Const  -- 64-bit signed long literal, e.g. 42L
+  | ConstUInt  : Int → Const  -- 32-bit unsigned int literal, e.g. 42u   (Chapter 12)
+  | ConstULong : Int → Const  -- 64-bit unsigned long literal, e.g. 42ul (Chapter 12)
   deriving Repr, BEq
 
 /-- Storage-class specifier.  Chapter 10 introduces `static` and `extern`.

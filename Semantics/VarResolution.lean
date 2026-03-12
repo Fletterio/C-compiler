@@ -96,11 +96,13 @@ private def getSym (name : String) : VarM2 (Option SymbolEntry) := do
 -- ---------------------------------------------------------------------------
 
 /-- Extract the raw integer value from a constant expression.
-    Accepts both ConstInt and ConstLong literals. -/
+    Accepts ConstInt, ConstLong, ConstUInt, and ConstULong literals. -/
 private def extractConst : AST.Exp → Option Int
-  | .Constant (.ConstInt n)  => some n
-  | .Constant (.ConstLong n) => some n
-  | _                        => none
+  | .Constant (.ConstInt n)   => some n
+  | .Constant (.ConstLong n)  => some n
+  | .Constant (.ConstUInt n)  => some n   -- Chapter 12
+  | .Constant (.ConstULong n) => some n   -- Chapter 12
+  | _                         => none
 
 -- ---------------------------------------------------------------------------
 -- File-scope variable declaration processing

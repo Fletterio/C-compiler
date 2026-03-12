@@ -63,10 +63,16 @@ private def runCmd (cmd : String) (args : Array String) (errPrefix : String) : I
 -- Backend symbol table construction
 -- ---------------------------------------------------------------------------
 
-/-- Convert an `AST.Typ` to the corresponding `AsmType`. -/
+/-- Convert an `AST.Typ` to the corresponding `AsmType`.
+    Chapter 12: UInt → Longword, ULong → Quadword (same widths as signed). -/
 private def asmTypeOf : AST.Typ → AssemblyAST.AsmType
-  | .Int  => .Longword
-  | .Long => .Quadword
+  | .Int  | .UInt  => .Longword
+  | .Long | .ULong => .Quadword
+
+/-- True iff the type is a signed integer type. -/
+private def isSignedTyp : AST.Typ → Bool
+  | .Int | .Long   => true
+  | .UInt | .ULong => false
 
 /-- Build the backend symbol table from:
     1. The frontend symbol table (all declared variables and functions).
@@ -88,9 +94,9 @@ private def buildBackendSymTable
     frontendSt.filterMap fun (name, entry) =>
       match entry.type, entry.attrs with
       | .Obj typ, .Local =>
-          some (name, .ObjEntry (asmTypeOf typ) false)
+          some (name, .ObjEntry (asmTypeOf typ) (isSignedTyp typ) false)
       | .Obj typ, .Static _ _ =>
-          some (name, .ObjEntry (asmTypeOf typ) true)
+          some (name, .ObjEntry (asmTypeOf typ) (isSignedTyp typ) true)
       | .Fun _ _ retTyp, .FunAttr isDef _ =>
           some (name, .FunEntry isDef (asmTypeOf retTyp))
       | _, _ => none
@@ -99,7 +105,7 @@ private def buildBackendSymTable
   let fromTypeEnv : AssemblyAST.BackendSymTable :=
     typeEnv.filterMap fun (name, typ) =>
       if frontendNames.contains name then none
-      else some (name, .ObjEntry (asmTypeOf typ) false)
+      else some (name, .ObjEntry (asmTypeOf typ) (isSignedTyp typ) false)
   fromFrontend ++ fromTypeEnv
 
 -- ---------------------------------------------------------------------------

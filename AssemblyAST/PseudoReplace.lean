@@ -41,12 +41,12 @@ private def ReplState.getOrInsert (s : ReplState) (id : String)
   | some (_, op) => (s, op)
   | none =>
       match lookupBst bst id with
-      | some (.ObjEntry _ true) =>
+      | some (.ObjEntry _ _ true) =>
           -- Static variable: RIP-relative Data operand
           let op := Operand.Data id
           ({ s with map := s.map ++ [(id, op)] }, op)
-      | some (.ObjEntry .Quadword false) =>
-          -- Local long (8-byte): align maxBytes to 8, then allocate 8 bytes
+      | some (.ObjEntry .Quadword _ false) =>
+          -- Local long or ulong (8-byte): align maxBytes to 8, then allocate 8 bytes
           let aligned := alignUp s.maxBytes 8
           let bytes   := aligned + 8
           let offset  : Int := -(bytes : Int)
@@ -75,6 +75,11 @@ private def replaceInstr (s : ReplState) (bst : BackendSymTable)
       let (s, src') := replaceOp s bst src
       let (s, dst') := replaceOp s bst dst
       (s, [.Movsx src' dst'])
+  | .MovZeroExtend src dst =>
+      -- Chapter 12: zero-extend 32-bit uint to 64-bit (FixUp handles memory dst)
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.MovZeroExtend src' dst'])
   | .Unary t op operand =>
       let (s, op') := replaceOp s bst operand
       (s, [.Unary t op op'])
@@ -85,6 +90,10 @@ private def replaceInstr (s : ReplState) (bst : BackendSymTable)
   | .Idiv t operand =>
       let (s, op') := replaceOp s bst operand
       (s, [.Idiv t op'])
+  | .Div t operand =>
+      -- Chapter 12: unsigned division (same pseudo-replacement logic as Idiv)
+      let (s, op') := replaceOp s bst operand
+      (s, [.Div t op'])
   | .Cmp t src dst =>
       let (s, src') := replaceOp s bst src
       let (s, dst') := replaceOp s bst dst
