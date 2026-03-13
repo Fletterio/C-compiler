@@ -1,7 +1,14 @@
 namespace AST
 
 /-
-  Abstract Syntax Tree for Chapter 12.
+  Abstract Syntax Tree for Chapter 13.
+
+  Chapter 13 additions (on top of Ch12):
+    - `Typ`: adds `Double` (64-bit IEEE 754 floating-point).
+    - `Const`: adds `ConstDouble : Float → Const` for floating-point literals.
+    - Arithmetic on Double uses scalar SSE2 instructions (addsd, subsd, etc.).
+    - Comparisons on Double use `comisd` and condition codes B/BE/A/AE.
+    - Conversions: Int↔Double, UInt↔Double, Long↔Double, ULong↔Double.
 
   Chapter 12 additions (on top of Ch11):
     - `Typ`: adds `UInt` (32-bit unsigned) and `ULong` (64-bit unsigned).
@@ -25,8 +32,9 @@ namespace AST
     program            = Program(top_level*)
     top_level          = FunDef(function_def) | FunDecl(function_decl)
                        | VarDecl(declaration)
-    ★★ type            = Int | Long | UInt | ULong
+    ★★ type            = Int | Long | UInt | ULong | Double
     ★★ const           = ConstInt(int) | ConstLong(int) | ConstUInt(int) | ConstULong(int)
+                       | ConstDouble(float)
     function_def       = Function(identifier name,
                                   ★ (type × identifier)* params,
                                   ★ type retTyp,
@@ -80,28 +88,32 @@ namespace AST
     int         →  Int
 -/
 
-/-- The four scalar integer types supported in Chapter 12.
-    `Int`   is a 32-bit signed integer   (C `int`).
-    `Long`  is a 64-bit signed integer   (C `long`).
-    `UInt`  is a 32-bit unsigned integer (C `unsigned int`).
-    `ULong` is a 64-bit unsigned integer (C `unsigned long`). -/
+/-- The scalar types supported through Chapter 13.
+    `Int`    is a 32-bit signed integer      (C `int`).
+    `Long`   is a 64-bit signed integer      (C `long`).
+    `UInt`   is a 32-bit unsigned integer    (C `unsigned int`).
+    `ULong`  is a 64-bit unsigned integer    (C `unsigned long`).
+    `Double` is a 64-bit IEEE 754 float      (C `double`). -/
 inductive Typ where
-  | Int   : Typ  -- 32-bit signed integer
-  | Long  : Typ  -- 64-bit signed integer
-  | UInt  : Typ  -- 32-bit unsigned integer  (Chapter 12)
-  | ULong : Typ  -- 64-bit unsigned integer  (Chapter 12)
+  | Int    : Typ  -- 32-bit signed integer
+  | Long   : Typ  -- 64-bit signed integer
+  | UInt   : Typ  -- 32-bit unsigned integer   (Chapter 12)
+  | ULong  : Typ  -- 64-bit unsigned integer   (Chapter 12)
+  | Double : Typ  -- 64-bit floating-point     (Chapter 13)
   deriving Repr, BEq
 
-/-- A typed integer constant.
-    `ConstInt(n)`:   value fits in (or is explicitly typed as) 32-bit `int`.
-    `ConstLong(n)`:  value has the `l`/`L` suffix and is a 64-bit `long`.
-    `ConstUInt(n)`:  value has the `u`/`U` suffix — 32-bit unsigned int.    (Ch12)
-    `ConstULong(n)`: value has the `ul`/`lu` suffix — 64-bit unsigned long. (Ch12) -/
+/-- A typed constant.
+    `ConstInt(n)`:    value fits in (or is explicitly typed as) 32-bit `int`.
+    `ConstLong(n)`:   value has the `l`/`L` suffix and is a 64-bit `long`.
+    `ConstUInt(n)`:   value has the `u`/`U` suffix — 32-bit unsigned int.     (Ch12)
+    `ConstULong(n)`:  value has the `ul`/`lu` suffix — 64-bit unsigned long.  (Ch12)
+    `ConstDouble(f)`: floating-point literal, e.g. 3.14 or 1.5e10.            (Ch13) -/
 inductive Const where
-  | ConstInt   : Int → Const  -- 32-bit signed integer literal, e.g. 42
-  | ConstLong  : Int → Const  -- 64-bit signed long literal, e.g. 42L
-  | ConstUInt  : Int → Const  -- 32-bit unsigned int literal, e.g. 42u   (Chapter 12)
-  | ConstULong : Int → Const  -- 64-bit unsigned long literal, e.g. 42ul (Chapter 12)
+  | ConstInt    : Int   → Const  -- 32-bit signed integer literal, e.g. 42
+  | ConstLong   : Int   → Const  -- 64-bit signed long literal, e.g. 42L
+  | ConstUInt   : Int   → Const  -- 32-bit unsigned int literal, e.g. 42u    (Chapter 12)
+  | ConstULong  : Int   → Const  -- 64-bit unsigned long literal, e.g. 42ul  (Chapter 12)
+  | ConstDouble : Float → Const  -- 64-bit double literal, e.g. 3.14         (Chapter 13)
   deriving Repr, BEq
 
 /-- Storage-class specifier.  Chapter 10 introduces `static` and `extern`.

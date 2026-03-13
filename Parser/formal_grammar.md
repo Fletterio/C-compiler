@@ -1,4 +1,4 @@
-# Formal Grammar — Chapter 12
+# Formal Grammar — Chapter 13
 
 Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Chapter 12.
 
@@ -14,8 +14,9 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 
 <decl-spec>     ::= <type-spec> | <storage-class>
 
-<type-spec>     ::= "int" | "long" | "unsigned" | "signed"
-                  (One or more type specifiers form a type; see type-spec rules below)
+<type-spec>     ::= "int" | "long" | "unsigned" | "signed" | "double"
+                  (One or more type specifiers form a type; see type-spec rules below.
+                   "double" is standalone and cannot be combined with other type keywords.)
 
 <storage-class> ::= "static" | "extern"
 
@@ -55,6 +56,7 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
                 | <long>                               (Chapter 11: long constant, e.g. 100l)
                 | <uint>                               (Chapter 12: unsigned int constant, e.g. 42u)
                 | <ulong>                              (Chapter 12: unsigned long constant, e.g. 42ul)
+                | <double>                             (Chapter 13: double constant, e.g. 3.14, 1e10)
                 | "(" <type-spec>+ ")" <factor>        (Chapter 11: explicit cast; no storage class)
                 | <identifier> "(" <arg-list> ")"
                 | <identifier>

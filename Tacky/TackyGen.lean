@@ -5,6 +5,22 @@ import Semantics.SymbolTable
 /-
   IR generation pass: converts AST.Program → Tacky.Program.
 
+  Chapter 13 additions:
+    - `emitExp` handles `Constant(.ConstDouble f)`: allocates a fresh name
+      `.LfpC.N` for the float constant, records it in `floatConsts`, and
+      returns `Val.Var ".LfpC.N"` (the constant lives in read-only data).
+    - `Cast` now handles all conversions to/from `Double`:
+        Int → Double  : `IntToDouble`
+        Double → Int  : `DoubleToInt`
+        UInt → Double : `UIntToDouble`
+        Double → UInt : `DoubleToUInt`
+        Long → Double : `IntToDouble` (via cvtsi2sdq — reused, CodeGen distinguishes by type)
+        Double → Long : `DoubleToInt` (via cvttsd2siq — reused)
+        ULong → Double: `ULongToDouble`
+        Double → ULong: `DoubleToULong`
+    - `GenState` gains `floatConsts` (name → value) and `needsNegZero`.
+    - `emitProgram` returns `(Program, typeEnv, floatConsts, needsNegZero)`.
+
   Chapter 11 additions:
     - `emitExp` returns `(Val × AST.Typ × List Instruction)` so that each
       expression's type is available for inserting correct assembly instructions.
@@ -27,12 +43,18 @@ namespace Tacky
 -- ---------------------------------------------------------------------------
 
 /-- State threaded through IR generation.
-    `counter`:  unique name counter (same as before).
-    `typeEnv`:  maps every temporary variable name (e.g. `"tmp.5"`) to its
-                scalar type, so the Driver can build the backend symbol table. -/
+    `counter`:    unique name counter (same as before).
+    `typeEnv`:    maps every temporary variable name (e.g. `"tmp.5"`) to its
+                  scalar type, so the Driver can build the backend symbol table.
+    `floatConsts`: (Chapter 13) maps float-constant labels (e.g. `".LfpC.5"`)
+                  to their float values, for emission as read-only static data.
+    `needsNegZero`: (Chapter 13) true when a double Negate instruction has been
+                  emitted; the Driver will add the `.Lneg_zero` constant. -/
 private structure GenState where
-  counter : Nat
-  typeEnv : List (String × AST.Typ)
+  counter     : Nat
+  typeEnv     : List (String × AST.Typ)
+  floatConsts : List (String × Float)
+  needsNegZero : Bool
 
 private abbrev GenM := StateM GenState
 
@@ -40,13 +62,26 @@ private abbrev GenM := StateM GenState
 private def makeTemporary (t : AST.Typ) : GenM String := do
   let s ← get
   let name := s!"tmp.{s.counter}"
-  modify (fun (st : GenState) => { st with counter := st.counter + 1, typeEnv := (name, t) :: st.typeEnv })
+  modify (fun st => { st with counter := st.counter + 1, typeEnv := (name, t) :: st.typeEnv })
   return name
 
 private def makeLabel (base : String) : GenM String := do
   let s ← get
-  modify (fun s => { s with counter := s.counter + 1 })
-  return s!"{base}.{s.counter - 1}"
+  -- Use s.counter (the PRE-modification value) as the unique suffix.
+  -- Importantly, do NOT subtract 1: that was an off-by-one bug where counter
+  -- values 0 and 1 both produced the label "base.0" (since Nat 0-1 = 0).
+  modify (fun st => { st with counter := st.counter + 1 })
+  return s!"{base}.{s.counter}"
+
+/-- (Chapter 13) Intern a float constant: allocate a unique read-only label.
+    Returns the label name to use as `Val.Var label`. -/
+private def internFloat (f : Float) : GenM String := do
+  let s ← get
+  let label := s!".LfpC.{s.counter}"
+  modify (fun st => { st with counter := st.counter + 1,
+                               typeEnv := (label, .Double) :: st.typeEnv,
+                               floatConsts := (label, f) :: st.floatConsts })
+  return label
 
 -- ---------------------------------------------------------------------------
 -- Operator translation
@@ -83,6 +118,12 @@ private def convertBinop : AST.BinaryOp → BinaryOp
 /-- Lower an AST expression to TACKY instructions.
     Returns `(result_val, result_type, instructions)`.
 
+    Chapter 13:
+    - `Constant(.ConstDouble f)` → intern `f` as a read-only static constant,
+      return `Val.Var label` with type `Double`.
+    - `Cast(.Double, e)` / `Cast(intTyp, doubleExpr)` → conversion instructions.
+    - `Unary .Negate e` where `e : Double` → sets `needsNegZero` in state.
+
     Chapter 11:
     - `Constant(.ConstInt n)` → `(Constant n, Int, [])`
     - `Constant(.ConstLong n)` → `(Constant n, Long, [])`
@@ -97,20 +138,23 @@ private def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val × AST.
   | .Constant (.ConstLong n)  => return (.Constant n, .Long,  [])
   | .Constant (.ConstUInt n)  => return (.Constant n, .UInt,  [])  -- Chapter 12
   | .Constant (.ConstULong n) => return (.Constant n, .ULong, [])  -- Chapter 12
+  | .Constant (.ConstDouble f) => do
+      -- Chapter 13: float constants cannot be immediates; intern as a static label.
+      let label ← internFloat f
+      return (.Var label, .Double, [])
   | .Var v => do
-      -- Look up the variable's type from the symbol table
       let t : AST.Typ := match Semantics.lookupSym st v with
         | some { type := .Obj t, .. } => t
-        | _ => .Int   -- default (temporaries are not in frontend sym table)
+        | _ => .Int
       return (.Var v, t, [])
   | .Cast targetTyp inner => do
       let (src, srcTyp, instrs) ← emitExp st inner
       if targetTyp == srcTyp then
-        -- No conversion needed (same type): pass through
         return (src, targetTyp, instrs)
       else
         let dst := Val.Var (← makeTemporary targetTyp)
         match targetTyp, srcTyp with
+        -- ---- integer ↔ integer conversions (Ch11/Ch12) ----
         -- Widening sign-extend (signed int → wider signed or unsigned type)
         | .Long,  .Int  => return (dst, .Long,  instrs ++ [.SignExtend src dst])
         | .ULong, .Int  => return (dst, .ULong, instrs ++ [.SignExtend src dst])
@@ -122,73 +166,68 @@ private def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val × AST.
         | .UInt, .Long  => return (dst, .UInt, instrs ++ [.Truncate src dst])
         | .Int,  .ULong => return (dst, .Int,  instrs ++ [.Truncate src dst])
         | .UInt, .ULong => return (dst, .UInt, instrs ++ [.Truncate src dst])
-        -- Same-size reinterpret (int↔uint or long↔ulong): copy into a new typed
-        -- temporary so the backend sym table sees the correct signedness.
-        -- Without this, cmpIsSigned would look up the original var and use the wrong
-        -- signed/unsigned condition codes for relational instructions.
+        -- ---- double ↔ integer conversions (Ch13) ----
+        -- Signed integer → Double
+        | .Double, .Int   => return (dst, .Double, instrs ++ [.IntToDouble  src dst])
+        | .Double, .Long  => return (dst, .Double, instrs ++ [.IntToDouble  src dst])
+        -- Unsigned integer → Double
+        | .Double, .UInt  => return (dst, .Double, instrs ++ [.UIntToDouble  src dst])
+        | .Double, .ULong => return (dst, .Double, instrs ++ [.ULongToDouble src dst])
+        -- Double → Signed integer
+        | .Int,    .Double => return (dst, .Int,  instrs ++ [.DoubleToInt  src dst])
+        | .Long,   .Double => return (dst, .Long, instrs ++ [.DoubleToInt  src dst])
+        -- Double → Unsigned integer
+        | .UInt,   .Double => return (dst, .UInt,  instrs ++ [.DoubleToUInt  src dst])
+        | .ULong,  .Double => return (dst, .ULong, instrs ++ [.DoubleToULong src dst])
+        -- Same-size reinterpret (int↔uint or long↔ulong): copy into a new typed temporary
         | _, _ => return (dst, targetTyp, instrs ++ [.Copy src dst])
   | .Unary .Not inner => do
-      -- Logical NOT: result is always Int (0 or 1)
       let (src, _, instrs) ← emitExp st inner
       let dst := Val.Var (← makeTemporary .Int)
       return (dst, .Int, instrs ++ [.Unary .Not src dst])
+  | .Unary .Negate inner => do
+      let (src, srcTyp, instrs) ← emitExp st inner
+      let dst := Val.Var (← makeTemporary srcTyp)
+      -- Chapter 13: double negation needs the neg-zero constant in the assembly
+      if srcTyp == .Double then
+        modify (fun s => { s with needsNegZero := true })
+      return (dst, srcTyp, instrs ++ [.Unary .Negate src dst])
   | .Unary op inner => do
       let (src, srcTyp, instrs) ← emitExp st inner
       let dst := Val.Var (← makeTemporary srcTyp)
       return (dst, srcTyp, instrs ++ [.Unary (convertUnop op) src dst])
   | .Binary .And e1 e2 => do
-      -- Short-circuit logical AND; result is always Int
       let falseLabel ← makeLabel "and_false"
       let endLabel   ← makeLabel "and_end"
       let (v1, _, instrs1) ← emitExp st e1
       let (v2, _, instrs2) ← emitExp st e2
       let result := Val.Var (← makeTemporary .Int)
-      return (result,
-        .Int,
-        instrs1 ++
-        [.JumpIfZero v1 falseLabel] ++
-        instrs2 ++
-        [.JumpIfZero v2 falseLabel,
-         .Copy (.Constant 1) result,
-         .Jump endLabel,
-         .Label falseLabel,
-         .Copy (.Constant 0) result,
-         .Label endLabel])
+      return (result, .Int,
+        instrs1 ++ [.JumpIfZero v1 falseLabel] ++
+        instrs2 ++ [.JumpIfZero v2 falseLabel,
+                    .Copy (.Constant 1) result, .Jump endLabel,
+                    .Label falseLabel, .Copy (.Constant 0) result,
+                    .Label endLabel])
   | .Binary .Or e1 e2 => do
-      -- Short-circuit logical OR; result is always Int
       let trueLabel  ← makeLabel "or_true"
       let endLabel   ← makeLabel "or_end"
       let (v1, _, instrs1) ← emitExp st e1
       let (v2, _, instrs2) ← emitExp st e2
       let result := Val.Var (← makeTemporary .Int)
-      return (result,
-        .Int,
-        instrs1 ++
-        [.JumpIfNotZero v1 trueLabel] ++
-        instrs2 ++
-        [.JumpIfNotZero v2 trueLabel,
-         .Copy (.Constant 0) result,
-         .Jump endLabel,
-         .Label trueLabel,
-         .Copy (.Constant 1) result,
-         .Label endLabel])
+      return (result, .Int,
+        instrs1 ++ [.JumpIfNotZero v1 trueLabel] ++
+        instrs2 ++ [.JumpIfNotZero v2 trueLabel,
+                    .Copy (.Constant 0) result, .Jump endLabel,
+                    .Label trueLabel, .Copy (.Constant 1) result,
+                    .Label endLabel])
   | .Binary op e1 e2 => do
       let (src1, t1, instrs1) ← emitExp st e1
       let (src2, t2, instrs2) ← emitExp st e2
-      -- After TypeCheck, both operands have the same type (casts were inserted),
-      -- EXCEPT for shift operators where the right operand keeps its own type.
-      -- Relational operators always produce Int.
-      -- Shift operators: result type is the type of the LEFT operand (C §6.5.7).
-      -- Other arithmetic operators produce the common type of both operands.
-      -- After TypeCheck, both operands of arithmetic ops have the same type (casts inserted).
-      -- Relational ops always produce Int (0 or 1).
-      -- Shift ops: result type = left operand's type (C §6.5.7).
-      -- All other arithmetic ops: result type = common type of operands (= t1 after TypeCheck).
       let resultTyp : AST.Typ := match op with
         | .Equal | .NotEqual | .LessThan | .LessOrEqual
         | .GreaterThan | .GreaterOrEqual => .Int
         | .ShiftLeft | .ShiftRight => t1   -- type of left operand (C §6.5.7)
-        | .And | .Or               => .Int -- logical ops (handled separately, shouldn't reach here)
+        | .And | .Or               => .Int
         | _                        => t1   -- arithmetic ops: t1 == t2 after TypeCheck
       let dst := Val.Var (← makeTemporary resultTyp)
       return (dst, resultTyp, instrs1 ++ instrs2 ++ [.Binary (convertBinop op) src1 src2 dst])
@@ -198,18 +237,13 @@ private def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val × AST.
       let (c,  _, condInstrs) ← emitExp st cond
       let (v1, t1, e1Instrs) ← emitExp st e1
       let (v2, _, e2Instrs)  ← emitExp st e2
-      -- After TypeCheck, both branches have the same type
       let result := Val.Var (← makeTemporary t1)
       return (result, t1,
-        condInstrs ++
-        [.JumpIfZero c e2Label] ++
-        e1Instrs ++
-        [.Copy v1 result, .Jump endLabel, .Label e2Label] ++
-        e2Instrs ++
-        [.Copy v2 result, .Label endLabel])
+        condInstrs ++ [.JumpIfZero c e2Label] ++
+        e1Instrs ++ [.Copy v1 result, .Jump endLabel, .Label e2Label] ++
+        e2Instrs ++ [.Copy v2 result, .Label endLabel])
   | .Assignment (.Var v) rhs => do
       let (result, _, instrs) ← emitExp st rhs
-      -- After TypeCheck, rhs is already cast to match v's type
       let varTyp : AST.Typ := match Semantics.lookupSym st v with
         | some { type := .Obj t, .. } => t
         | _ => .Int
@@ -220,27 +254,36 @@ private def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val × AST.
         | some { type := .Obj t, .. } => t
         | _ => .Int
       let tmp ← makeTemporary varTyp
-      -- Determine the right constant: 1 as Int or 1 as Long
-      let one := Val.Constant 1
-      return (.Var tmp, varTyp,
-        [.Copy (.Var v) (.Var tmp),
-         .Binary .Add (.Var v) one (.Var v)])
+      -- For doubles, add 1.0; for integers, add 1
+      if varTyp == .Double then do
+        let oneLabel ← internFloat 1.0
+        return (.Var tmp, varTyp,
+          [.Copy (.Var v) (.Var tmp),
+           .Binary .Add (.Var v) (.Var oneLabel) (.Var v)])
+      else
+        return (.Var tmp, varTyp,
+          [.Copy (.Var v) (.Var tmp),
+           .Binary .Add (.Var v) (.Constant 1) (.Var v)])
   | .PostfixIncr _ => return (.Constant 0, .Int, [])
   | .PostfixDecr (.Var v) => do
       let varTyp : AST.Typ := match Semantics.lookupSym st v with
         | some { type := .Obj t, .. } => t
         | _ => .Int
       let tmp ← makeTemporary varTyp
-      let one := Val.Constant 1
-      return (.Var tmp, varTyp,
-        [.Copy (.Var v) (.Var tmp),
-         .Binary .Subtract (.Var v) one (.Var v)])
+      if varTyp == .Double then do
+        let oneLabel ← internFloat 1.0
+        return (.Var tmp, varTyp,
+          [.Copy (.Var v) (.Var tmp),
+           .Binary .Subtract (.Var v) (.Var oneLabel) (.Var v)])
+      else
+        return (.Var tmp, varTyp,
+          [.Copy (.Var v) (.Var tmp),
+           .Binary .Subtract (.Var v) (.Constant 1) (.Var v)])
   | .PostfixDecr _ => return (.Constant 0, .Int, [])
   | .FunCall name args => do
       let argResults ← args.mapM (emitExp st)
       let argInstrs := argResults.foldl (fun acc (_, _, instrs) => acc ++ instrs) []
       let argVals   := argResults.map   (fun (v, _, _) => v)
-      -- Look up the function's return type
       let retTyp : AST.Typ := match Semantics.lookupSym st name with
         | some { type := .Fun _ _ rt, .. } => rt
         | _ => .Int
@@ -336,7 +379,6 @@ private partial def emitStatement (st : Semantics.SymbolTable) (funcName : Strin
       let jumpTable ← cases.foldlM (fun acc (caseVal, caseLbl) => do
           match caseVal with
           | some n => do
-              -- Compare switch value against case constant (same type as v)
               let caseConst := Val.Constant n
               let tmp := Val.Var (← makeTemporary .Int)
               pure (acc ++ [.Binary .Equal v caseConst tmp,
@@ -377,11 +419,8 @@ end
 -- Function and program emission
 -- ---------------------------------------------------------------------------
 
-/-- Emit a TACKY function definition.
-    Chapter 11: param names are still plain strings (types are in sym table). -/
 private def emitFunctionDef (st : Semantics.SymbolTable) (f : AST.FunctionDef)
     (isGlobal : Bool) : GenM FunctionDef := do
-  -- Extract just the renamed parameter names (types are in the sym table)
   let paramNames := f.params.map (·.2)
   let body ← f.body.foldlM (fun acc item => do
     return acc ++ (← emitBlockItem st f.name item)) []
@@ -389,22 +428,43 @@ private def emitFunctionDef (st : Semantics.SymbolTable) (f : AST.FunctionDef)
            body := body ++ [.Return (.Constant 0)],
            global := isGlobal }
 
+/-- Helper: build the `AST.Const` zero initializer for a given type.
+    Used for Tentative static variables. -/
+private def zeroConstOf : AST.Typ → AST.Const
+  | .Int    => .ConstInt 0
+  | .Long   => .ConstLong 0
+  | .UInt   => .ConstUInt 0
+  | .ULong  => .ConstULong 0
+  | .Double => .ConstDouble 0.0
+
 /-- Collect static variable entries from the symbol table and emit them as
     TackyTopLevel.StaticVariable items.
-    Chapter 11: includes the variable's type so the emitter can use .long/.quad. -/
+    Chapter 13: init is now `AST.Const` (not `Int`). -/
 private def emitStaticVars (symTable : Semantics.SymbolTable) : List TackyTopLevel :=
   symTable.filterMap fun (name, entry) =>
     match entry.type, entry.attrs with
-    | .Obj t, .Static (.Initial n) isGlobal  => some (.StaticVariable name isGlobal t n)
-    | .Obj t, .Static .Tentative   isGlobal  => some (.StaticVariable name isGlobal t 0)
-    | _,      _                              => none
+    | .Obj t, .Static (.Initial n) isGlobal =>
+        -- Integer static with an explicit initializer
+        let c : AST.Const := match t with
+          | .Int   => .ConstInt n
+          | .Long  => .ConstLong n
+          | .UInt  => .ConstUInt n
+          | .ULong => .ConstULong n
+          | .Double => .ConstDouble (Float.ofScientific n.toNat false 0)  -- fallback
+        some (.StaticVariable name isGlobal t c)
+    | .Obj t, .Static (.DoubleInitial f) isGlobal =>
+        -- Chapter 13: static double with an explicit initializer
+        some (.StaticVariable name isGlobal .Double (.ConstDouble f))
+    | .Obj t, .Static .Tentative isGlobal =>
+        -- Zero-initialised (goes to .bss)
+        some (.StaticVariable name isGlobal t (zeroConstOf t))
+    | _, _ => none
 
 /-- Entry point for the IR generation pass.
-    Returns `(Program, typeEnv)` where `typeEnv` maps each generated temporary
-    name to its scalar type.  The Driver uses this to build the backend symbol
-    table for CodeGen and PseudoReplace. -/
+    Returns `(Program, typeEnv, floatConsts, needsNegZero)`. -/
 def emitProgram (p : AST.Program) (symTable : Semantics.SymbolTable)
-    (initCounter : Nat := 0) : Program × List (String × AST.Typ) :=
+    (initCounter : Nat := 0)
+    : Program × List (String × AST.Typ) × List (String × Float) × Bool :=
   let astFuncs := p.topLevels.filterMap fun tl =>
     match tl with
     | .FunDef fd  => some fd
@@ -417,9 +477,13 @@ def emitProgram (p : AST.Program) (symTable : Semantics.SymbolTable)
         | _ => true
       let tackyFd ← emitFunctionDef symTable fd isGlobal
       return acc ++ [.Function tackyFd]) []
-  let initState : GenState := { counter := initCounter, typeEnv := [] }
+  let initState : GenState :=
+    { counter := initCounter, typeEnv := [], floatConsts := [], needsNegZero := false }
   let (funcItems, finalState) := action.run initState
   let staticItems := emitStaticVars symTable
-  ({ topLevels := funcItems ++ staticItems }, finalState.typeEnv)
+  ({ topLevels := funcItems ++ staticItems },
+   finalState.typeEnv,
+   finalState.floatConsts,
+   finalState.needsNegZero)
 
 end Tacky

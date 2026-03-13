@@ -3,6 +3,13 @@ import AssemblyAST.AssemblyAST
 /-
   Pass 2 of assembly generation: replace Pseudo operands with concrete operands.
 
+  Chapter 13 changes:
+    - `Double` AsmType → 8-byte stack slot, 8-byte aligned (same size as Quadword).
+    - New instructions handled (operand replacement only — FixUp handles constraints):
+        `Movsd(src, dst)`, `Xorpd(src, dst)`, `Comisd(src, dst)`
+        `Cvtsi2sd(t, src, dst)`, `Cvttsd2si(t, src, dst)`
+    - `StaticConstant` items pass through unchanged (like `StaticVariable`).
+
   Chapter 11 changes:
     - Now consults the `BackendSymTable` (instead of the frontend SymbolTable).
     - Stack slot size is determined by `AsmType`:
@@ -31,10 +38,10 @@ private def alignUp (n : Nat) (align : Nat) : Nat :=
 
 /-- Look up or assign a concrete operand for `id`.
     Consults the backend sym table:
-      - `ObjEntry(_, true)` → static variable → `Data(id)`.
-      - `ObjEntry(Longword, false)` → local int → next 4-byte stack slot.
-      - `ObjEntry(Quadword, false)` → local long → next 8-byte stack slot.
-      - Not found (TACKY temporary) → default to 4-byte slot (type default is Longword). -/
+      - `ObjEntry(_, _, true)` → static variable/constant → `Data(id)`.
+      - `ObjEntry(Quadword, _, false)` → local long/ulong → next 8-byte stack slot.
+      - `ObjEntry(Double, _, false)`   → local double → next 8-byte stack slot (Chapter 13).
+      - Not found or `ObjEntry(Longword, ...)` → 4-byte slot. -/
 private def ReplState.getOrInsert (s : ReplState) (id : String)
     (bst : BackendSymTable) : ReplState × Operand :=
   match s.map.find? (fun p => p.1 == id) with
@@ -42,11 +49,11 @@ private def ReplState.getOrInsert (s : ReplState) (id : String)
   | none =>
       match lookupBst bst id with
       | some (.ObjEntry _ _ true) =>
-          -- Static variable: RIP-relative Data operand
+          -- Static variable or read-only constant: RIP-relative Data operand
           let op := Operand.Data id
           ({ s with map := s.map ++ [(id, op)] }, op)
-      | some (.ObjEntry .Quadword _ false) =>
-          -- Local long or ulong (8-byte): align maxBytes to 8, then allocate 8 bytes
+      | some (.ObjEntry .Quadword _ false) | some (.ObjEntry .Double _ false) =>
+          -- Local long/ulong/double (8-byte): align maxBytes to 8, then allocate 8 bytes
           let aligned := alignUp s.maxBytes 8
           let bytes   := aligned + 8
           let offset  : Int := -(bytes : Int)
@@ -64,13 +71,19 @@ private def replaceOp (s : ReplState) (bst : BackendSymTable) : Operand → Repl
   | op         => (s, op)
 
 /-- Replace all Pseudo operands in a single instruction.
-    Chapter 11: handles all typed instruction variants and Movsx. -/
+    Chapter 11: handles all typed instruction variants and Movsx.
+    Chapter 13: handles Movsd, Cvtsi2sd, Cvttsd2si, Xorpd, Comisd. -/
 private def replaceInstr (s : ReplState) (bst : BackendSymTable)
     : Instruction → ReplState × List Instruction
   | .Mov t src dst =>
       let (s, src') := replaceOp s bst src
       let (s, dst') := replaceOp s bst dst
       (s, [.Mov t src' dst'])
+  | .Movsd src dst =>
+      -- Chapter 13: scalar double move; FixUp handles mem-to-mem constraint
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Movsd src' dst'])
   | .Movsx src dst =>
       let (s, src') := replaceOp s bst src
       let (s, dst') := replaceOp s bst dst
@@ -104,6 +117,27 @@ private def replaceInstr (s : ReplState) (bst : BackendSymTable)
   | .Push operand =>
       let (s, op') := replaceOp s bst operand
       (s, [.Push op'])
+  -- Chapter 13: floating-point instructions -------------------------
+  | .Cvtsi2sd t src dst =>
+      -- Convert integer to double; FixUp handles mem dst constraint
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Cvtsi2sd t src' dst'])
+  | .Cvttsd2si t src dst =>
+      -- Truncate double to integer; FixUp handles mem dst constraint
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Cvttsd2si t src' dst'])
+  | .Xorpd src dst =>
+      -- XOR packed doubles (double negation); FixUp handles mem-to-mem
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Xorpd src' dst'])
+  | .Comisd src dst =>
+      -- Compare doubles; FixUp handles mem-to-mem (src must be reg or mem, dst must be reg)
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Comisd src' dst'])
   | instr => (s, [instr])  -- Ret, Cdq, Jmp, JmpCC, Label, Call pass through
 
 /-- Replace pseudoregisters in a single function definition. -/
@@ -118,12 +152,14 @@ private def replaceFunctionDef (f : FunctionDef) (bst : BackendSymTable) : Funct
   { f with instructions := instrs, stackSize := finalState.maxBytes }
 
 /-- Entry point for pass 2.
-    Processes each `AsmTopLevel.Function`; passes `StaticVariable` items through. -/
+    Processes each `AsmTopLevel.Function`.
+    `StaticVariable` and `StaticConstant` items pass through unchanged. -/
 def replacePseudos (p : Program) (bst : BackendSymTable) : Program :=
   let topLevels := p.topLevels.map fun tl =>
     match tl with
-    | .Function fd            => AsmTopLevel.Function (replaceFunctionDef fd bst)
-    | sv@(.StaticVariable ..) => sv
+    | .Function fd              => AsmTopLevel.Function (replaceFunctionDef fd bst)
+    | sv@(.StaticVariable ..)   => sv
+    | sc@(.StaticConstant ..)   => sc   -- Chapter 13: read-only float constants pass through
   { topLevels }
 
 end AssemblyAST

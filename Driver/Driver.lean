@@ -64,19 +64,25 @@ private def runCmd (cmd : String) (args : Array String) (errPrefix : String) : I
 -- ---------------------------------------------------------------------------
 
 /-- Convert an `AST.Typ` to the corresponding `AsmType`.
-    Chapter 12: UInt → Longword, ULong → Quadword (same widths as signed). -/
+    Chapter 12: UInt → Longword, ULong → Quadword (same widths as signed).
+    Chapter 13: Double → Double (8-byte, uses XMM registers). -/
 private def asmTypeOf : AST.Typ → AssemblyAST.AsmType
   | .Int  | .UInt  => .Longword
   | .Long | .ULong => .Quadword
+  | .Double        => .Double
 
-/-- True iff the type is a signed integer type. -/
+/-- True iff the type is a signed integer type.
+    Double returns false (sign concept doesn't apply to IEEE 754 types). -/
 private def isSignedTyp : AST.Typ → Bool
   | .Int | .Long   => true
   | .UInt | .ULong => false
+  | .Double        => false
 
 /-- Build the backend symbol table from:
     1. The frontend symbol table (all declared variables and functions).
     2. The `typeEnv` from TackyGen (maps generated temporary names → types).
+    3. Chapter 13: `floatConsts` — float literal labels (`.LfpC.N`) that must be
+       treated as static (isStatic = true) so PseudoReplace maps them to Data(name).
 
     For each frontend entry:
       - `Obj(typ)` with `Local` attrs   → `ObjEntry(asmType, false)`
@@ -84,10 +90,13 @@ private def isSignedTyp : AST.Typ → Bool
       - `Fun(_, _, retTyp)` with `FunAttr(isDef, _)` → `FunEntry(isDef, retAsmType)`
 
     For each typeEnv entry not already in the frontend sym table:
-      → `ObjEntry(asmType, false)` (TACKY temporaries are always local) -/
+      → `ObjEntry(asmType, false)` (TACKY temporaries are always local)
+
+    Float const labels override with `isStatic = true` (prepended, lookupBst finds first). -/
 private def buildBackendSymTable
     (frontendSt : Semantics.SymbolTable)
     (typeEnv    : List (String × AST.Typ))
+    (floatConsts : List (String × Float) := [])
     : AssemblyAST.BackendSymTable :=
   -- Convert frontend entries
   let fromFrontend : AssemblyAST.BackendSymTable :=
@@ -100,13 +109,20 @@ private def buildBackendSymTable
       | .Fun _ _ retTyp, .FunAttr isDef _ =>
           some (name, .FunEntry isDef (asmTypeOf retTyp))
       | _, _ => none
-  -- Add typeEnv entries for temporaries not in the frontend sym table
+  -- Add typeEnv entries for temporaries not in the frontend sym table.
+  -- Float constant labels from internFloat() are in typeEnv with type Double;
+  -- they will be overridden below to have isStatic = true.
   let frontendNames := fromFrontend.map (·.1)
   let fromTypeEnv : AssemblyAST.BackendSymTable :=
     typeEnv.filterMap fun (name, typ) =>
       if frontendNames.contains name then none
       else some (name, .ObjEntry (asmTypeOf typ) (isSignedTyp typ) false)
-  fromFrontend ++ fromTypeEnv
+  -- Chapter 13: float const labels must be static (RIP-relative Data operands).
+  -- Prepend so lookupBst finds these first (overriding the isStatic=false entries
+  -- that buildBackendSymTable would otherwise create from typeEnv).
+  let floatConstBst : AssemblyAST.BackendSymTable :=
+    floatConsts.map fun (name, _) => (name, .ObjEntry .Double false true)
+  floatConstBst ++ fromFrontend ++ fromTypeEnv
 
 -- ---------------------------------------------------------------------------
 -- Pipeline steps
@@ -174,26 +190,52 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
   match Semantics.resolveLabels resolvedAst with
   | .ok ()     => pure ()
   | .error msg => throw (IO.userError s!"Semantic error: {msg}")
-  -- TACKY generation: returns (program, typeEnv); TypeCheck already ran above
-  let (tacky, typeEnv) := Tacky.emitProgram resolvedAst symTable initCounter
+  -- TACKY generation: returns (program, typeEnv, floatConsts, needsNegZero)
+  -- Chapter 13: floatConsts = list of (label, Float) for float literal constants;
+  --             needsNegZero = true if any double negation was emitted (needs .Lneg_zero).
+  let (tacky, typeEnv, floatConsts, needsNegZero) :=
+    Tacky.emitProgram resolvedAst symTable initCounter
   if stage == .Tacky then return none
-  -- Build backend symbol table from frontend sym table + TACKY typeEnv
-  let bst := buildBackendSymTable symTable typeEnv
+  -- Build backend symbol table from frontend sym table + TACKY typeEnv.
+  -- Float const labels (in floatConsts) need isStatic = true so PseudoReplace maps
+  -- them to Data(name) operands instead of stack slots.
+  let bst := buildBackendSymTable symTable typeEnv floatConsts
   -- Assembly generation pass 1: TACKY → Assembly AST
   let asmAst := AssemblyAST.genProgram tacky bst
   -- Assembly generation pass 2: replace pseudoregisters
   let asmAst := AssemblyAST.replacePseudos asmAst bst
   -- Assembly generation pass 3: fix invalid instructions
   let asmAst := AssemblyAST.fixUp asmAst
+  -- Chapter 13: append StaticConstant items for float literals, neg-zero, and
+  -- the ULong↔Double threshold constant.
+  -- These must be appended AFTER fixUp (StaticConstants have no pseudo operands).
+  let floatConstItems : List AssemblyAST.AsmTopLevel :=
+    floatConsts.map fun (name, f) =>
+      .StaticConstant name 8 (.DoubleInit f)
+  let negZeroItems : List AssemblyAST.AsmTopLevel :=
+    if needsNegZero then
+      -- -0.0 IEEE 754 bit pattern: 0x8000000000000000 = sign bit only
+      [.StaticConstant ".Lneg_zero" 16 (.LongInit (-9223372036854775808))]
+    else []
+  -- Always emit the ULong threshold (2^63 = 0x43E0000000000000 as IEEE 754 double bits).
+  -- CodeGen references .Lulong_thresh whenever DoubleToULong or ULongToDouble appears.
+  -- Emitting unconditionally is safe: unused rodata is harmless.
+  let threshItems : List AssemblyAST.AsmTopLevel :=
+    [.StaticConstant ".Lulong_thresh" 8 (.ULongInit 4890909195324358656)]
+  let asmAst : AssemblyAST.Program :=
+    { topLevels := asmAst.topLevels ++ floatConstItems ++ negZeroItems ++ threshItems }
   if stage == .Codegen then return none
   -- Emit assembly
   let assemblyPath := changeExtension preprocessedPath ".s"
   IO.FS.writeFile assemblyPath (Emission.emitProgram asmAst)
   return some assemblyPath
 
-def assemble (assemblyPath : String) (outputPath : String) : IO Unit := do
+def assemble (assemblyPath : String) (outputPath : String)
+    (extraLinkerFlags : List String := []) : IO Unit := do
+  -- Pass any extra linker flags (e.g. -lm) after the output flag so GCC sees them.
+  let extraArr := extraLinkerFlags.toArray
   try
-    runCmd "gcc" #[assemblyPath, "-o", outputPath] "Assembly/linking failed"
+    runCmd "gcc" (#[assemblyPath, "-o", outputPath] ++ extraArr) "Assembly/linking failed"
   catch e =>
     try IO.FS.removeFile assemblyPath catch _ => pure ()
     throw e
@@ -207,7 +249,8 @@ def assembleToObject (assemblyPath : String) (objectPath : String) : IO Unit := 
     throw e
   try IO.FS.removeFile assemblyPath catch _ => pure ()
 
-def run (inputPath : String) (stage : Stage) : IO Unit := do
+def run (inputPath : String) (stage : Stage)
+    (extraLinkerFlags : List String := []) : IO Unit := do
   let preprocessed ← preprocess inputPath
   let assemblyOpt ←
     try
@@ -219,7 +262,7 @@ def run (inputPath : String) (stage : Stage) : IO Unit := do
       throw e
   match stage, assemblyOpt with
   | .Full, some assemblyPath =>
-    assemble assemblyPath (dropExtension inputPath)
+    assemble assemblyPath (dropExtension inputPath) extraLinkerFlags
   | .ObjectFile, some assemblyPath =>
     assembleToObject assemblyPath (changeExtension inputPath ".o")
   | _, _ =>

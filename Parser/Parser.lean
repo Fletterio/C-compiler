@@ -91,6 +91,7 @@ private def isDeclSpecToken : Token → Bool
   | .KwLong     => true
   | .KwUnsigned => true   -- Chapter 12
   | .KwSigned   => true   -- Chapter 12
+  | .KwDouble   => true   -- Chapter 13
   | .KwStatic   => true
   | .KwExtern   => true
   | _           => false
@@ -111,46 +112,55 @@ private def isDeclSpecToken : Token → Bool
 private def parseDeclSpecs (tokens : List Token)
     : Except String (Typ × Option StorageClass × List Token) :=
   let rec loop (toks : List Token) (sawInt : Bool) (sawLong : Bool)
-               (sawUnsigned : Bool) (sawSigned : Bool)
+               (sawUnsigned : Bool) (sawSigned : Bool) (sawDouble : Bool)
                (sc : Option StorageClass) : Except String (Typ × Option StorageClass × List Token) :=
     match toks with
     | .KwInt :: rest =>
         if sawInt then .error "Duplicate type specifier 'int'"
-        else loop rest true sawLong sawUnsigned sawSigned sc
+        else if sawDouble then .error "Cannot combine 'int' with 'double'"
+        else loop rest true sawLong sawUnsigned sawSigned false sc
     | .KwLong :: rest =>
         if sawLong then .error "Duplicate type specifier 'long'"
-        else loop rest sawInt true sawUnsigned sawSigned sc
+        else if sawDouble then .error "Cannot combine 'long' with 'double'"
+        else loop rest sawInt true sawUnsigned sawSigned false sc
     | .KwUnsigned :: rest =>
         if sawUnsigned then .error "Duplicate type specifier 'unsigned'"
         else if sawSigned then .error "Conflicting type specifiers 'signed' and 'unsigned'"
-        else loop rest sawInt sawLong true sawSigned sc
+        else if sawDouble then .error "Cannot combine 'unsigned' with 'double'"
+        else loop rest sawInt sawLong true sawSigned false sc
     | .KwSigned :: rest =>
-        -- `signed` just means the type is signed (all int/long are already signed).
-        -- It may appear multiple times only as `signed signed`? No — just allow once.
         if sawUnsigned then .error "Conflicting type specifiers 'unsigned' and 'signed'"
-        else loop rest sawInt sawLong sawUnsigned true sc
+        else if sawDouble then .error "Cannot combine 'signed' with 'double'"
+        else loop rest sawInt sawLong sawUnsigned true false sc
+    | .KwDouble :: rest =>
+        -- Chapter 13: 'double' is a standalone type; cannot be combined with
+        -- int/long/unsigned/signed (unlike C's 'long double' which we don't support).
+        if sawDouble then .error "Duplicate type specifier 'double'"
+        else if sawInt || sawLong || sawUnsigned || sawSigned then
+          .error "Cannot combine 'double' with other type specifiers"
+        else loop rest sawInt sawLong sawUnsigned sawSigned true sc
     | .KwStatic :: rest =>
         match sc with
         | some _ => .error "Multiple storage class specifiers"
-        | none   => loop rest sawInt sawLong sawUnsigned sawSigned (some .Static)
+        | none   => loop rest sawInt sawLong sawUnsigned sawSigned sawDouble (some .Static)
     | .KwExtern :: rest =>
         match sc with
         | some _ => .error "Multiple storage class specifiers"
-        | none   => loop rest sawInt sawLong sawUnsigned sawSigned (some .Extern)
+        | none   => loop rest sawInt sawLong sawUnsigned sawSigned sawDouble (some .Extern)
     | _ =>
         -- End of declaration specifiers; determine the type.
-        -- `signed` alone defaults to int; `unsigned` alone defaults to uint.
         let typ : Except String Typ :=
-          if sawUnsigned then
+          if sawDouble then .ok .Double  -- Chapter 13: double
+          else if sawUnsigned then
             if sawLong then .ok .ULong   -- unsigned long [int]
             else .ok .UInt               -- unsigned [int]
           else if sawLong then .ok .Long  -- [signed] [int] long
           else if sawInt || sawSigned then .ok .Int  -- [signed] int
-          else .error "Expected type specifier (int, long, unsigned, signed, etc.)"
+          else .error "Expected type specifier (int, long, unsigned, signed, double, etc.)"
         match typ with
         | .error e => .error e
         | .ok t    => .ok (t, sc, toks)
-  loop tokens false false false false none
+  loop tokens false false false false false none
 
 /-- Parse a type specifier for use in cast expressions and parameters.
     Delegates to `parseDeclSpecs` and strips storage-class info.
@@ -185,6 +195,8 @@ mutual
 private partial def parseFactor (tokens : List Token) : Except String (Exp × List Token) :=
   match tokens with
   | []                       => .error "Expected expression but reached end of input"
+  -- Chapter 13: floating-point constant (e.g. 3.14, 1.5e10)
+  | .DoubleConstant f :: rest => .ok (.Constant (.ConstDouble f), rest)
   -- Chapter 11: long integer constant (e.g. 100L — has l/L suffix)
   | .LongConstant n :: rest  => .ok (.Constant (.ConstLong n), rest)
   -- Chapter 12: unsigned long constant (e.g. 100UL — has ul/lu suffix)

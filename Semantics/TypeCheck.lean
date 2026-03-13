@@ -30,8 +30,10 @@ namespace Semantics
 -- ---------------------------------------------------------------------------
 
 /-- Return the common type for a binary operation (C "usual arithmetic conversions").
+    Chapter 13: `Double` is a floating-point type and outranks all integer types.
     Chapter 12: extends to 4 types (Int, Long, UInt, ULong).
     Rules (C §6.3.1.8):
+      0. Double beats all integer types.  (Ch13)
       1. Same type → that type.
       2. Both signed or both unsigned → wider type.
          Int  + Long  → Long;   UInt + ULong → ULong.
@@ -43,11 +45,13 @@ namespace Semantics
          UInt + Long  → Long (Long can represent all UInt values [0, 2^32−1]).
       (Rule 6, converting both to unsigned of the signed type, is not reachable here.) -/
 private def commonType (t1 t2 : AST.Typ) : AST.Typ :=
-  if t1 == t2 then t1
+  -- Chapter 13: Double outranks all integer types
+  if t1 == .Double || t2 == .Double then .Double
+  else if t1 == t2 then t1
   -- Same rank, mixed signedness: unsigned wins
   else if (t1 == .Int && t2 == .UInt) || (t1 == .UInt && t2 == .Int) then .UInt
   else if (t1 == .Long && t2 == .ULong) || (t1 == .ULong && t2 == .Long) then .ULong
-  -- ULong is the widest type; wins over everything else
+  -- ULong is the widest integer type; wins over everything else
   else if t1 == .ULong || t2 == .ULong then .ULong
   -- Long beats Int and UInt (Long can represent all UInt values)
   else if t1 == .Long || t2 == .Long then .Long
@@ -128,10 +132,11 @@ private def lookupVarTyp (st : SymbolTable) (name : String) : TcM AST.Typ :=
     Returns the (possibly rewritten) expression and its type. -/
 private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- Typed constants: preserve the constant's declared type
-  | .Constant (.ConstInt n)   => return (.Constant (.ConstInt n),   .Int)
-  | .Constant (.ConstLong n)  => return (.Constant (.ConstLong n),  .Long)
-  | .Constant (.ConstUInt n)  => return (.Constant (.ConstUInt n),  .UInt)   -- Chapter 12
-  | .Constant (.ConstULong n) => return (.Constant (.ConstULong n), .ULong)  -- Chapter 12
+  | .Constant (.ConstInt n)    => return (.Constant (.ConstInt n),    .Int)
+  | .Constant (.ConstLong n)   => return (.Constant (.ConstLong n),   .Long)
+  | .Constant (.ConstUInt n)   => return (.Constant (.ConstUInt n),   .UInt)    -- Chapter 12
+  | .Constant (.ConstULong n)  => return (.Constant (.ConstULong n),  .ULong)   -- Chapter 12
+  | .Constant (.ConstDouble f) => return (.Constant (.ConstDouble f), .Double)  -- Chapter 13
   -- Variable reference: look up type
   | .Var v => do
       let t ← lookupVarTyp st v
@@ -142,10 +147,17 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
       return (.Cast targetTyp inner', targetTyp)
   -- Unary operators: the result type matches the operand type.
   -- Exception: logical NOT (!) always produces Int regardless of operand type.
+  -- Chapter 13: bitwise complement (~) is not valid on Double.
   | .Unary .Not inner => do
       let (inner', _) ← typeCheckExp st inner
       -- Logical NOT always produces int (0 or 1)
       return (.Unary .Not inner', .Int)
+  | .Unary .Complement inner => do
+      let (inner', innerTyp) ← typeCheckExp st inner
+      -- C §6.5.3.3: ~ requires integer operand; doubles are not allowed
+      if innerTyp == .Double then
+        throw s!"TypeCheck: bitwise complement (~) is not valid on a double"
+      return (.Unary .Complement inner', innerTyp)
   | .Unary op inner => do
       let (inner', innerTyp) ← typeCheckExp st inner
       return (.Unary op inner', innerTyp)
@@ -154,25 +166,61 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- C §6.5.7: "The type of the result is that of the promoted left operand."
   -- The right operand is NOT subject to usual arithmetic conversions; the
   -- shift amount can have any integer type without affecting the result type.
+  -- Chapter 13: shifts and bitwise ops (& | ^ %) are not valid on Double.
   | .Binary .ShiftLeft left right => do
       let (left',  leftTyp)  ← typeCheckExp st left
-      let (right', _)        ← typeCheckExp st right
+      let (right', rightTyp) ← typeCheckExp st right
+      if leftTyp == .Double then
+        throw s!"TypeCheck: left operand of shift (<<) cannot be double"
+      if rightTyp == .Double then
+        throw s!"TypeCheck: right operand of shift (<<) cannot be double"
       return (.Binary .ShiftLeft left' right', leftTyp)
   | .Binary .ShiftRight left right => do
       let (left',  leftTyp)  ← typeCheckExp st left
-      let (right', _)        ← typeCheckExp st right
+      let (right', rightTyp) ← typeCheckExp st right
+      if leftTyp == .Double then
+        throw s!"TypeCheck: left operand of shift (>>) cannot be double"
+      if rightTyp == .Double then
+        throw s!"TypeCheck: right operand of shift (>>) cannot be double"
       return (.Binary .ShiftRight left' right', leftTyp)
+  -- Chapter 13: logical AND/OR — each operand is tested for truthiness
+  -- independently; do NOT apply usual arithmetic conversions between them.
+  -- The result is always Int (0 or 1).
+  | .Binary .And left right => do
+      let (left', _)  ← typeCheckExp st left
+      let (right', _) ← typeCheckExp st right
+      return (.Binary .And left' right', .Int)
+  | .Binary .Or left right => do
+      let (left', _)  ← typeCheckExp st left
+      let (right', _) ← typeCheckExp st right
+      return (.Binary .Or left' right', .Int)
   | .Binary op left right => do
       let (left', leftTyp)   ← typeCheckExp st left
       let (right', rightTyp) ← typeCheckExp st right
       -- Usual arithmetic conversions: widen the narrower operand
       let common := commonType leftTyp rightTyp
+      -- Chapter 13: reject bitwise operations and modulo on Double operands.
+      -- These operations require integer types (C §6.5.10, §6.5.11, §6.5.12, §6.5.5).
+      match op with
+      | .Remainder =>
+          if common == .Double then
+            throw s!"TypeCheck: modulo (%) is not valid on double operands"
+      | .BitAnd =>
+          if common == .Double then
+            throw s!"TypeCheck: bitwise AND (&) is not valid on double operands"
+      | .BitOr =>
+          if common == .Double then
+            throw s!"TypeCheck: bitwise OR (|) is not valid on double operands"
+      | .BitXor =>
+          if common == .Double then
+            throw s!"TypeCheck: bitwise XOR (^) is not valid on double operands"
+      | _ => pure ()
       let left''  := castTo common leftTyp  left'
       let right'' := castTo common rightTyp right'
       -- Relational and equality operators always produce Int
       let resultTyp := match op with
         | .Equal | .NotEqual | .LessThan | .LessOrEqual
-        | .GreaterThan | .GreaterOrEqual | .And | .Or => .Int
+        | .GreaterThan | .GreaterOrEqual => .Int
         | _ => common
       return (.Binary op left'' right'', resultTyp)
   -- Assignment: RHS is cast to the type of the LHS variable
@@ -266,6 +314,10 @@ private partial def typeCheckStmt (st : SymbolTable) (retTyp : AST.Typ) : AST.St
   | .Continue lbl => return .Continue lbl
   | .Switch exp body lbl cases => do
       let (exp', expTyp) ← typeCheckExp st exp
+      -- C §6.8.4.2: the controlling expression must have integer type.
+      -- Double is not a valid switch controlling expression type.
+      if expTyp == .Double then
+        throw s!"TypeCheck: switch controlling expression must have integer type, not double"
       let body' ← typeCheckStmt st retTyp body
       -- C §6.8.4.2: if the switch controlling expression has 32-bit type,
       -- truncate each case constant to that type's range.

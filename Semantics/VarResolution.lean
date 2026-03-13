@@ -96,13 +96,49 @@ private def getSym (name : String) : VarM2 (Option SymbolEntry) := do
 -- ---------------------------------------------------------------------------
 
 /-- Extract the raw integer value from a constant expression.
-    Accepts ConstInt, ConstLong, ConstUInt, and ConstULong literals. -/
+    Accepts integer literals and (via truncation) ConstDouble literals.
+    C allows initializing `static int i = 4.9;` — the double is truncated
+    towards zero to produce the integer value (here, 4). -/
 private def extractConst : AST.Exp → Option Int
-  | .Constant (.ConstInt n)   => some n
-  | .Constant (.ConstLong n)  => some n
-  | .Constant (.ConstUInt n)  => some n   -- Chapter 12
-  | .Constant (.ConstULong n) => some n   -- Chapter 12
-  | _                         => none
+  | .Constant (.ConstInt n)    => some n
+  | .Constant (.ConstLong n)   => some n
+  | .Constant (.ConstUInt n)   => some n     -- Chapter 12
+  | .Constant (.ConstULong n)  => some n     -- Chapter 12
+  | .Constant (.ConstDouble f) =>            -- Chapter 13: implicit float→int truncation
+      -- Truncation towards zero, matching C's (int)f cast semantics.
+      -- For non-negative f: use UInt64 truncation, then promote to Int.
+      -- For negative f: negate, truncate, negate result.
+      -- NaN, ±Inf, and out-of-range produce 0 (undefined in C, 0 is safe).
+      if f.isNaN || f.isInf then some 0
+      else if f >= 0.0 then some (Float.toUInt64 f).toNat
+      else some (-(Float.toUInt64 (-f)).toNat)
+  | _                          => none
+
+/-- Extract the raw float value from a constant expression.
+    Used for static double variable initializers (Chapter 13).
+    Integer constants are implicitly converted to the nearest double
+    using IEEE 754 hardware rounding (via UInt64.toFloat / Float.ofInt). -/
+private def extractDoubleConst : AST.Exp → Option Float
+  | .Constant (.ConstDouble f) => some f
+  | .Constant (.ConstInt n)    => some (Float.ofInt n)    -- implicit int→double
+  | .Constant (.ConstLong n)   => some (Float.ofInt n)    -- implicit long→double
+  | .Constant (.ConstUInt n)   => some (Float.ofInt n)    -- implicit uint→double
+  | .Constant (.ConstULong n)  => some (Float.ofInt n)    -- implicit ulong→double
+  | _                          => none
+
+/-- Extract an `InitialValue` from a constant expression given the variable's type.
+    For integer types: wraps in `Initial(n)`.
+    For `Double`:     wraps in `DoubleInitial(f)`.  (Chapter 13) -/
+private def extractInitialValue (varTyp : AST.Typ) (e : AST.Exp) : Option InitialValue :=
+  match varTyp with
+  | .Double =>
+      match extractDoubleConst e with
+      | some f => some (.DoubleInitial f)
+      | none   => none
+  | _ =>
+      match extractConst e with
+      | some n => some (.Initial n)
+      | none   => none
 
 -- ---------------------------------------------------------------------------
 -- File-scope variable declaration processing
@@ -141,25 +177,25 @@ private def processFileScopeVar (decl : AST.Declaration) : VarM2 String := do
           if existingType != .Obj varType then
             throw s!"Variable '{name}' declared with conflicting types"
           match decl.init, init with
-          | some e, .Initial _ =>
-              match extractConst e with
+          | some e, .Initial _ | some e, .DoubleInitial _ =>
+              match extractInitialValue varType e with
               | some _ => throw s!"Variable '{name}' has conflicting definitions"
               | none   => throw s!"Variable '{name}' has conflicting definitions"
           | some e, _ =>
-              match extractConst e with
-              | some n =>
-                  addSym name { type := .Obj varType, attrs := .Static (.Initial n) false }
+              match extractInitialValue varType e with
+              | some iv =>
+                  addSym name { type := .Obj varType, attrs := .Static iv false }
               | none => throw s!"Initializer for static variable '{name}' must be a constant"
-          | none, .Initial _ =>
+          | none, .Initial _ | none, .DoubleInitial _ =>
               pure ()
           | none, _ =>
               pure ()
       | _ =>
           match decl.init with
           | some e =>
-              match extractConst e with
-              | some n =>
-                  addSym name { type := .Obj varType, attrs := .Static (.Initial n) false }
+              match extractInitialValue varType e with
+              | some iv =>
+                  addSym name { type := .Obj varType, attrs := .Static iv false }
               | none => throw s!"Initializer for file-scope static variable '{name}' must be a constant"
           | none =>
               addSym name { type := .Obj varType, attrs := .Static .Tentative false }
@@ -172,28 +208,26 @@ private def processFileScopeVar (decl : AST.Declaration) : VarM2 String := do
       | some { attrs := .Static _ false, .. } =>
           throw s!"Variable '{name}' declared with both internal and external linkage"
       | some { type := existingType, attrs := .Static init true, .. } =>
-          -- Chapter 11: re-declaration at file scope must agree with existing type
           if existingType != .Obj varType then
             throw s!"Variable '{name}' declared with conflicting types"
           match decl.init, init with
-          | some _, .Initial _ =>
+          | some _, .Initial _ | some _, .DoubleInitial _ =>
               throw s!"Variable '{name}' has conflicting definitions"
           | some e, _ =>
-              match extractConst e with
-              | some n =>
-                  addSym name { type := .Obj varType, attrs := .Static (.Initial n) true }
+              match extractInitialValue varType e with
+              | some iv =>
+                  addSym name { type := .Obj varType, attrs := .Static iv true }
               | none => throw s!"Initializer for file-scope variable '{name}' must be a constant"
           | none, .NoInitializer =>
-              -- `extern int x;` followed by a tentative definition: upgrade to Tentative.
               addSym name { type := .Obj varType, attrs := .Static .Tentative true }
           | none, _ =>
               pure ()
       | _ =>
           match decl.init with
           | some e =>
-              match extractConst e with
-              | some n =>
-                  addSym name { type := .Obj varType, attrs := .Static (.Initial n) true }
+              match extractInitialValue varType e with
+              | some iv =>
+                  addSym name { type := .Obj varType, attrs := .Static iv true }
               | none => throw s!"Initializer for file-scope variable '{name}' must be a constant"
           | none =>
               addSym name { type := .Obj varType, attrs := .Static .Tentative true }
@@ -369,9 +403,10 @@ private partial def resolveBlockItem (identMap : IdentMap) : AST.BlockItem → V
             match decl.init with
             | none   => pure .Tentative
             | some e =>
-                match extractConst e with
-                | some n => pure (.Initial n)
-                | none   => throw s!"Initializer for static variable '{decl.name}' must be a constant"
+                -- Chapter 13: use extractInitialValue to support both integer and double constants
+                match extractInitialValue decl.typ e with
+                | some iv => pure iv
+                | none    => throw s!"Initializer for static variable '{decl.name}' must be a constant"
           let renamed ← makeUnique decl.name
           addSym renamed { type := .Obj decl.typ, attrs := .Static initVal false }
           let entry : IdentEntry := { info := .Var renamed, fromCurrent := true, hasLinkage := false }
