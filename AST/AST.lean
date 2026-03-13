@@ -1,7 +1,13 @@
 namespace AST
 
 /-
-  Abstract Syntax Tree for Chapter 13.
+  Abstract Syntax Tree for Chapter 14.
+
+  Chapter 14 additions (on top of Ch13):
+    - `Typ`: adds `Pointer(t)` — a pointer to a value of type `t`.
+    - `Exp`: adds `AddrOf(e)` (& operator) and `Dereference(e)` (* operator).
+    - Pointers are 8-byte values (Quadword), treated like `unsigned long` for
+      code generation purposes.
 
   Chapter 13 additions (on top of Ch12):
     - `Typ`: adds `Double` (64-bit IEEE 754 floating-point).
@@ -88,18 +94,20 @@ namespace AST
     int         →  Int
 -/
 
-/-- The scalar types supported through Chapter 13.
-    `Int`    is a 32-bit signed integer      (C `int`).
-    `Long`   is a 64-bit signed integer      (C `long`).
-    `UInt`   is a 32-bit unsigned integer    (C `unsigned int`).
-    `ULong`  is a 64-bit unsigned integer    (C `unsigned long`).
-    `Double` is a 64-bit IEEE 754 float      (C `double`). -/
+/-- The types supported through Chapter 14.
+    `Int`       is a 32-bit signed integer      (C `int`).
+    `Long`      is a 64-bit signed integer      (C `long`).
+    `UInt`      is a 32-bit unsigned integer    (C `unsigned int`).
+    `ULong`     is a 64-bit unsigned integer    (C `unsigned long`).
+    `Double`    is a 64-bit IEEE 754 float      (C `double`).
+    `Pointer t` is an 8-byte pointer to a value of type `t` (Chapter 14). -/
 inductive Typ where
-  | Int    : Typ  -- 32-bit signed integer
-  | Long   : Typ  -- 64-bit signed integer
-  | UInt   : Typ  -- 32-bit unsigned integer   (Chapter 12)
-  | ULong  : Typ  -- 64-bit unsigned integer   (Chapter 12)
-  | Double : Typ  -- 64-bit floating-point     (Chapter 13)
+  | Int     : Typ        -- 32-bit signed integer
+  | Long    : Typ        -- 64-bit signed integer
+  | UInt    : Typ        -- 32-bit unsigned integer   (Chapter 12)
+  | ULong   : Typ        -- 64-bit unsigned integer   (Chapter 12)
+  | Double  : Typ        -- 64-bit floating-point     (Chapter 13)
+  | Pointer : Typ → Typ  -- 8-byte pointer to t       (Chapter 14)
   deriving Repr, BEq
 
 /-- A typed constant.
@@ -157,7 +165,8 @@ inductive BinaryOp where
 
 /-- Expressions in the C subset.
     Chapter 11 adds `Cast` for explicit/implicit type conversions, and changes
-    `Constant` to carry a typed `Const` instead of a raw `Int`. -/
+    `Constant` to carry a typed `Const` instead of a raw `Int`.
+    Chapter 14 adds `AddrOf` (&) and `Dereference` (*). -/
 inductive Exp where
   | Constant    : Const → Exp             -- Chapter 11: typed constant
   | Var         : String → Exp            -- variable reference
@@ -169,6 +178,8 @@ inductive Exp where
   | PostfixIncr : Exp → Exp               -- extra credit: e++
   | PostfixDecr : Exp → Exp               -- extra credit: e--
   | FunCall     : String → List Exp → Exp -- Chapter 9: foo(a, b, c)
+  | AddrOf      : Exp → Exp               -- Chapter 14: &e (take address)
+  | Dereference : Exp → Exp               -- Chapter 14: *e (dereference pointer)
   deriving Repr, BEq
 
 /-- A variable declaration with an optional initializer expression.

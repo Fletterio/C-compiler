@@ -1,7 +1,19 @@
 namespace AssemblyAST
 
 /-
-  Assembly AST for Chapter 13.
+  Assembly AST for Chapter 14.
+
+  Chapter 14 additions:
+    - `Reg.BP`: base pointer `%rbp`, used as the base of `Memory(BP, offset)` slots.
+    - `Operand.Memory(reg, offset)`: replaces the old `Stack(offset)`.
+        `Memory(BP, n)`  = `n(%rbp)` — local variable / parameter stack slot.
+        `Memory(R10, 0)` = `(%r10)` — pointer-dereference source.
+        `Memory(R11, 0)` = `(%r11)` — pointer-dereference destination.
+        `Memory(SP, 0)`  = `(%rsp)` — top of stack (for double push).
+    - `Instruction.Lea(src, dst)`: `leaq src, dst` — computes the address of
+        a stack slot (for `GetAddress` / `&e`).
+
+  Chapter 13 additions:
 
   Chapter 13 additions:
     - `AsmType`: adds `Double` (8-byte, scalar IEEE 754 double).
@@ -58,14 +70,15 @@ namespace AssemblyAST
                        | ★ Cvttsd2si(asm_type, operand src, operand dst)
                        | ★ Xorpd(operand src, operand dst)
                        | ★ Comisd(operand src, operand dst)
+                       | ★★ Lea(operand src, operand dst)
     asm_type           = Longword | Quadword | ★ Double
     unary_operator     = Neg | Not
     binary_operator    = Add | Sub | Mult | And | Or | Xor | Sal | Sar | Shr
                        | ★ DivDouble
     cond_code          = E | NE | G | GE | L | LE | A | AE | B | BE
     operand            = Imm(int) | Reg(reg) | Pseudo(identifier)
-                       | Stack(int) | Data(identifier)
-    reg                = AX | DX | CX | DI | SI | R8 | R9 | R10 | R11 | SP
+                       | ★★ Memory(reg, int) | Data(identifier)
+    reg                = AX | DX | CX | DI | SI | R8 | R9 | R10 | R11 | SP | ★★ BP
                        | ★ XMM0 | XMM1 | XMM2 | XMM3 | XMM4 | XMM5 | XMM6 | XMM7
                        | ★ XMM14 | XMM15
 -/
@@ -92,6 +105,8 @@ inductive Reg where
   | R11 : Reg   -- scratch for destination fix-ups
   /-- Stack pointer `%rsp` — used in prologue/epilogue Binary instructions. -/
   | SP  : Reg
+  /-- Base pointer `%rbp` — base of the stack frame; used in `Memory(BP, offset)`. -/
+  | BP  : Reg   -- Chapter 14
   -- Chapter 13: XMM registers for floating-point and double arguments
   | XMM0  : Reg   -- 1st float arg / float return value
   | XMM1  : Reg   -- 2nd float arg
@@ -109,7 +124,10 @@ inductive Operand where
   | Imm    : Int → Operand
   | Reg    : Reg → Operand
   | Pseudo : String → Operand
-  | Stack  : Int → Operand
+  /-- `Memory(r, offset)` = `offset(%r)` in AT&T syntax.
+      Replaces the old `Stack(offset)` (which was always `Memory(BP, offset)`).
+      Also used for pointer dereferences: `Memory(R10, 0)` = `(%r10)`. -/
+  | Memory : Reg → Int → Operand   -- Chapter 14 (replaces Stack)
   | Data   : String → Operand
   deriving Repr, BEq
 
@@ -182,6 +200,9 @@ inductive Instruction where
   | Xorpd          : Operand → Operand → Instruction
   /-- Compare doubles: `comisd src, dst`. Sets ZF and CF; use B/BE/A/AE/E/NE. -/
   | Comisd         : Operand → Operand → Instruction
+  /-- Load effective address: `leaq src, dst`.
+      Computes the address of `src` (a memory location) and stores it in `dst`. -/
+  | Lea            : Operand → Operand → Instruction   -- Chapter 14
   deriving Repr, BEq
 
 /-- A typed static variable initializer. -/

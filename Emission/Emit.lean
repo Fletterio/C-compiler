@@ -69,6 +69,7 @@ private def emitReg4 : Reg → String
   | .R10 => "%r10d"
   | .R11 => "%r11d"
   | .SP  => "%esp"   -- 32-bit stack pointer (not typically used)
+  | .BP  => "%ebp"   -- 32-bit base pointer (Chapter 14)
   | r    => panic! s!"emitReg4: XMM register {repr r} has no 32-bit name"
 
 /-- 64-bit (8-byte) register names.  XMM registers must not appear here. -/
@@ -83,6 +84,7 @@ private def emitReg8 : Reg → String
   | .R10 => "%r10"
   | .R11 => "%r11"
   | .SP  => "%rsp"   -- 64-bit stack pointer
+  | .BP  => "%rbp"   -- 64-bit base pointer (Chapter 14)
   | r    => panic! s!"emitReg8: XMM register {repr r} has no 64-bit integer name"
 
 /-- 8-bit (1-byte) register names.  Used by `set<cc>` and shift `%cl`. -/
@@ -97,6 +99,7 @@ private def emitReg1 : Reg → String
   | .R10 => "%r10b"
   | .R11 => "%r11b"
   | .SP  => "%spl"
+  | .BP  => "%bpl"   -- 8-bit base pointer (Chapter 14)
   | r    => panic! s!"emitReg1: XMM register {repr r} has no 8-bit name"
 
 /-- Chapter 13: XMM register names for SSE/AVX scalar-double instructions. -/
@@ -125,30 +128,33 @@ private def emitRegForType (t : AsmType) (r : Reg) : String :=
 -- Operand emission
 -- ---------------------------------------------------------------------------
 
-/-- Emit an operand using 32-bit register names (for Longword instructions). -/
+/-- Emit an operand using 32-bit register names (for Longword instructions).
+    Chapter 14: `Memory(r, offset)` emits `offset(%r64)` — the address register
+    is always 64-bit even for 32-bit data operations. -/
 private def emitOperand : Operand → String
-  | .Imm n    => s!"${n}"
-  | .Reg r    => emitReg4 r
-  | .Stack n  => s!"{n}(%rbp)"
-  | .Data nm  => s!"{nm}(%rip)"
-  | .Pseudo _ => panic! "Pseudo operand reached emission stage"
+  | .Imm n       => s!"${n}"
+  | .Reg r       => emitReg4 r
+  | .Memory r n  => s!"{n}({emitReg8 r})"   -- Chapter 14: offset(reg64)
+  | .Data nm     => s!"{nm}(%rip)"
+  | .Pseudo _    => panic! "Pseudo operand reached emission stage"
 
 /-- Emit an operand using 64-bit register names (for Quadword instructions and pushq). -/
 private def emitOperand8 : Operand → String
-  | .Imm n    => s!"${n}"
-  | .Reg r    => emitReg8 r
-  | .Stack n  => s!"{n}(%rbp)"
-  | .Data nm  => s!"{nm}(%rip)"
-  | .Pseudo _ => panic! "Pseudo operand reached emission stage"
+  | .Imm n       => s!"${n}"
+  | .Reg r       => emitReg8 r
+  | .Memory r n  => s!"{n}({emitReg8 r})"   -- Chapter 14: offset(reg64)
+  | .Data nm     => s!"{nm}(%rip)"
+  | .Pseudo _    => panic! "Pseudo operand reached emission stage"
 
 /-- Chapter 13: emit an operand for SSE instructions.
-    XMM registers use `%xmmN`; memory uses the standard form. -/
+    XMM registers use `%xmmN`; memory uses the standard form.
+    Chapter 14: `Memory(r, offset)` emits `offset(%r64)`. -/
 private def emitXmmOperand : Operand → String
-  | .Reg r    => emitRegXmm r
-  | .Stack n  => s!"{n}(%rbp)"
-  | .Data nm  => s!"{nm}(%rip)"
-  | .Imm _    => panic! "Immediate cannot appear in XMM operand position"
-  | .Pseudo _ => panic! "Pseudo operand reached emission stage"
+  | .Reg r       => emitRegXmm r
+  | .Memory r n  => s!"{n}({emitReg8 r})"   -- Chapter 14: offset(reg64)
+  | .Data nm     => s!"{nm}(%rip)"
+  | .Imm _       => panic! "Immediate cannot appear in XMM operand position"
+  | .Pseudo _    => panic! "Pseudo operand reached emission stage"
 
 /-- Emit an operand using the register size appropriate for the given `AsmType`.
     Chapter 13: `.Double` maps to `emitXmmOperand` (XMM registers / memory). -/
@@ -165,11 +171,11 @@ private def emitShiftCount : Operand → String
 
 /-- Emit a byte-sized operand for `set<cc>` instructions. -/
 private def emitByteOperand : Operand → String
-  | .Reg r    => emitReg1 r
-  | .Stack n  => s!"{n}(%rbp)"
-  | .Data nm  => s!"{nm}(%rip)"
-  | .Imm n    => s!"${n}"
-  | .Pseudo _ => panic! "Pseudo operand reached emission stage"
+  | .Reg r       => emitReg1 r
+  | .Memory r n  => s!"{n}({emitReg8 r})"   -- Chapter 14
+  | .Data nm     => s!"{nm}(%rip)"
+  | .Imm n       => s!"${n}"
+  | .Pseudo _    => panic! "Pseudo operand reached emission stage"
 
 /-- Emit a condition code suffix for `j<cc>` and `set<cc>`. -/
 private def emitCondCode : CondCode → String
@@ -297,6 +303,9 @@ private def emitInstruction (localDefs : List String) : Instruction → String
         s!"    call {name}@PLT"
   -- Ret: full epilogue
   | .Ret => "    movq %rbp, %rsp\n    popq %rbp\n    ret"
+  -- Chapter 14: leaq — compute address of memory operand into register
+  | .Lea src dst =>
+      s!"    leaq {emitOperand8 src}, {emitOperand8 dst}"
 
 -- ---------------------------------------------------------------------------
 -- Top-level emission

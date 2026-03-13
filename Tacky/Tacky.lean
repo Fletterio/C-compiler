@@ -3,7 +3,12 @@ import AST.AST
 namespace Tacky
 
 /-
-  TACKY intermediate representation for Chapter 13.
+  TACKY intermediate representation for Chapter 14.
+
+  Chapter 14 additions:
+    - `Load(ptr, dst)`:       dst = *ptr  (load through pointer)
+    - `Store(src, ptr)`:      *ptr = src  (store through pointer)
+    - `GetAddress(src, dst)`: dst = &src  (take address of a variable)
 
   Chapter 13 additions:
     - Six new conversion instructions for double ↔ integer conversions:
@@ -54,6 +59,9 @@ namespace Tacky
                        | ★ DoubleToUInt(val src, val dst)
                        | ★ ULongToDouble(val src, val dst)
                        | ★ DoubleToULong(val src, val dst)
+                       | ★★ Load(val ptr, val dst)
+                       | ★★ Store(val src, val ptr)
+                       | ★★ GetAddress(val src, val dst)
     val                = Constant(int) | Var(identifier)
     unary_operator     = Complement | Negate | Not
     binary_operator    = Add | Subtract | Multiply | Divide | Remainder
@@ -130,6 +138,13 @@ inductive Instruction where
   /-- Convert double `src` to unsigned 64-bit `dst` (ULong).
       Uses the 2^63 threshold trick. -/
   | DoubleToULong  : Val → Val → Instruction
+  -- Chapter 14: pointer operations --------------------------------
+  /-- Load value from pointer: emit `movX (*ptr), dst`. -/
+  | Load       : Val → Val → Instruction
+  /-- Store value through pointer: emit `movX src, (*ptr)`. -/
+  | Store      : Val → Val → Instruction
+  /-- Take address of a variable: emit `leaq src, dst`. -/
+  | GetAddress : Val → Val → Instruction
   deriving Repr, BEq
 
 /-- A TACKY function definition. -/

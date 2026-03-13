@@ -3,6 +3,11 @@ import AssemblyAST.AssemblyAST
 /-
   Pass 2 of assembly generation: replace Pseudo operands with concrete operands.
 
+  Chapter 14 changes:
+    - `Stack(offset)` → `Memory(BP, offset)`: pseudo-registers for local variables
+      are now placed in `Memory` operands instead of the old `Stack` operand.
+    - `Lea(src, dst)` operands are replaced (src is typically a stack pseudo).
+
   Chapter 13 changes:
     - `Double` AsmType → 8-byte stack slot, 8-byte aligned (same size as Quadword).
     - New instructions handled (operand replacement only — FixUp handles constraints):
@@ -57,13 +62,13 @@ private def ReplState.getOrInsert (s : ReplState) (id : String)
           let aligned := alignUp s.maxBytes 8
           let bytes   := aligned + 8
           let offset  : Int := -(bytes : Int)
-          let op      := Operand.Stack offset
+          let op      := Operand.Memory .BP offset  -- Chapter 14: Memory(BP,n) replaces Stack(n)
           ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
       | _ =>
           -- Local int (4-byte) or unknown temporary: 4-byte slot
           let bytes  := s.maxBytes + 4
           let offset : Int := -(bytes : Int)
-          let op     := Operand.Stack offset
+          let op     := Operand.Memory .BP offset   -- Chapter 14: Memory(BP,n) replaces Stack(n)
           ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
 
 private def replaceOp (s : ReplState) (bst : BackendSymTable) : Operand → ReplState × Operand
@@ -138,6 +143,11 @@ private def replaceInstr (s : ReplState) (bst : BackendSymTable)
       let (s, src') := replaceOp s bst src
       let (s, dst') := replaceOp s bst dst
       (s, [.Comisd src' dst'])
+  | .Lea src dst =>
+      -- Chapter 14: load effective address; src is a memory address (stack pseudo)
+      let (s, src') := replaceOp s bst src
+      let (s, dst') := replaceOp s bst dst
+      (s, [.Lea src' dst'])
   | instr => (s, [instr])  -- Ret, Cdq, Jmp, JmpCC, Label, Call pass through
 
 /-- Replace pseudoregisters in a single function definition. -/

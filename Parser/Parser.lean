@@ -162,13 +162,47 @@ private def parseDeclSpecs (tokens : List Token)
         | .ok t    => .ok (t, sc, toks)
   loop tokens false false false false false none
 
+/-- Consume trailing `*` tokens and wrap the base type in successive `Pointer` layers.
+    Chapter 14: `int *` → `Pointer(Int)`, `int **` → `Pointer(Pointer(Int))`, etc. -/
+private def consumeStars (baseTyp : Typ) (tokens : List Token) : Typ × List Token :=
+  match tokens with
+  | .Star :: rest => consumeStars (.Pointer baseTyp) rest
+  | _             => (baseTyp, tokens)
+
+/-- Parse an abstract declarator (no identifier): zero or more `*` tokens and/or
+    parenthesized groups.  Returns a type-wrapping function and the remaining tokens.
+    Used for abstract declarators in cast expressions, e.g.:
+      `(unsigned long (*))` → Pointer(ULong)
+      `(double (*(**)))` → Pointer(Pointer(Pointer(Double)))
+    Grammar: abstract-declarator ::= '*'* | '(' abstract-declarator ')' -/
+private def parseAbstractDeclarator (tokens : List Token) : (Typ → Typ) × List Token :=
+  match tokens with
+  | .Star :: rest =>
+      -- Consume a `*` and apply another Pointer level around whatever the inner decl produces
+      let (innerWrap, rest') := parseAbstractDeclarator rest
+      (fun t => innerWrap (.Pointer t), rest')
+  | .OpenParen :: rest =>
+      -- Parenthesized abstract declarator: recurse inside, then consume ')'
+      let (innerWrap, rest') := parseAbstractDeclarator rest
+      match expect .CloseParen rest' with
+      | .ok rest'' => (innerWrap, rest'')
+      | .error _   => (innerWrap, rest')  -- best-effort recovery
+  | _ =>
+      -- Not a star or paren: stop (base case)
+      (id, tokens)
+
 /-- Parse a type specifier for use in cast expressions and parameters.
     Delegates to `parseDeclSpecs` and strips storage-class info.
-    Chapter 12: handles all combinations of int/long/unsigned/signed. -/
+    Chapter 12: handles all combinations of int/long/unsigned/signed.
+    Chapter 14: handles trailing `*` and parenthesized abstract declarators, e.g.:
+      `(unsigned long (*))` and `(double (*(*(*)))))` -/
 private def parseType (tokens : List Token) : Except String (Typ × List Token) := do
   match parseDeclSpecs tokens with
   | .ok (_, some _, _) => .error "Storage class specifier not allowed in type name"
-  | .ok (typ, none, rest) => .ok (typ, rest)
+  | .ok (baseTyp, none, rest) =>
+      -- Use parseAbstractDeclarator (superset of consumeStars) for full abstract declarator support
+      let (wrapFn, rest') := parseAbstractDeclarator rest
+      .ok (wrapFn baseTyp, rest')
   | .error e => .error e
 
 -- ---------------------------------------------------------------------------
@@ -216,9 +250,12 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
         .ok (.Constant (.ConstLong (n : Int)), rest)
       else
         .ok (.Constant (.ConstInt (n : Int)), rest)
-  | .Minus :: rest           => do let (e, rest') ← parseFactor rest; .ok (.Unary .Negate e, rest')
-  | .Tilde :: rest           => do let (e, rest') ← parseFactor rest; .ok (.Unary .Complement e, rest')
-  | .Bang  :: rest           => do let (e, rest') ← parseFactor rest; .ok (.Unary .Not e, rest')
+  | .Minus     :: rest => do let (e, rest') ← parseFactor rest; .ok (.Unary .Negate e, rest')
+  | .Tilde     :: rest => do let (e, rest') ← parseFactor rest; .ok (.Unary .Complement e, rest')
+  | .Bang      :: rest => do let (e, rest') ← parseFactor rest; .ok (.Unary .Not e, rest')
+  -- Chapter 14: unary `*` (dereference) and `&` (address-of)
+  | .Star      :: rest => do let (e, rest') ← parseFactor rest; .ok (.Dereference e, rest')
+  | .Ampersand :: rest => do let (e, rest') ← parseFactor rest; .ok (.AddrOf e, rest')
   -- Prefix ++ and -- desugar to compound assignment
   | .PlusPlus :: rest   => do
       let (e, rest') ← parseFactor rest
@@ -347,6 +384,104 @@ private def parseOptionalExp (delim : Token) (tokens : List Token)
         .ok (some e, rest'')
 
 -- ---------------------------------------------------------------------------
+-- Declarator and parameter list parsing (Chapter 14: parenthesized declarators)
+-- ---------------------------------------------------------------------------
+
+/-
+  `parseDeclaratorName`, `parseParamList`, `parseParamListTail`, and
+  `parseOneParam` are mutually recursive.  `parseDeclaratorName` calls
+  `parseParamList` (for inline function params in a declarator), and
+  `parseParamList`/`parseParamListTail` call `parseOneParam`, which calls
+  `parseDeclaratorName` for parameter declarators.  All four go in one `mutual`
+  block, which must be defined BEFORE `parseVarDecl` so that `parseVarDecl`
+  can call `parseDeclaratorName`.
+-/
+mutual
+
+/-- Parse a concrete declarator (one that contains an identifier at its core).
+    Chapter 14: handles parenthesized and pointer-qualified declarators such as
+      `(*ptr)`, `(**ptr)`, `(name)`, `(*(name))`, `(name(params))`, etc.
+    Grammar:
+      declarator ::= '*' declarator
+                   | '(' declarator ')'
+                   | identifier [ '(' param-list ')' ]
+    Returns `(name, wrapFn, paramsOpt, rest)`:
+      - `name`:      the identifier at the core of the declarator.
+      - `wrapFn`:    `Typ → Typ` — applies pointer levels from the declarator.
+      - `paramsOpt`: `some params` if function params appeared inside this declarator.
+      - `rest`:      remaining tokens after the declarator. -/
+private partial def parseDeclaratorName (tokens : List Token)
+    : Except String (String × (Typ → Typ) × Option (List (Typ × String)) × List Token) := do
+  match tokens with
+  | .Star :: rest =>
+      -- Pointer star: one more Pointer level applied around inner wrap
+      let (name, innerWrap, paramsOpt, rest') ← parseDeclaratorName rest
+      return (name, fun t => innerWrap (.Pointer t), paramsOpt, rest')
+  | .OpenParen :: rest =>
+      -- Parenthesized declarator: recurse, then expect ')'
+      let (name, innerWrap, paramsOpt, rest') ← parseDeclaratorName rest
+      let rest'' ← expect .CloseParen rest'
+      -- After closing ')', check for left-recursive function parameter application.
+      -- e.g. `(name)(params)` or `(*name)(params)` or `((name))(params)`.
+      -- This handles declarators like `(*(*((f)(int *(*p)))))` where params
+      -- follow a parenthesized sub-declarator rather than immediately following
+      -- the identifier.
+      match paramsOpt, rest'' with
+      | none, .OpenParen :: rest''' =>
+          -- No inline params yet, but '(' follows: parse params here.
+          let (params, rest4) ← parseParamList rest'''
+          return (name, innerWrap, some params, rest4)
+      | _, _ =>
+          -- Either we already have params (from a deeper level) or no params follow.
+          return (name, innerWrap, paramsOpt, rest'')
+  | .Identifier name :: .OpenParen :: rest =>
+      -- Identifier followed immediately by '(' — function params inside the declarator
+      -- (e.g., `return_3(void)` inside `(return_3(void))`)
+      let (params, rest') ← parseParamList rest
+      return (name, id, some params, rest')
+  | .Identifier name :: rest =>
+      return (name, id, none, rest)
+  | [] => .error "Expected declarator but reached end of input"
+  | t :: _ => .error s!"Expected declarator but found {t.describe}"
+
+/-- Parse a parameter list.
+    Grammar: `void ")"` | `type id { "," type id } ")"`.
+    Returns `List (Typ × String)` — typed parameter pairs. -/
+private partial def parseParamList (tokens : List Token) : Except String (List (Typ × String) × List Token) :=
+  match tokens with
+  | .KwVoid :: .CloseParen :: rest => .ok ([], rest)
+  | .CloseParen :: rest            => .ok ([], rest)
+  | _ => do
+      let (firstParam, rest) ← parseOneParam tokens
+      let (moreParams, rest') ← parseParamListTail rest
+      .ok (firstParam :: moreParams, rest')
+
+/-- Parse the tail of a parameter list (after the first parameter). -/
+private partial def parseParamListTail (tokens : List Token) : Except String (List (Typ × String) × List Token) :=
+  match tokens with
+  | .CloseParen :: rest => .ok ([], rest)
+  | .Comma :: rest => do
+      let (param, rest') ← parseOneParam rest
+      let (params, rest'') ← parseParamListTail rest'
+      .ok (param :: params, rest'')
+  | [] => .error "Expected \")\" or \",\" in parameter list but reached end of input"
+  | t :: _ => .error s!"Expected \")\" or \",\" in parameter list but found {t.describe}"
+
+/-- Parse a single parameter: `type declarator`.
+    Chapter 14: uses `parseDeclaratorName` so parenthesized parameter declarators
+    such as `double(*d)` and `int(**p)` are accepted. -/
+private partial def parseOneParam (tokens : List Token) : Except String ((Typ × String) × List Token) := do
+  let (baseTyp, scOpt, tokens) ← parseDeclSpecs tokens
+  -- Storage-class specifiers (static, extern) are not allowed in parameter declarations.
+  if scOpt.isSome then
+    throw "Storage class specifier not allowed in parameter declaration"
+  let (name, wrapFn, _, tokens) ← parseDeclaratorName tokens
+  -- wrapFn applies pointer levels from the declarator to the base type
+  return ((wrapFn baseTyp, name), tokens)
+
+end
+
+-- ---------------------------------------------------------------------------
 -- Declaration parsing (variables)
 -- ---------------------------------------------------------------------------
 
@@ -358,7 +493,7 @@ private def parseOptionalExp (delim : Token) (tokens : List Token)
 private def parseVarDecl (tokens : List Token) (storageClassOpt : Option StorageClass := none)
     : Except String (Declaration × List Token) := do
   -- Parse all declaration specifiers in any order
-  let (typ, scFromSpecs, tokens) ← parseDeclSpecs tokens
+  let (baseTyp, scFromSpecs, tokens) ← parseDeclSpecs tokens
   let sc : Option StorageClass ←
     match storageClassOpt, scFromSpecs with
     | some a, some b =>
@@ -367,11 +502,15 @@ private def parseVarDecl (tokens : List Token) (storageClassOpt : Option Storage
     | some a, none  => pure (some a)
     | none,   some b => pure (some b)
     | none,   none   => pure none
-  let (name, tokens) ←
-    match tokens with
-    | .Identifier n :: rest => .ok (n, rest)
-    | []                    => .error "Expected variable name but reached end of input"
-    | t :: _                => .error s!"Expected variable name but found {t.describe}"
+  -- Chapter 14: use parseDeclaratorName to handle parenthesized declarators
+  -- e.g. `int(*ptr)`, `double(d1)`, `long(*(l_ptr))`, etc.
+  let (name, wrapFn, paramsOpt, tokens) ← parseDeclaratorName tokens
+  -- A variable declaration cannot have function parameters embedded in its declarator.
+  -- If parseDeclaratorName found inline params (e.g. `int f(void)`), this is actually
+  -- a function declaration and is not valid in a variable-declaration context.
+  if paramsOpt.isSome then
+    throw s!"Unexpected function declarator for '{name}' in variable declaration context"
+  let typ := wrapFn baseTyp
   match tokens with
   | .Equal :: rest => do
       let (e, rest')  ← parseExp 0 rest
@@ -405,51 +544,6 @@ private def parseForInit (tokens : List Token) : Except String (ForInit × List 
           .ok (.InitExp (some e), rest')
   | [] =>
     .ok (.InitExp none, [])
-
--- ---------------------------------------------------------------------------
--- Parameter list parsing (typed params for Chapter 11)
--- ---------------------------------------------------------------------------
-
-/-
-  `parseParamList`, `parseParamListTail`, and `parseOneParam` are mutually
-  recursive: `parseParamList` calls both helpers, and `parseParamListTail`
-  calls `parseOneParam`.  We put all three in a `mutual` block.
--/
-mutual
-
-/-- Parse a parameter list.
-    Grammar: `void ")"` | `type id { "," type id } ")"`.
-    Returns `List (Typ × String)` — typed parameter pairs. -/
-private partial def parseParamList (tokens : List Token) : Except String (List (Typ × String) × List Token) :=
-  match tokens with
-  | .KwVoid :: .CloseParen :: rest => .ok ([], rest)
-  | .CloseParen :: rest            => .ok ([], rest)
-  | _ => do
-      let (firstParam, rest) ← parseOneParam tokens
-      let (moreParams, rest') ← parseParamListTail rest
-      .ok (firstParam :: moreParams, rest')
-
-/-- Parse the tail of a parameter list (after the first parameter). -/
-private partial def parseParamListTail (tokens : List Token) : Except String (List (Typ × String) × List Token) :=
-  match tokens with
-  | .CloseParen :: rest => .ok ([], rest)
-  | .Comma :: rest => do
-      let (param, rest') ← parseOneParam rest
-      let (params, rest'') ← parseParamListTail rest'
-      .ok (param :: params, rest'')
-  | [] => .error "Expected \")\" or \",\" in parameter list but reached end of input"
-  | t :: _ => .error s!"Expected \")\" or \",\" in parameter list but found {t.describe}"
-
-/-- Parse a single parameter: `type <identifier>`.
-    Chapter 11: type is `int` or `long`. -/
-private partial def parseOneParam (tokens : List Token) : Except String ((Typ × String) × List Token) := do
-  let (typ, tokens) ← parseType tokens
-  match tokens with
-  | .Identifier name :: rest => .ok ((typ, name), rest)
-  | []                       => .error "Expected parameter name but reached end of input"
-  | t :: _                   => .error s!"Expected parameter name but found {t.describe}"
-
-end
 
 -- ---------------------------------------------------------------------------
 -- Statement and block-item parsing
@@ -589,15 +683,32 @@ private partial def parseBlockItem (tokens : List Token) : Except String (BlockI
       if isDeclSpecToken t then do
         -- Peek at all declaration specifiers to determine type, storage class, and name.
         -- This handles any ordering such as `int static long x`, `static int x`, etc.
-        let (retTyp, sc, afterSpecs) ← parseDeclSpecs tokens
-        match afterSpecs with
-        | .Identifier name :: .OpenParen :: rest =>
-            -- `type name (` → local function declaration
-            parseLocalFunDecl name retTyp sc (.OpenParen :: rest)
-        | _ => do
-            -- Variable declaration; parseDeclSpecs inside parseVarDecl handles specifiers
-            let (decl, rest) ← parseVarDecl tokens
-            .ok (.D decl, rest)
+        let (baseRetTyp, sc, afterSpecs) ← parseDeclSpecs tokens
+        -- Chapter 14: use parseDeclaratorName for lookahead to handle parenthesized declarators
+        -- like `int(*ptr)`, `long(*(l_ptr))`, etc.
+        let (name, wrapFn, inlineParamsOpt, afterDecl) ← parseDeclaratorName afterSpecs
+        let retTyp := wrapFn baseRetTyp
+        match inlineParamsOpt with
+        | some params =>
+            -- parseDeclaratorName already consumed `name(params)` (e.g. `foo(void)`);
+            -- afterDecl is the tokens following the closing ')'.
+            -- Local function definitions with a body are not allowed inside a function.
+            match afterDecl with
+            | .Semicolon :: rest''' =>
+                .ok (.FD { name, params, retTyp, storageClass := sc }, rest''')
+            | .OpenBrace :: _ =>
+                .error s!"Function definition for '{name}' inside a function is not allowed"
+            | [] => .error "Expected \";\" after local function declaration but reached end of input"
+            | t :: _ => .error s!"Expected \";\" after local function declaration but found {t.describe}"
+        | none =>
+            match afterDecl with
+            | .OpenParen :: _ =>
+                -- Name followed by '(': local function declaration with params outside
+                parseLocalFunDecl name retTyp sc afterDecl
+            | _ => do
+                -- Variable declaration: re-parse from scratch using parseVarDecl
+                let (decl, rest) ← parseVarDecl tokens
+                .ok (.D decl, rest)
       else do
         -- Not a declaration specifier: must be a statement
         let (stmt, rest) ← parseStatement tokens
@@ -630,17 +741,17 @@ end
     Both orderings of storage class and type are accepted. -/
 private partial def parseTopLevel (tokens : List Token) : Except String (TopLevel × List Token) := do
   -- Parse all declaration specifiers in any order (int/long/static/extern may be intermixed)
-  let (retTyp, sc, tokens) ← parseDeclSpecs tokens
-  -- Parse the name
-  let (name, tokens) ←
-    match tokens with
-    | .Identifier name :: rest => .ok (name, rest)
-    | []                       => .error "Expected identifier but reached end of input"
-    | t :: _                   => .error s!"Expected identifier but found {t.describe}"
-  -- Decide: variable or function by peeking at next token
-  match tokens with
-  | .OpenParen :: rest => do
-      let (params, tokens) ← parseParamList rest
+  let (baseRetTyp, sc, tokens) ← parseDeclSpecs tokens
+  -- Chapter 14: use parseDeclaratorName to handle parenthesized/pointer declarators.
+  -- e.g. `int(return_3)(void)`, `long(*two_pointers(params))`, etc.
+  let (name, wrapFn, inlineParamsOpt, tokens) ← parseDeclaratorName tokens
+  let retTyp := wrapFn baseRetTyp
+  -- inlineParamsOpt: Some params if function params appeared inside the declarator
+  -- (e.g., `int(return_3(void))` or `long(*f(params))`).
+  -- tokens: if it starts with '(' it's a function with params outside the declarator.
+  match inlineParamsOpt with
+  | some params =>
+      -- Params were inside the declarator: decide function/variable from what follows
       match tokens with
       | .Semicolon :: rest' =>
           .ok (.FunDecl { name, params, retTyp, storageClass := sc }, rest')
@@ -650,14 +761,29 @@ private partial def parseTopLevel (tokens : List Token) : Except String (TopLeve
           .ok (.FunDef { name, params, retTyp, body, storageClass := sc }, rest''')
       | [] => .error s!"Expected open-brace or semicolon after function header for {name} but reached end of input"
       | t :: _ => .error s!"Expected open-brace or semicolon after function header for {name} but found {t.describe}"
-  | .Equal :: rest => do
-      let (e, rest')  ← parseExp 0 rest
-      let rest''      ← expect .Semicolon rest'
-      .ok (.VarDecl { name, typ := retTyp, init := some e, storageClass := sc }, rest'')
-  | .Semicolon :: rest =>
-      .ok (.VarDecl { name, typ := retTyp, init := none, storageClass := sc }, rest)
-  | [] => .error s!"Expected open-paren, semicolon, or equals after name {name} but reached end of input"
-  | t :: _ => .error s!"Expected open-paren, semicolon, or equals after name {name} but found {t.describe}"
+  | none =>
+      -- No inline params: check what follows to decide function vs variable
+      match tokens with
+      | .OpenParen :: rest => do
+          -- '(' follows: function params outside the declarator
+          let (params, tokens) ← parseParamList rest
+          match tokens with
+          | .Semicolon :: rest' =>
+              .ok (.FunDecl { name, params, retTyp, storageClass := sc }, rest')
+          | .OpenBrace :: rest' => do
+              let (body, rest'') ← parseBlockItems rest'
+              let rest'''        ← expect .CloseBrace rest''
+              .ok (.FunDef { name, params, retTyp, body, storageClass := sc }, rest''')
+          | [] => .error s!"Expected open-brace or semicolon after function header for {name} but reached end of input"
+          | t :: _ => .error s!"Expected open-brace or semicolon after function header for {name} but found {t.describe}"
+      | .Equal :: rest => do
+          let (e, rest')  ← parseExp 0 rest
+          let rest''      ← expect .Semicolon rest'
+          .ok (.VarDecl { name, typ := retTyp, init := some e, storageClass := sc }, rest'')
+      | .Semicolon :: rest =>
+          .ok (.VarDecl { name, typ := retTyp, init := none, storageClass := sc }, rest)
+      | [] => .error s!"Expected open-paren, semicolon, or equals after name {name} but reached end of input"
+      | t :: _ => .error s!"Expected open-paren, semicolon, or equals after name {name} but found {t.describe}"
 
 private partial def parseTopLevels (tokens : List Token) : Except String (List TopLevel) :=
   match tokens with

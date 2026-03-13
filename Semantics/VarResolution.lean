@@ -284,8 +284,9 @@ private def resolveExp (identMap : IdentMap) : AST.Exp → VarM2 AST.Exp
   | .Binary op l r  => return .Binary op (← resolveExp identMap l) (← resolveExp identMap r)
   | .Assignment left right => do
       match left with
-      | .Var _ => pure ()
-      | _      => throw "Invalid lvalue in assignment"
+      | .Var _         => pure ()
+      | .Dereference _ => pure ()   -- Chapter 14: dereference is a valid lvalue
+      | _              => throw "Invalid lvalue in assignment"
       return .Assignment (← resolveExp identMap left) (← resolveExp identMap right)
   | .Conditional cond e1 e2 =>
       return .Conditional (← resolveExp identMap cond)
@@ -294,13 +295,18 @@ private def resolveExp (identMap : IdentMap) : AST.Exp → VarM2 AST.Exp
   | .PostfixIncr e  => do
       let e' ← resolveExp identMap e
       match e' with
-      | .Var _ => return .PostfixIncr e'
-      | _      => throw "Invalid lvalue in postfix increment"
+      | .Var _         => return .PostfixIncr e'
+      | .Dereference _ => return .PostfixIncr e'   -- Chapter 14: (*p)++
+      | _              => throw "Invalid lvalue in postfix increment"
   | .PostfixDecr e  => do
       let e' ← resolveExp identMap e
       match e' with
-      | .Var _ => return .PostfixDecr e'
-      | _      => throw "Invalid lvalue in postfix decrement"
+      | .Var _         => return .PostfixDecr e'
+      | .Dereference _ => return .PostfixDecr e'   -- Chapter 14: (*p)--
+      | _              => throw "Invalid lvalue in postfix decrement"
+  -- Chapter 14: address-of and dereference
+  | .AddrOf e      => return .AddrOf      (← resolveExp identMap e)
+  | .Dereference e => return .Dereference (← resolveExp identMap e)
   | .FunCall f args => do
       match lookupIdent identMap f with
       | none => throw s!"Undeclared function '{f}'"

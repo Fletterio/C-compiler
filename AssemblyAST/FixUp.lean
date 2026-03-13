@@ -47,9 +47,9 @@ private def roundUp16 (n : Int) : Int :=
   ((n + 15) / 16) * 16
 
 private def isMem : Operand → Bool
-  | .Stack _ => true
-  | .Data _  => true
-  | _        => false
+  | .Memory _ _ => true   -- Chapter 14: Memory(BP,n) and Memory(Rx,0) are both "memory"
+  | .Data _     => true
+  | _           => false
 
 /-- True if `n` fits in a signed 32-bit integer. -/
 private def fitsInInt32 (n : Int) : Bool :=
@@ -271,6 +271,15 @@ private def fixInstr : Instruction → List Instruction
         [.Movsd dst (.Reg .XMM14), .Comisd src (.Reg .XMM14)]
       else
         [.Comisd src dst]
+  -- ----------------------------------------------------------------
+  -- Chapter 14: Lea — dst must be a register; src is a memory operand
+  --   dst is memory → leaq src, R11 ; movq R11, dst
+  -- ----------------------------------------------------------------
+  | .Lea src dst =>
+      if isMem dst then
+        [.Lea src (.Reg .R11), .Mov .Quadword (.Reg .R11) dst]
+      else
+        [.Lea src dst]
   -- All other instructions need no fix-up
   | instr => [instr]
 

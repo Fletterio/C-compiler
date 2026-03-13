@@ -1,6 +1,6 @@
-# Formal Grammar — Chapter 13
+# Formal Grammar — Chapter 14
 
-Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Chapter 12.
+Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Chapter 14.
 
 ```
 <program>     ::= { <declaration> }
@@ -8,9 +8,10 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 <declaration> ::= <function-declaration>
                 | <variable-declaration>
 
-<function-declaration> ::= <decl-spec>+ <identifier> "(" <param-list> ")" ( ";" | <block> )
+<function-declaration> ::= <decl-spec>+ <declarator> "(" <param-list> ")" ( ";" | <block> )
+                         | <decl-spec>+ <fun-declarator> ( ";" | <block> )
 
-<variable-declaration> ::= <decl-spec>+ <identifier> [ "=" <exp> ] ";"
+<variable-declaration> ::= <decl-spec>+ <var-declarator> [ "=" <exp> ] ";"
 
 <decl-spec>     ::= <type-spec> | <storage-class>
 
@@ -20,9 +21,28 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 
 <storage-class> ::= "static" | "extern"
 
+<declarator>    ::= "*" <declarator>                   (Chapter 14: pointer declarator)
+                  | "(" <declarator> ")"               (Chapter 14: parenthesized declarator)
+                  | <identifier>
+
+<var-declarator>  ::= <declarator>
+                    (same as <declarator> but may not contain inline function params)
+
+<fun-declarator>  ::= "*" <fun-declarator>             (pointer to function)
+                    | "(" <fun-declarator> ")"         (parenthesized fun-declarator)
+                    | <identifier> "(" <param-list> ")"  (inline params in declarator)
+                    | "(" <declarator> ")" "(" <param-list> ")"  (params follow paren group)
+
+<abstract-declarator> ::= "*" <abstract-declarator>?  (Chapter 14: pointer abstract decl)
+                         | "(" <abstract-declarator> ")"  (parenthesized abstract decl)
+                         | ε                           (empty — no identifier)
+                  (Used in cast expressions, e.g. `(unsigned long (*))` → Pointer(ULong))
+
 <param-list>  ::= "void"
-                | <type-spec>+ <identifier> { "," <type-spec>+ <identifier> }
+                | <param> { "," <param> }
                   (Note: storage-class specifiers are NOT allowed in parameter types)
+
+<param>       ::= <type-spec>+ <declarator>            (Chapter 14: typed + declarator)
 
 <block>       ::= "{" { <block-item> } "}"
 
@@ -57,7 +77,9 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
                 | <uint>                               (Chapter 12: unsigned int constant, e.g. 42u)
                 | <ulong>                              (Chapter 12: unsigned long constant, e.g. 42ul)
                 | <double>                             (Chapter 13: double constant, e.g. 3.14, 1e10)
-                | "(" <type-spec>+ ")" <factor>        (Chapter 11: explicit cast; no storage class)
+                | "(" <type-spec>+ <abstract-declarator> ")" <factor>  (Chapter 14: cast with pointer type)
+                | "*" <factor>                         (Chapter 14: dereference, e.g. *ptr)
+                | "&" <factor>                         (Chapter 14: address-of, e.g. &x)
                 | <identifier> "(" <arg-list> ")"
                 | <identifier>
                 | <unop> <factor>
@@ -93,6 +115,38 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 - Symbols wrapped in `? question marks ?` are terminals whose values vary.
 - `{ x }` denotes zero or more repetitions of `x`.
 - `[ x ]` denotes zero or one occurrence of `x` (optional).
+
+## Chapter 14 Changes
+
+- **`Pointer` type**: `int *`, `long **`, `double *`, etc. are now valid types.  A pointer type
+  is written as a base type followed by one or more `*` tokens.  Pointer size is 8 bytes (Quadword),
+  treated like `unsigned long` for code generation.
+- **`AddrOf` (`&`)** and **`Dereference` (`*`)** unary operators added to `<factor>`.
+  These bind tighter than binary operators (same precedence group as other unary operators).
+- **Declarators**: declarations now use a general `<declarator>` grammar instead of a bare
+  `<identifier>`.  A declarator is one of:
+  - `*` declarator  — pointer to the base type (e.g. `int *p`, `double **pp`)
+  - `(` declarator `)` — parenthesized declarator (e.g. `int(*p)`, `long(*(lp))`)
+  - `identifier` — plain identifier
+  - `identifier (params)` — inline function parameters inside the declarator
+  - `(declarator) (params)` — params applied to a parenthesized declarator (left-recursive)
+- **Abstract declarators** (for cast expressions): same grammar without the identifier.
+  e.g. `(unsigned long (*))` → `Pointer(ULong)`, `(double (*(*(*)))))` → nested pointer.
+- **Null pointer constants**: only integer constant expressions with value 0 may be implicitly
+  converted to a pointer type.  `0`, `0L`, `0U`, `0UL` are null pointer constants; variables and
+  doubles are not.
+- **Type checking for pointers**:
+  - Pointer ↔ double conversions are always illegal (even explicit casts).
+  - Pointer ↔ integer conversions require an explicit cast (except null pointer constants).
+  - Pointers of different pointee types cannot be implicitly converted to each other.
+  - Arithmetic/bitwise/shift/complement/negate operators reject pointer operands.
+  - Equality (`==`, `!=`) between a pointer and an integer is only legal if the integer
+    is a null pointer constant; comparing two pointers requires identical pointee types.
+  - `switch` rejects pointer controlling expressions.
+- **`&*e` optimization**: `AddrOf(Dereference(e))` evaluates to `e` without performing a
+  dereference (so `&*null_ptr` does not crash).
+- **Compound assignment through pointer**: `*f() += expr` evaluates `f()` only once by caching
+  the pointer in a temporary before loading and storing through it.
 
 ## Chapter 12 Changes
 

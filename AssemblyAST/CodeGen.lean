@@ -171,9 +171,10 @@ private def emitParamCopies (params : List String) (bst : BackendSymTable) : Lis
               go rest intIdx (floatIdx + 1) stackIdx
                 (acc ++ [.Movsd (.Reg reg) (.Pseudo p)])
             else
+              -- Chapter 14: stack params use Memory(BP, offset) instead of Stack(offset)
               let stackOff : Int := ((stackIdx + 2) * 8 : Nat)
               go rest intIdx floatIdx (stackIdx + 1)
-                (acc ++ [.Movsd (.Stack stackOff) (.Pseudo p)])
+                (acc ++ [.Movsd (.Memory .BP stackOff) (.Pseudo p)])
         | _ =>
             -- Integer argument: use integer register if available, else stack
             if intIdx < 6 then
@@ -181,9 +182,10 @@ private def emitParamCopies (params : List String) (bst : BackendSymTable) : Lis
               go rest (intIdx + 1) floatIdx stackIdx
                 (acc ++ [.Mov asmT (.Reg reg) (.Pseudo p)])
             else
+              -- Chapter 14: stack params use Memory(BP, offset) instead of Stack(offset)
               let stackOff : Int := ((stackIdx + 2) * 8 : Nat)
               go rest intIdx floatIdx (stackIdx + 1)
-                (acc ++ [.Mov asmT (.Stack stackOff) (.Pseudo p)])
+                (acc ++ [.Mov asmT (.Memory .BP stackOff) (.Pseudo p)])
   go params 0 0 0 []
 
 /-- Generate assembly for a TACKY FunCall instruction.
@@ -559,6 +561,35 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
       ([.Label name], ctr)
   | .FunCall name args dst =>
       convertFunCall name args dst bst ctr
+  -- Chapter 14: pointer operations -----------------------------------------------
+  | .GetAddress src dst =>
+      -- leaq src, dst: compute address of src (a stack slot) into dst
+      ([.Lea (convertVal src) (convertVal dst)], ctr)
+  | .Load ptr dst =>
+      -- Load from memory address stored in ptr into dst.
+      -- Step 1: move the pointer (64-bit address) into R10.
+      -- Step 2: load from (%r10) into dst.
+      -- FixUp handles the case where dst is a stack slot (Memory(BP,n)):
+      --   movX Memory(R10,0) Memory(BP,n) → mem-to-mem → routed through R10.
+      let dstT := valAsmType bst dst
+      if dstT == .Double then
+        ([.Mov .Quadword (convertVal ptr) (.Reg .R10),
+          .Movsd (.Memory .R10 0) (convertVal dst)], ctr)
+      else
+        ([.Mov .Quadword (convertVal ptr) (.Reg .R10),
+          .Mov dstT (.Memory .R10 0) (convertVal dst)], ctr)
+  | .Store src ptr =>
+      -- Store src through the pointer address stored in ptr.
+      -- Step 1: move the pointer (64-bit address) into R11.
+      -- Step 2: store src into (%r11).
+      -- FixUp handles mem-to-mem when src is a stack slot.
+      let srcT := valAsmType bst src
+      if srcT == .Double then
+        ([.Mov .Quadword (convertVal ptr) (.Reg .R11),
+          .Movsd (convertVal src) (.Memory .R11 0)], ctr)
+      else
+        ([.Mov .Quadword (convertVal ptr) (.Reg .R11),
+          .Mov srcT (convertVal src) (.Memory .R11 0)], ctr)
 
 /-- Convert a TACKY function definition to assembly, threading the global label
     counter so that ULong↔Double branch labels are unique across all functions

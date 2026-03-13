@@ -65,18 +65,22 @@ private def runCmd (cmd : String) (args : Array String) (errPrefix : String) : I
 
 /-- Convert an `AST.Typ` to the corresponding `AsmType`.
     Chapter 12: UInt → Longword, ULong → Quadword (same widths as signed).
-    Chapter 13: Double → Double (8-byte, uses XMM registers). -/
+    Chapter 13: Double → Double (8-byte, uses XMM registers).
+    Chapter 14: Pointer → Quadword (pointers are 8-byte, like unsigned long). -/
 private def asmTypeOf : AST.Typ → AssemblyAST.AsmType
   | .Int  | .UInt  => .Longword
   | .Long | .ULong => .Quadword
   | .Double        => .Double
+  | .Pointer _     => .Quadword   -- Chapter 14: pointer is 8-byte
 
 /-- True iff the type is a signed integer type.
-    Double returns false (sign concept doesn't apply to IEEE 754 types). -/
+    Double returns false (sign concept doesn't apply to IEEE 754 types).
+    Chapter 14: Pointer returns false (treated as unsigned for code generation). -/
 private def isSignedTyp : AST.Typ → Bool
-  | .Int | .Long   => true
-  | .UInt | .ULong => false
-  | .Double        => false
+  | .Int | .Long     => true
+  | .UInt | .ULong   => false
+  | .Double          => false
+  | .Pointer _       => false   -- Chapter 14: pointers are unsigned
 
 /-- Build the backend symbol table from:
     1. The frontend symbol table (all declared variables and functions).
