@@ -46,6 +46,9 @@ private def alignUp (n : Nat) (align : Nat) : Nat :=
       - `ObjEntry(_, _, true)` → static variable/constant → `Data(id)`.
       - `ObjEntry(Quadword, _, false)` → local long/ulong → next 8-byte stack slot.
       - `ObjEntry(Double, _, false)`   → local double → next 8-byte stack slot (Chapter 13).
+      - `ObjEntry(ByteArray(n, al), _, false)` → local array → Chapter 15: allocate n bytes
+          aligned to `al` (or 16 for large arrays).  Returns Memory(BP, base_offset)
+          where the base is the lowest address of the array.
       - Not found or `ObjEntry(Longword, ...)` → 4-byte slot. -/
 private def ReplState.getOrInsert (s : ReplState) (id : String)
     (bst : BackendSymTable) : ReplState × Operand :=
@@ -62,18 +65,38 @@ private def ReplState.getOrInsert (s : ReplState) (id : String)
           let aligned := alignUp s.maxBytes 8
           let bytes   := aligned + 8
           let offset  : Int := -(bytes : Int)
-          let op      := Operand.Memory .BP offset  -- Chapter 14: Memory(BP,n) replaces Stack(n)
+          let op      := Operand.Memory .BP offset
+          ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
+      | some (.ObjEntry (.ByteArray totalBytes elemAlign) _ false) =>
+          -- Chapter 15: local array — reserve `totalBytes` bytes at alignment `elemAlign`.
+          -- The "base" operand is Memory(BP, -(bytes)) where bytes is the total offset
+          -- from RBP to the start of the array.
+          -- We need (rbp - bytes) ≡ 0 (mod elemAlign).  Since rbp is 16-byte aligned and
+          -- elemAlign ∈ {4, 8, 16}, this requires bytes ≡ 0 (mod elemAlign).
+          -- Step 1: pad maxBytes up to elemAlign so the top boundary is aligned.
+          -- Step 2: add totalBytes, then pad again so the bottom boundary (base) is also aligned.
+          let aligned := alignUp s.maxBytes elemAlign
+          let bytes   := alignUp (aligned + totalBytes) elemAlign
+          let offset  : Int := -(bytes : Int)
+          let op      := Operand.Memory .BP offset
           ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
       | _ =>
           -- Local int (4-byte) or unknown temporary: 4-byte slot
           let bytes  := s.maxBytes + 4
           let offset : Int := -(bytes : Int)
-          let op     := Operand.Memory .BP offset   -- Chapter 14: Memory(BP,n) replaces Stack(n)
+          let op     := Operand.Memory .BP offset
           ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
 
 private def replaceOp (s : ReplState) (bst : BackendSymTable) : Operand → ReplState × Operand
   | .Pseudo id => s.getOrInsert id bst
-  | op         => (s, op)
+  | .PseudoMem id byteOff =>
+      -- Chapter 15: resolve PseudoMem(id, byteOff) by looking up id's base address,
+      -- then adding byteOff to the offset.
+      let (s', baseOp) := s.getOrInsert id bst
+      match baseOp with
+      | .Memory r baseOff => (s', .Memory r (baseOff + byteOff))
+      | op => (s', op)   -- fallback (shouldn't happen for local arrays)
+  | op => (s, op)
 
 /-- Replace all Pseudo operands in a single instruction.
     Chapter 11: handles all typed instruction variants and Movsx.

@@ -169,6 +169,40 @@ private def consumeStars (baseTyp : Typ) (tokens : List Token) : Typ × List Tok
   | .Star :: rest => consumeStars (.Pointer baseTyp) rest
   | _             => (baseTyp, tokens)
 
+/-- Chapter 15: Parse zero or more array dimension suffixes `[N]` after a declarator name.
+    Returns a type-wrapping function and the remaining tokens.
+    The outermost dimension is the first `[N]` from the left.
+    e.g. `[3]`    → `fun t => .Array t 3`
+         `[3][4]` → `fun t => .Array (.Array t 4) 3`   (array of 3 × array of 4)
+    Accepts integer constants with any suffix (4, 4l, 4ul, 4u) as array sizes.
+    This function is used by both `parseAbstractDeclarator` (for cast types like `int (*)[3]`)
+    and `parseDeclaratorName` (for concrete declarators like `int arr[3]`). -/
+private def parseArrayDimensions (tokens : List Token) : (Typ → Typ) × List Token :=
+  -- Helper: extract a Nat from any integer constant token (ignoring signedness/width).
+  -- Only plain integer constants without sign-extension issues are valid as array sizes,
+  -- but C allows any integer constant expression, so we accept all constant token forms.
+  let tryGetDim : Token → Option Nat
+    | .Constant n      => some n
+    | .LongConstant n  => some n
+    | .UIntConstant n  => some n
+    | .ULongConstant n => some n
+    | _                => none
+  match tokens with
+  | .OpenBracket :: tok :: .CloseBracket :: rest =>
+      match tryGetDim tok with
+      | some n =>
+          -- Consume this `[n]` and recurse to pick up any further dimensions.
+          let (innerWrap, rest') := parseArrayDimensions rest
+          -- The inner wrap handles deeper dimensions; apply it to the element type first,
+          -- then wrap with this dimension on the outside.
+          (fun t => .Array (innerWrap t) n, rest')
+      | none =>
+          -- Token is not an integer constant — stop and don't consume.
+          (id, tokens)
+  | _ =>
+      -- Not an array dimension suffix; stop and return the identity wrap.
+      (id, tokens)
+
 /-- Parse an abstract declarator (no identifier): zero or more `*` tokens and/or
     parenthesized groups.  Returns a type-wrapping function and the remaining tokens.
     Used for abstract declarators in cast expressions, e.g.:
@@ -185,7 +219,12 @@ private def parseAbstractDeclarator (tokens : List Token) : (Typ → Typ) × Lis
       -- Parenthesized abstract declarator: recurse inside, then consume ')'
       let (innerWrap, rest') := parseAbstractDeclarator rest
       match expect .CloseParen rest' with
-      | .ok rest'' => (innerWrap, rest'')
+      | .ok rest'' =>
+          -- Chapter 15: consume any array dimension suffixes after ')'.
+          -- e.g. `int (*)[3]` — after parsing `(*)` we pick up `[3]`.
+          -- Combined wrap: fun t => innerWrap (arrWrap t)  e.g. Pointer (Array Int 3)
+          let (arrWrap, rest''') := parseArrayDimensions rest''
+          (fun t => innerWrap (arrWrap t), rest''')
       | .error _   => (innerWrap, rest')  -- best-effort recovery
   | _ =>
       -- Not a star or paren: stop (base case)
@@ -230,26 +269,28 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
   match tokens with
   | []                       => .error "Expected expression but reached end of input"
   -- Chapter 13: floating-point constant (e.g. 3.14, 1.5e10)
-  | .DoubleConstant f :: rest => .ok (.Constant (.ConstDouble f), rest)
+  -- Chapter 15: constants can be subscripted (`3[arr]` == `arr[3]` in C), so pass
+  -- through parsePostfixOps.
+  | .DoubleConstant f :: rest => parsePostfixOps (.Constant (.ConstDouble f)) rest
   -- Chapter 11: long integer constant (e.g. 100L — has l/L suffix)
-  | .LongConstant n :: rest  => .ok (.Constant (.ConstLong n), rest)
+  | .LongConstant n :: rest  => parsePostfixOps (.Constant (.ConstLong n)) rest
   -- Chapter 12: unsigned long constant (e.g. 100UL — has ul/lu suffix)
-  | .ULongConstant n :: rest => .ok (.Constant (.ConstULong (n : Int)), rest)
+  | .ULongConstant n :: rest => parsePostfixOps (.Constant (.ConstULong (n : Int))) rest
   -- Chapter 12: unsigned int constant (e.g. 100U — has u/U suffix)
   -- Auto-promote to ULong if value exceeds UINT_MAX (4294967295)
   | .UIntConstant n :: rest =>
       if n > 4294967295 then
-        .ok (.Constant (.ConstULong (n : Int)), rest)
+        parsePostfixOps (.Constant (.ConstULong (n : Int))) rest
       else
-        .ok (.Constant (.ConstUInt (n : Int)), rest)
+        parsePostfixOps (.Constant (.ConstUInt (n : Int))) rest
   -- Regular integer constant: auto-promote to Long if value exceeds INT_MAX.
   -- (C §6.4.4.1: a decimal constant without a suffix is promoted to the
   -- smallest type that can represent it — int, then long.)
   | .Constant n :: rest =>
       if n > 2147483647 then
-        .ok (.Constant (.ConstLong (n : Int)), rest)
+        parsePostfixOps (.Constant (.ConstLong (n : Int))) rest
       else
-        .ok (.Constant (.ConstInt (n : Int)), rest)
+        parsePostfixOps (.Constant (.ConstInt (n : Int))) rest
   | .Minus     :: rest => do let (e, rest') ← parseFactor rest; .ok (.Unary .Negate e, rest')
   | .Tilde     :: rest => do let (e, rest') ← parseFactor rest; .ok (.Unary .Complement e, rest')
   | .Bang      :: rest => do let (e, rest') ← parseFactor rest; .ok (.Unary .Not e, rest')
@@ -279,23 +320,40 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
           do
             let (e, rest')  ← parseExp 0 rest
             let rest''      ← expect .CloseParen rest'
-            match rest'' with
-            | .PlusPlus   :: rest''' => .ok (.PostfixIncr e, rest''')
-            | .MinusMinus :: rest''' => .ok (.PostfixDecr e, rest''')
-            | _                      => .ok (e, rest'')
+            -- Chapter 15: delegate postfix ops (++, --, [idx]) to parsePostfixOps
+            parsePostfixOps e rest''
   -- Function call: `identifier "(" args ")"`
   | .Identifier v :: .OpenParen :: rest => do
       let (args, rest') ← parseArgList rest
-      match rest' with
-      | .PlusPlus   :: rest'' => .ok (.PostfixIncr (.FunCall v args), rest'')
-      | .MinusMinus :: rest'' => .ok (.PostfixDecr (.FunCall v args), rest'')
-      | _                     => .ok (.FunCall v args, rest')
+      -- Chapter 15: delegate postfix ops (++, --, [idx]) to parsePostfixOps
+      parsePostfixOps (.FunCall v args) rest'
   | .Identifier v :: rest =>
-      match rest with
-      | .PlusPlus   :: rest' => .ok (.PostfixIncr (.Var v), rest')
-      | .MinusMinus :: rest' => .ok (.PostfixDecr (.Var v), rest')
-      | _                    => .ok (.Var v, rest)
+      -- Chapter 15: delegate postfix ops (++, --, [idx]) to parsePostfixOps
+      parsePostfixOps (.Var v) rest
   | t :: _  => .error s!"Expected expression but found {t.describe}"
+
+/-- Chapter 15: Apply zero or more postfix operators to `e`.
+    Handles (in chaining order):
+      `[idx]`  → `Subscript(e, idx)`, then continue applying more postfix ops.
+      `++`     → `PostfixIncr(e)` (terminal).
+      `--`     → `PostfixDecr(e)` (terminal).
+    This replaces the ad-hoc `++ / --` matches that were spread through `parseFactor`.
+    Examples:
+      `a[0][1]++` → PostfixIncr(Subscript(Subscript(Var a, 0), 1))
+      `f()[2]`    → Subscript(FunCall f [], 2) -/
+private partial def parsePostfixOps (e : Exp) (tokens : List Token) : Except String (Exp × List Token) :=
+  match tokens with
+  | .OpenBracket :: rest => do
+      -- Subscript: consume `[`, parse the index expression, then consume `]`.
+      let (idx, rest') ← parseExp 0 rest
+      let rest''       ← expect .CloseBracket rest'
+      -- Recurse: `a[0][1]` chains to another subscript.
+      parsePostfixOps (.Subscript e idx) rest''
+  -- Chapter 15: postfix ++ and -- are NOT terminal — `ptr--[idx]` should parse as
+  -- `(ptr--)[idx]`, so we recurse after applying the postfix op.
+  | .PlusPlus   :: rest => parsePostfixOps (.PostfixIncr e) rest
+  | .MinusMinus :: rest => parsePostfixOps (.PostfixDecr e) rest
+  | _                   => .ok (e, tokens)              -- no more postfix ops
 
 private partial def parseArgList (tokens : List Token) : Except String (List Exp × List Token) :=
   match tokens with
@@ -396,6 +454,7 @@ private def parseOptionalExp (delim : Token) (tokens : List Token)
   block, which must be defined BEFORE `parseVarDecl` so that `parseVarDecl`
   can call `parseDeclaratorName`.
 -/
+
 mutual
 
 /-- Parse a concrete declarator (one that contains an identifier at its core).
@@ -433,14 +492,24 @@ private partial def parseDeclaratorName (tokens : List Token)
           return (name, innerWrap, some params, rest4)
       | _, _ =>
           -- Either we already have params (from a deeper level) or no params follow.
-          return (name, innerWrap, paramsOpt, rest'')
+          -- Chapter 15: consume any array dimension suffixes after the closing ')'.
+          -- e.g. `int (*p)[3]` — the `[3]` after `)` means pointer-to-array.
+          --   innerWrap = (Pointer) from the `*` inside the parens
+          --   arrWrap   = (Array T 3) from the `[3]` after the parens
+          --   Combined: fun t => innerWrap (arrWrap t)  →  Pointer (Array Int 3)
+          let (arrWrap, rest''') := parseArrayDimensions rest''
+          return (name, fun t => innerWrap (arrWrap t), paramsOpt, rest''')
   | .Identifier name :: .OpenParen :: rest =>
       -- Identifier followed immediately by '(' — function params inside the declarator
       -- (e.g., `return_3(void)` inside `(return_3(void))`)
       let (params, rest') ← parseParamList rest
       return (name, id, some params, rest')
   | .Identifier name :: rest =>
-      return (name, id, none, rest)
+      -- Chapter 15: after a plain identifier, consume any `[N]` array dimension suffixes.
+      -- e.g. `int arr[5]`   → wrapFn = fun t => .Array t 5
+      --      `int arr[3][4]` → wrapFn = fun t => .Array (.Array t 4) 3
+      let (arrWrap, rest') := parseArrayDimensions rest
+      return (name, arrWrap, none, rest')
   | [] => .error "Expected declarator but reached end of input"
   | t :: _ => .error s!"Expected declarator but found {t.describe}"
 
@@ -476,8 +545,73 @@ private partial def parseOneParam (tokens : List Token) : Except String ((Typ ×
   if scOpt.isSome then
     throw "Storage class specifier not allowed in parameter declaration"
   let (name, wrapFn, _, tokens) ← parseDeclaratorName tokens
-  -- wrapFn applies pointer levels from the declarator to the base type
-  return ((wrapFn baseTyp, name), tokens)
+  -- wrapFn applies pointer levels and array dimensions from the declarator to the base type.
+  let paramTyp := wrapFn baseTyp
+  -- C §6.7.6.3: "A declaration of a parameter as 'array of type' shall be adjusted to
+  -- 'qualified pointer to type'."  The outermost Array wrapper is replaced by a Pointer.
+  let adjustedTyp : AST.Typ := match paramTyp with
+    | .Array elemTyp _ => .Pointer elemTyp
+    | t => t
+  return ((adjustedTyp, name), tokens)
+
+end
+
+-- ---------------------------------------------------------------------------
+-- Initializer parsing (Chapter 15)
+-- ---------------------------------------------------------------------------
+
+/-
+  `parseInitializer`, `parseCompoundInitTail`, and `parseCompoundInitListTail`
+  are mutually recursive: each `{...}` invokes all three in a cycle.
+  All three live in one `mutual` block so Lean accepts the forward references.
+-/
+mutual
+
+/-- Chapter 15: Parse an initializer for a variable declaration.
+    Grammar:
+      initializer ::= '{' initializer-list '}'   -- compound (for arrays)
+                    | exp                          -- scalar
+    The compound form `{ e1, e2, e3 }` produces `CompoundInit [SingleInit e1, ...]`.
+    Nested compound forms (for multi-dimensional arrays) are supported.
+    A trailing comma before `}` is accepted for convenience. -/
+private partial def parseInitializer (tokens : List Token) : Except String (Initializer × List Token) :=
+  match tokens with
+  | .OpenBrace :: rest =>
+      -- Compound initializer: parse a brace-enclosed list of sub-initializers
+      parseCompoundInitTail rest
+  | _ => do
+      -- Scalar initializer: parse an expression
+      let (e, rest) ← parseExp 0 tokens
+      .ok (.SingleInit e, rest)
+
+/-- Parse the inside and closing `}` of a compound initializer. -/
+private partial def parseCompoundInitTail (tokens : List Token) : Except String (Initializer × List Token) := do
+  match tokens with
+  | .CloseBrace :: _ =>
+      -- Empty compound initializer `{}` — illegal in C89/C11 (valid only in C23).
+      .error "Empty initializer list `{}` is not supported (C99/C11); use at least one element"
+  | _ => do
+      -- Parse first element, then the rest
+      let (first, rest) ← parseInitializer tokens
+      let (inits, rest') ← parseCompoundInitListTail rest
+      .ok (.CompoundInit (first :: inits), rest')
+
+/-- Parse the tail of a compound initializer list (after the first element). -/
+private partial def parseCompoundInitListTail (tokens : List Token) : Except String (List Initializer × List Token) :=
+  match tokens with
+  | .CloseBrace :: rest =>
+      -- End of list
+      .ok ([], rest)
+  | .Comma :: .CloseBrace :: rest =>
+      -- Trailing comma before `}` — allowed
+      .ok ([], rest)
+  | .Comma :: rest => do
+      -- Another element
+      let (elem, rest')  ← parseInitializer rest
+      let (more, rest'') ← parseCompoundInitListTail rest'
+      .ok (elem :: more, rest'')
+  | [] => .error "Expected \"}\" or \",\" in compound initializer but reached end of input"
+  | t :: _ => .error s!"Expected \"}\" or \",\" in compound initializer but found {t.describe}"
 
 end
 
@@ -513,9 +647,10 @@ private def parseVarDecl (tokens : List Token) (storageClassOpt : Option Storage
   let typ := wrapFn baseTyp
   match tokens with
   | .Equal :: rest => do
-      let (e, rest')  ← parseExp 0 rest
-      let rest''      ← expect .Semicolon rest'
-      .ok ({ name, typ, init := some e, storageClass := sc }, rest'')
+      -- Chapter 15: initializer may be a compound `{ e1, e2, ... }` or a scalar expression.
+      let (init, rest') ← parseInitializer rest
+      let rest''        ← expect .Semicolon rest'
+      .ok ({ name, typ, init := some init, storageClass := sc }, rest'')
   | _ => do
       let rest ← expect .Semicolon tokens
       .ok ({ name, typ, init := none, storageClass := sc }, rest)
@@ -777,9 +912,10 @@ private partial def parseTopLevel (tokens : List Token) : Except String (TopLeve
           | [] => .error s!"Expected open-brace or semicolon after function header for {name} but reached end of input"
           | t :: _ => .error s!"Expected open-brace or semicolon after function header for {name} but found {t.describe}"
       | .Equal :: rest => do
-          let (e, rest')  ← parseExp 0 rest
-          let rest''      ← expect .Semicolon rest'
-          .ok (.VarDecl { name, typ := retTyp, init := some e, storageClass := sc }, rest'')
+          -- Chapter 15: initializer may be a compound `{ e1, e2, ... }` or a scalar expression.
+          let (init, rest') ← parseInitializer rest
+          let rest''        ← expect .Semicolon rest'
+          .ok (.VarDecl { name, typ := retTyp, init := some init, storageClass := sc }, rest'')
       | .Semicolon :: rest =>
           .ok (.VarDecl { name, typ := retTyp, init := none, storageClass := sc }, rest)
       | [] => .error s!"Expected open-paren, semicolon, or equals after name {name} but reached end of input"

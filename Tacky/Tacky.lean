@@ -3,7 +3,19 @@ import AST.AST
 namespace Tacky
 
 /-
-  TACKY intermediate representation for Chapter 14.
+  TACKY intermediate representation for Chapter 15.
+
+  Chapter 15 additions:
+    - `CopyToOffset(src, dstName, offset)`: copy a scalar value into a byte
+      offset within a named aggregate (array) variable.  Used for array
+      initializers: `int arr[3] = {1,2,3}` → three CopyToOffset instructions.
+    - `AddPtr(ptr, index, scale, dst)`: dst = ptr + index * scale.
+      Used for pointer arithmetic and subscript operations (after TypeCheck
+      desugars `a[i]` to `*(a + i)` and TackyGen detects the pointer add).
+    - `StaticVariable` init changed from a single `AST.Const` to `List StaticInit`,
+      enabling static arrays to carry an initializer list.
+    - `StaticInit`: a new tagged union for static initializer elements, including
+      `ZeroInit n` for emitting `.zero n` (a block of n zero bytes).
 
   Chapter 14 additions:
     - `Load(ptr, dst)`:       dst = *ptr  (load through pointer)
@@ -62,12 +74,16 @@ namespace Tacky
                        | ★★ Load(val ptr, val dst)
                        | ★★ Store(val src, val ptr)
                        | ★★ GetAddress(val src, val dst)
+                       | ★★★ CopyToOffset(val src, identifier dst, int offset)
+                       | ★★★ AddPtr(val ptr, val index, int scale, val dst)
     val                = Constant(int) | Var(identifier)
     unary_operator     = Complement | Negate | Not
     binary_operator    = Add | Subtract | Multiply | Divide | Remainder
                        | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight
                        | Equal | NotEqual
                        | LessThan | LessOrEqual | GreaterThan | GreaterOrEqual
+    static_init        = IntInit(int) | LongInit(int) | UIntInit(int) | ULongInit(int)
+                       | DoubleInit(float) | ★★★ ZeroInit(int n)   -- .zero n bytes
 -/
 
 inductive UnaryOp where
@@ -145,6 +161,15 @@ inductive Instruction where
   | Store      : Val → Val → Instruction
   /-- Take address of a variable: emit `leaq src, dst`. -/
   | GetAddress : Val → Val → Instruction
+  -- Chapter 15: array / pointer-arithmetic operations -----------
+  /-- Copy scalar `src` into byte `offset` of aggregate variable `dstName`.
+      Used for aggregate initialization: `int arr[3] = {1,2,3}` emits three
+      `CopyToOffset` instructions, one per element. -/
+  | CopyToOffset : Val → String → Int → Instruction
+  /-- Pointer arithmetic: `dst = ptr + index * scale`.
+      `scale` is the element size in bytes (always a positive constant).
+      For `ptr - int`, TackyGen negates the index before emitting AddPtr. -/
+  | AddPtr       : Val → Val → Int → Val → Instruction
   deriving Repr, BEq
 
 /-- A TACKY function definition. -/
@@ -155,14 +180,31 @@ structure FunctionDef where
   global : Bool
   deriving Repr, BEq
 
+/-- Chapter 15: A single element of a static variable's initializer list.
+    A scalar variable has a one-element list; an array has one entry per element.
+    `ZeroInit n` emits `.zero n` — an efficient block of n zero bytes.
+    This mirrors the AssemblyAST.StaticInit type but lives in the TACKY layer. -/
+inductive StaticInit where
+  | IntInit    : Int   → StaticInit   -- 32-bit value  → .long
+  | LongInit   : Int   → StaticInit   -- 64-bit value  → .quad
+  | UIntInit   : Int   → StaticInit   -- 32-bit unsigned → .long
+  | ULongInit  : Int   → StaticInit   -- 64-bit unsigned → .quad
+  | DoubleInit : Float → StaticInit   -- 64-bit double → .quad (bit pattern)
+  | ZeroInit   : Nat   → StaticInit   -- n zero bytes  → .zero n
+  deriving Repr, BEq
+
 /-- A top-level item in the TACKY program.
     Chapter 11: `StaticVariable` carries the variable type for proper assembly
     section/directive selection (.long vs .quad, .zero 4 vs .zero 8).
-    Chapter 13: init is `AST.Const` (was `Int`) to support double inits. -/
+    Chapter 13: init was `AST.Const` (was `Int`) to support double inits.
+    Chapter 15: init is `List StaticInit` to support array initializer lists. -/
 inductive TackyTopLevel where
   | Function       : FunctionDef → TackyTopLevel
-  /-- Static variable: name, global flag, scalar type, initial value. -/
-  | StaticVariable : String → Bool → AST.Typ → AST.Const → TackyTopLevel
+  /-- Static variable: name, global flag, type, list of static initializers.
+      For scalar variables the list has exactly one element.
+      For array variables the list has one element per array element.
+      `ZeroInit n` can compact a run of zero-valued elements. -/
+  | StaticVariable : String → Bool → AST.Typ → List StaticInit → TackyTopLevel
   deriving Repr, BEq
 
 /-- A complete TACKY program. -/

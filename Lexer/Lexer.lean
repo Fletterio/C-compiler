@@ -269,10 +269,12 @@ private def nextToken (chars : List Char) : Option (Token × List Char) :=
   match chars with
   | []                  => none
   -- Single-character punctuation (no word boundary required)
-  | '(' :: rest         => some (.OpenParen,  rest)
-  | ')' :: rest         => some (.CloseParen, rest)
-  | '{' :: rest         => some (.OpenBrace,  rest)
-  | '}' :: rest         => some (.CloseBrace, rest)
+  | '(' :: rest         => some (.OpenParen,    rest)
+  | ')' :: rest         => some (.CloseParen,   rest)
+  | '{' :: rest         => some (.OpenBrace,    rest)
+  | '}' :: rest         => some (.CloseBrace,   rest)
+  | '[' :: rest         => some (.OpenBracket,  rest)   -- Chapter 15: array subscript
+  | ']' :: rest         => some (.CloseBracket, rest)   -- Chapter 15: array subscript
   | ';' :: rest         => some (.Semicolon,  rest)
   | '~' :: rest         => some (.Tilde,      rest)
   | '?' :: rest         => some (.Question,   rest)

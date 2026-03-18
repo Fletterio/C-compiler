@@ -220,6 +220,11 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
         | .Pointer _, .ULong => return (dst, targetTyp, instrs ++ [.Copy src dst])
         -- Pointer → Pointer (reinterpret cast between pointer types)
         | .Pointer _, .Pointer _ => return (dst, targetTyp, instrs ++ [.Copy src dst])
+        -- Chapter 15: Array → Pointer (explicit cast, e.g. `(long *)arr` where arr : long[4]).
+        -- An array variable used as a value must decay to a pointer to its first element.
+        -- This requires taking the address (GetAddress, which compiles to `leaq`), NOT copying
+        -- the value at arr[0] into the pointer.
+        | .Pointer _, .Array _ _ => return (dst, targetTyp, instrs ++ [.GetAddress src dst])
         -- Pointer → Integer: truncate (Pointer→Int/UInt, 64→32) or copy (Pointer→Long/ULong)
         | .Int,   .Pointer _ => return (dst, targetTyp, instrs ++ [.Truncate src dst])
         | .UInt,  .Pointer _ => return (dst, targetTyp, instrs ++ [.Truncate src dst])
@@ -269,14 +274,48 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
   | .Binary op e1 e2 => do
       let (src1, t1, instrs1) ← emitExp st e1
       let (src2, t2, instrs2) ← emitExp st e2
-      let resultTyp : AST.Typ := match op with
-        | .Equal | .NotEqual | .LessThan | .LessOrEqual
-        | .GreaterThan | .GreaterOrEqual => .Int
-        | .ShiftLeft | .ShiftRight => t1   -- type of left operand (C §6.5.7)
-        | .And | .Or               => .Int
-        | _                        => t1   -- arithmetic ops: t1 == t2 after TypeCheck
-      let dst := Val.Var (← makeTemporary resultTyp)
-      return (dst, resultTyp, instrs1 ++ instrs2 ++ [.Binary (convertBinop op) src1 src2 dst])
+      -- Chapter 15: detect pointer arithmetic and emit AddPtr instead of Binary.
+      -- TypeCheck ensures that if one side is a Pointer, the operation is + or -.
+      match op, t1, t2 with
+      | .Add, .Pointer elemTyp, _ => do
+          -- ptr + int: AddPtr(ptr_val, idx_val, scale, dst)
+          let scale := (elemTyp.sizeOf : Int)
+          let dst   := Val.Var (← makeTemporary t1)
+          return (dst, t1, instrs1 ++ instrs2 ++ [.AddPtr src1 src2 scale dst])
+      | .Add, _, .Pointer elemTyp => do
+          -- int + ptr: commutative; put the pointer first
+          let scale := (elemTyp.sizeOf : Int)
+          let dst   := Val.Var (← makeTemporary t2)
+          return (dst, t2, instrs1 ++ instrs2 ++ [.AddPtr src2 src1 scale dst])
+      | .Subtract, .Pointer elemTyp, .Pointer _ => do
+          -- ptr - ptr: (ptr1 - ptr2) / elemSize → result type Long (ptrdiff_t)
+          let scale   := (elemTyp.sizeOf : Int)
+          let diffTmp := Val.Var (← makeTemporary .Long)
+          let dst     := Val.Var (← makeTemporary .Long)
+          return (dst, .Long,
+            instrs1 ++ instrs2 ++
+            [.Binary .Subtract src1 src2 diffTmp,
+             .Binary .Divide diffTmp (.Constant scale) dst])
+      | .Subtract, .Pointer elemTyp, _ => do
+          -- ptr - int: negate the index, then AddPtr(ptr, neg_idx, scale, dst)
+          let scale  := (elemTyp.sizeOf : Int)
+          let negIdx := Val.Var (← makeTemporary t2)
+          let dst    := Val.Var (← makeTemporary t1)
+          return (dst, t1,
+            instrs1 ++ instrs2 ++
+            [.Unary .Negate src2 negIdx,
+             .AddPtr src1 negIdx scale dst])
+      | _, _, _ =>
+          -- Regular arithmetic / bitwise / relational / shift
+          let resultTyp : AST.Typ := match op with
+            | .Equal | .NotEqual | .LessThan | .LessOrEqual
+            | .GreaterThan | .GreaterOrEqual => .Int
+            | .ShiftLeft | .ShiftRight => t1   -- type of left operand (C §6.5.7)
+            | .And | .Or               => .Int
+            | _                        => t1   -- arithmetic ops: t1 == t2 after TypeCheck
+          let dst := Val.Var (← makeTemporary resultTyp)
+          return (dst, resultTyp,
+            instrs1 ++ instrs2 ++ [.Binary (convertBinop op) src1 src2 dst])
   | .Conditional cond e1 e2 => do
       let e2Label  ← makeLabel "ternary_else"
       let endLabel ← makeLabel "ternary_end"
@@ -324,31 +363,38 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
         | some { type := .Obj t, .. } => t
         | _ => .Int
       let tmp ← makeTemporary varTyp
-      -- For doubles, add 1.0; for integers, add 1
-      if varTyp == .Double then do
-        let oneLabel ← internFloat 1.0
-        return (.Var tmp, varTyp,
-          [.Copy (.Var v) (.Var tmp),
-           .Binary .Add (.Var v) (.Var oneLabel) (.Var v)])
-      else
-        return (.Var tmp, varTyp,
-          [.Copy (.Var v) (.Var tmp),
-           .Binary .Add (.Var v) (.Constant 1) (.Var v)])
+      match varTyp with
+      | .Pointer elemTyp =>
+          -- Chapter 15: pointer increment advances by sizeof(*ptr), not by 1 byte.
+          -- Use AddPtr so CodeGen emits a scaled leaq instead of a raw addq $1.
+          let scale : Int := elemTyp.sizeOf
+          return (.Var tmp, varTyp,
+            [.Copy (.Var v) (.Var tmp),
+             .AddPtr (.Var v) (.Constant 1) scale (.Var v)])
+      | .Double => do
+          let oneLabel ← internFloat 1.0
+          return (.Var tmp, varTyp,
+            [.Copy (.Var v) (.Var tmp),
+             .Binary .Add (.Var v) (.Var oneLabel) (.Var v)])
+      | _ =>
+          return (.Var tmp, varTyp,
+            [.Copy (.Var v) (.Var tmp),
+             .Binary .Add (.Var v) (.Constant 1) (.Var v)])
   -- Chapter 14: postfix ++ through a pointer dereference: `(*p)++`
-  -- Load the old value, save it, add 1, store back, return the old value.
+  -- Load the old value, save it, add 1 (or sizeof(*p) for pointer *p), store back,
+  -- return the old value.
   | .PostfixIncr (.Dereference ptrExp) => do
       let (ptrVal, ptrTyp, ptrInstrs) ← emitExp st ptrExp
       let valTyp : AST.Typ := match ptrTyp with | .Pointer t => t | _ => .Int
       let loadedVal := Val.Var (← makeTemporary valTyp)
       let oldVal    := Val.Var (← makeTemporary valTyp)
       let addInstrs : List Instruction :=
-        if valTyp == .Double then
-          -- Double: need a float constant 1.0 — but we need GenM here so we
-          -- fall back to integer treatment (doubles shouldn't be dereferenced like this
-          -- in practice, but for completeness we treat them as integers failing gracefully)
-          [.Binary .Add loadedVal (.Constant 1) loadedVal]
-        else
-          [.Binary .Add loadedVal (.Constant 1) loadedVal]
+        match valTyp with
+        | .Pointer elemTyp =>
+            -- Chapter 15: (*p)++ where *p is a pointer — advance by element size
+            [.AddPtr loadedVal (.Constant 1) elemTyp.sizeOf loadedVal]
+        | _ =>
+            [.Binary .Add loadedVal (.Constant 1) loadedVal]
       return (oldVal, valTyp,
         ptrInstrs ++ [.Load ptrVal loadedVal, .Copy loadedVal oldVal] ++
         addInstrs ++ [.Store loadedVal ptrVal])
@@ -358,41 +404,83 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
         | some { type := .Obj t, .. } => t
         | _ => .Int
       let tmp ← makeTemporary varTyp
-      if varTyp == .Double then do
-        let oneLabel ← internFloat 1.0
-        return (.Var tmp, varTyp,
-          [.Copy (.Var v) (.Var tmp),
-           .Binary .Subtract (.Var v) (.Var oneLabel) (.Var v)])
-      else
-        return (.Var tmp, varTyp,
-          [.Copy (.Var v) (.Var tmp),
-           .Binary .Subtract (.Var v) (.Constant 1) (.Var v)])
+      match varTyp with
+      | .Pointer elemTyp =>
+          -- Chapter 15: pointer decrement advances by -sizeof(*ptr)
+          let scale : Int := elemTyp.sizeOf
+          return (.Var tmp, varTyp,
+            [.Copy (.Var v) (.Var tmp),
+             .AddPtr (.Var v) (.Constant (-1)) scale (.Var v)])
+      | .Double => do
+          let oneLabel ← internFloat 1.0
+          return (.Var tmp, varTyp,
+            [.Copy (.Var v) (.Var tmp),
+             .Binary .Subtract (.Var v) (.Var oneLabel) (.Var v)])
+      | _ =>
+          return (.Var tmp, varTyp,
+            [.Copy (.Var v) (.Var tmp),
+             .Binary .Subtract (.Var v) (.Constant 1) (.Var v)])
   -- Chapter 14: postfix -- through a pointer dereference: `(*p)--`
   | .PostfixDecr (.Dereference ptrExp) => do
       let (ptrVal, ptrTyp, ptrInstrs) ← emitExp st ptrExp
       let valTyp : AST.Typ := match ptrTyp with | .Pointer t => t | _ => .Int
       let loadedVal := Val.Var (← makeTemporary valTyp)
       let oldVal    := Val.Var (← makeTemporary valTyp)
+      let subInstrs : List Instruction :=
+        match valTyp with
+        | .Pointer elemTyp =>
+            -- Chapter 15: (*p)-- where *p is a pointer — decrement by element size
+            [.AddPtr loadedVal (.Constant (-1)) elemTyp.sizeOf loadedVal]
+        | _ =>
+            [.Binary .Subtract loadedVal (.Constant 1) loadedVal]
       return (oldVal, valTyp,
-        ptrInstrs ++ [.Load ptrVal loadedVal, .Copy loadedVal oldVal,
-                      .Binary .Subtract loadedVal (.Constant 1) loadedVal,
-                      .Store loadedVal ptrVal])
+        ptrInstrs ++ [.Load ptrVal loadedVal, .Copy loadedVal oldVal] ++
+        subInstrs ++ [.Store loadedVal ptrVal])
   | .PostfixDecr _ => return (.Constant 0, .Int, [])
   -- Chapter 14: `&*e` cancels out — equivalent to just evaluating e (the pointer).
   -- This is important for correctness: `&*null_ptr` must NOT actually dereference.
   | .AddrOf (.Dereference inner) => do
+      -- Optimization: &(*e) = e — no load/store, just return the pointer value.
+      -- Chapter 15: if `inner` computes a Pointer(Array(T, n)), we adjust the type
+      -- to Pointer(T) because in C, array decay means "pointer to first element."
+      -- Concretely: for 2-D `a[i][j]`, the inner subscript gives a `Pointer(row-type)`,
+      -- and AddrOf(Dereference(...)) on that row should give Pointer(element-type) for
+      -- the next subscript level to use the correct element size as scale.
       let (ptrVal, ptrTyp, instrs) ← emitExp st inner
-      return (ptrVal, ptrTyp, instrs)
-  -- Chapter 14: address-of: `&e` allocates a pointer-typed temporary for the address
+      let adjustedTyp : AST.Typ := match ptrTyp with
+        | .Pointer (.Array elemT _) => .Pointer elemT  -- pointer-to-array → pointer-to-element
+        | t                         => t
+      return (ptrVal, adjustedTyp, instrs)
+  -- Chapter 14: address-of: `&e` allocates a pointer-typed temporary for the address.
+  -- Chapter 15: array-to-pointer decay — `&arr` where `arr : Array(T, n)` gives
+  -- `Pointer(T)` (pointer to the first element), NOT `Pointer(Array(T, n))`.
+  -- This is how TypeCheck encodes array decay via AddrOf when desugaring subscripts:
+  --   arr[i]  →  Dereference(Binary(Add, AddrOf(arr), i))
+  -- where AddrOf(arr) must have type Pointer(T) for the scale to be T.sizeOf (not
+  -- Array(T,n).sizeOf which would be wrong and produce an invalid leaq scale).
   | .AddrOf inner => do
       let (srcVal, srcTyp, instrs) ← emitExp st inner
-      let ptrTyp := AST.Typ.Pointer srcTyp
+      -- For array types: decay to pointer-to-element, not pointer-to-array
+      let ptrTyp : AST.Typ := match srcTyp with
+        | .Array elemTyp _ => .Pointer elemTyp   -- decay: Array(T,n) → Pointer(T)
+        | t                => .Pointer t          -- normal address-of
       let dst := Val.Var (← makeTemporary ptrTyp)
       return (dst, ptrTyp, instrs ++ [.GetAddress srcVal dst])
-  -- Chapter 14: dereference in rvalue context: `*ptr` loads from the pointer address
+  -- Chapter 14: dereference in rvalue context: `*ptr` loads from the pointer address.
+  -- Chapter 15: if the pointed-to type is itself an array (e.g., `Pointer(int[4])`),
+  -- we do NOT emit a Load — loading an entire array is not possible (arrays have no
+  -- register representation).  Instead we keep the pointer value and report the array
+  -- type; the outer AddrOf(Dereference) optimization will convert it back to a plain
+  -- pointer-to-element for the next subscript level.
   | .Dereference inner => do
       let (ptrVal, ptrTyp, instrs) ← emitExp st inner
       let valTyp : AST.Typ := match ptrTyp with | .Pointer t => t | _ => .Int
+      -- If valTyp is an array type, this Dereference is an intermediate expression
+      -- (e.g. `a[i]` of a 2-D array before the outer subscript).  We return the
+      -- POINTER itself (ptrVal) typed as valTyp — the AddrOf wrapper on top will see
+      -- this array type and adjust accordingly. No Load is emitted here.
+      if (match valTyp with | .Array _ _ => true | _ => false) then
+        return (ptrVal, valTyp, instrs)
       let dst := Val.Var (← makeTemporary valTyp)
       return (dst, valTyp, instrs ++ [.Load ptrVal dst])
   | .FunCall name args => do
@@ -404,10 +492,64 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
         | _ => .Int
       let dst := Val.Var (← makeTemporary retTyp)
       return (dst, retTyp, argInstrs ++ [.FunCall name argVals dst])
+  -- Chapter 15: Subscript is fully desugared by TypeCheck into Dereference(Binary.Add(...)).
+  -- This case is unreachable in a well-typed program, but exhaustive matching requires it.
+  | .Subscript _ _ => return (.Constant 0, .Int, [])
 
 -- ---------------------------------------------------------------------------
 -- Statement and block-item lowering
 -- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- Initializer lowering (Chapter 15)
+-- ---------------------------------------------------------------------------
+
+/-- Chapter 15: emit CopyToOffset instructions for a compound array initializer.
+    Recurses into nested sub-initializers for multi-dimensional arrays.
+    `varName`:    the root array variable name.
+    `arrTyp`:     the type of the current aggregate (array of elemTyp).
+    `byteOffset`: starting byte offset within `varName` for this aggregate.
+    `inits`:      the list of sub-initializers (one per element). -/
+private partial def emitArrayInit (st : Semantics.SymbolTable) (varName : String)
+    (arrTyp : AST.Typ) (byteOffset : Int) (inits : List AST.Initializer)
+    : GenM (List Instruction) := do
+  let elemTyp  : AST.Typ := match arrTyp with | .Array e _ => e | t => t
+  let elemSize : Int := elemTyp.sizeOf
+  -- Lean 4 does not have `List.enum`; use `foldlM` with a manual counter instead.
+  let (_, allInstrs) ← inits.foldlM (fun (acc : Int × List Instruction) init => do
+    let (i, instrs) := acc
+    let elemOffset := byteOffset + i * elemSize
+    let elemInstrs ← match init with
+      | .SingleInit e => do
+          -- Leaf element: evaluate and store at the computed byte offset.
+          -- IMPORTANT: if the result is a Constant, its AsmType is determined by
+          -- magnitude alone in CodeGen (valAsmType), which misclassifies small
+          -- ULong/Long values (e.g. 100ul → Longword instead of Quadword).
+          -- To preserve the element type, always route through a typed temporary
+          -- so that CodeGen can look up the correct AsmType from the backend sym table.
+          let (val, typ, evalInstrs) ← emitExp st e
+          let tmp ← makeTemporary typ
+          -- Use `pure` (not `return`) so the result stays as `List Instruction`
+          -- without accidentally returning from the outer foldlM callback.
+          pure (evalInstrs ++ [.Copy val (.Var tmp),
+                               Instruction.CopyToOffset (.Var tmp) varName elemOffset])
+      | .CompoundInit subInits =>
+          -- Nested aggregate (e.g. a row of a 2-D array)
+          emitArrayInit st varName elemTyp elemOffset subInits
+    return (i + 1, instrs ++ elemInstrs)) (0, [])
+  return allInstrs
+
+/-- Chapter 15: lower a local-variable initializer into TACKY instructions.
+    - `SingleInit e` on a scalar variable: emit `Copy val (Var varName)`.
+    - `CompoundInit inits` on an array variable: call `emitArrayInit` to
+      emit one `CopyToOffset` per (leaf) element. -/
+private def emitInitializer (st : Semantics.SymbolTable) (varName : String)
+    (varTyp : AST.Typ) : AST.Initializer → GenM (List Instruction)
+  | .SingleInit e => do
+      let (val, _, instrs) ← emitExp st e
+      return instrs ++ [.Copy val (.Var varName)]
+  | .CompoundInit inits =>
+      emitArrayInit st varName varTyp 0 inits
 
 private def emitForInit (st : Semantics.SymbolTable) : AST.ForInit → GenM (List Instruction)
   | .InitExp none   => return []
@@ -417,9 +559,9 @@ private def emitForInit (st : Semantics.SymbolTable) : AST.ForInit → GenM (Lis
   | .InitDecl decl =>
       match decl.init with
       | none   => return []
-      | some e => do
-          let (val, _, instrs) ← emitExp st e
-          return instrs ++ [.Copy val (.Var decl.name)]
+      | some init =>
+          -- Chapter 15: initializer may be SingleInit (scalar) or CompoundInit (array)
+          emitInitializer st decl.name decl.typ init
 
 mutual
 
@@ -523,9 +665,9 @@ private partial def emitBlockItem (st : Semantics.SymbolTable) (funcName : Strin
   | .D decl =>
       match decl.init with
       | none   => return []
-      | some e => do
-          let (val, _, instrs) ← emitExp st e
-          return instrs ++ [.Copy val (.Var decl.name)]
+      | some init =>
+          -- Chapter 15: initializer may be SingleInit (scalar) or CompoundInit (array)
+          emitInitializer st decl.name decl.typ init
   | .FD _ => return []
 
 end
@@ -543,38 +685,60 @@ private def emitFunctionDef (st : Semantics.SymbolTable) (f : AST.FunctionDef)
            body := body ++ [.Return (.Constant 0)],
            global := isGlobal }
 
-/-- Helper: build the `AST.Const` zero initializer for a given type.
-    Used for Tentative static variables. -/
-private def zeroConstOf : AST.Typ → AST.Const
-  | .Int       => .ConstInt 0
-  | .Long      => .ConstLong 0
-  | .UInt      => .ConstUInt 0
-  | .ULong     => .ConstULong 0
-  | .Double    => .ConstDouble 0.0
-  | .Pointer _ => .ConstULong 0   -- Chapter 14: null pointer = 0 as 64-bit value
+-- ---------------------------------------------------------------------------
+-- Static variable initializer helpers (Chapter 15)
+-- ---------------------------------------------------------------------------
+
+/-- Chapter 15: produce `List StaticInit` for a zero-valued aggregate or scalar.
+    Arrays use a single `ZeroInit(n)` entry for efficiency (emits `.zero n`). -/
+private def zeroStaticInits : AST.Typ → List StaticInit
+  | .Int       => [.IntInit 0]
+  | .Long      => [.LongInit 0]
+  | .UInt      => [.UIntInit 0]
+  | .ULong     => [.ULongInit 0]
+  | .Double    => [.DoubleInit 0.0]
+  | .Pointer _ => [.ULongInit 0]      -- null pointer = 0 (64-bit)
+  | .Array elemTyp n => [.ZeroInit (elemTyp.sizeOf * n)]   -- .zero totalBytes
+
+/-- Convert a single scalar `SymbolTable.InitialValue` + type to one `StaticInit`.
+    Used for non-array static variables. -/
+private def scalarInitToStaticInit (t : AST.Typ) (n : Int) : StaticInit :=
+  match t with
+  | .Int       => .IntInit n
+  | .Long      => .LongInit n
+  | .UInt      => .UIntInit n
+  | .ULong     => .ULongInit n
+  | .Pointer _ => .ULongInit n   -- pointer stored as 64-bit value
+  | _          => .IntInit n     -- shouldn't happen for non-double scalar
+
+/-- Chapter 15: convert a `SymbolTable.InitialValue` to `List StaticInit`.
+    Handles scalars, doubles, tentative (zero-initialized), and arrays.
+    For array elements, recurses into the element type. -/
+private def initValToStaticInits (t : AST.Typ)
+    : Semantics.InitialValue → List StaticInit
+  | .Initial n        => [scalarInitToStaticInit t n]
+  | .DoubleInitial f  => [.DoubleInit f]
+  | .Tentative        => zeroStaticInits t    -- go to .bss
+  | .NoInitializer    => zeroStaticInits t    -- extern-only: treated as zero
+  | .ArrayInitial elemInits =>
+      let elemTyp := match t with | .Array e _ => e | et => et
+      elemInits.foldl (fun acc iv => acc ++ initValToStaticInits elemTyp iv) []
 
 /-- Collect static variable entries from the symbol table and emit them as
     TackyTopLevel.StaticVariable items.
-    Chapter 13: init is now `AST.Const` (not `Int`). -/
+    Chapter 15: init is now `List StaticInit` to support arrays.
+    `NoInitializer` variables (pure `extern` declarations without a local definition)
+    are skipped entirely — they must not produce any data section output, since the
+    definition lives in another translation unit (or library).  Emitting a `.zero n`
+    for a huge `extern` array would cause the assembler/OS to crash trying to
+    reserve exabytes of address space. -/
 private def emitStaticVars (symTable : Semantics.SymbolTable) : List TackyTopLevel :=
   symTable.filterMap fun (name, entry) =>
     match entry.type, entry.attrs with
-    | .Obj t, .Static (.Initial n) isGlobal =>
-        -- Integer static with an explicit initializer
-        let c : AST.Const := match t with
-          | .Int       => .ConstInt n
-          | .Long      => .ConstLong n
-          | .UInt      => .ConstUInt n
-          | .ULong     => .ConstULong n
-          | .Double    => .ConstDouble (Float.ofScientific n.toNat false 0)  -- fallback
-          | .Pointer _ => .ConstULong n   -- Chapter 14: pointer stored as 64-bit value
-        some (.StaticVariable name isGlobal t c)
-    | .Obj t, .Static (.DoubleInitial f) isGlobal =>
-        -- Chapter 13: static double with an explicit initializer
-        some (.StaticVariable name isGlobal .Double (.ConstDouble f))
-    | .Obj t, .Static .Tentative isGlobal =>
-        -- Zero-initialised (goes to .bss)
-        some (.StaticVariable name isGlobal t (zeroConstOf t))
+    | .Obj _, .Static .NoInitializer _ => none   -- extern-only declaration: no local def
+    | .Obj t, .Static iv isGlobal =>
+        let inits := initValToStaticInits t iv
+        some (.StaticVariable name isGlobal t inits)
     | _, _ => none
 
 /-- Entry point for the IR generation pass.

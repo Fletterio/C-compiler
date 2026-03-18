@@ -126,10 +126,10 @@ private def extractDoubleConst : AST.Exp → Option Float
   | .Constant (.ConstULong n)  => some (Float.ofInt n)    -- implicit ulong→double
   | _                          => none
 
-/-- Extract an `InitialValue` from a constant expression given the variable's type.
+/-- Extract an `InitialValue` from a constant expression given the variable's (scalar) type.
     For integer types: wraps in `Initial(n)`.
     For `Double`:     wraps in `DoubleInitial(f)`.  (Chapter 13) -/
-private def extractInitialValue (varTyp : AST.Typ) (e : AST.Exp) : Option InitialValue :=
+private def extractScalarInitialValue (varTyp : AST.Typ) (e : AST.Exp) : Option InitialValue :=
   match varTyp with
   | .Double =>
       match extractDoubleConst e with
@@ -139,6 +139,52 @@ private def extractInitialValue (varTyp : AST.Typ) (e : AST.Exp) : Option Initia
       match extractConst e with
       | some n => some (.Initial n)
       | none   => none
+
+/-- Return the zero-valued `InitialValue` for any type (scalar or array).
+    For arrays, recursively creates an `ArrayInitial` so that nested partial
+    initializers are correctly zero-padded all the way down.
+    C §6.7.9p10: unlisted sub-aggregate elements are zero-initialized as if
+    they had static storage duration. -/
+private def zeroInitialValue : AST.Typ → InitialValue
+  | .Double    => .DoubleInitial 0.0
+  | .Array e n => .ArrayInitial (List.replicate n (zeroInitialValue e))
+  | _          => .Initial 0  -- all integer/pointer/Long/ULong/Int/UInt types
+
+/-- Extract an `InitialValue` from an `Initializer` for a static variable.
+    Handles both scalar `SingleInit` and array `CompoundInit`.
+    Missing array elements are zero-initialized.
+    Returns `none` if any element is not a constant expression. -/
+private def extractInitialValue (varTyp : AST.Typ) : AST.Initializer → Option InitialValue
+  | .SingleInit e =>
+      -- Chapter 15: array types cannot be initialized with a scalar expression.
+      -- Return `none` so the caller throws a meaningful error.
+      match varTyp with
+      | .Array _ _ => none
+      | _ => extractScalarInitialValue varTyp e
+  | .CompoundInit inits =>
+      match varTyp with
+      | .Array elemTyp size =>
+          -- Build an InitialValue per element; missing elements are zero
+          let rec extractElems (remaining : List AST.Initializer) (idx : Nat)
+              : Option (List InitialValue) :=
+            -- If we've filled all array slots but there are extra initializers, that's an error.
+            -- Return `none` to signal failure (caller will produce an appropriate error message).
+            if idx >= size then
+              if remaining.isEmpty then some [] else none
+            else
+              let elemInit := remaining.head?
+              let ivOpt : Option InitialValue := match elemInit with
+                | none    => some (zeroInitialValue elemTyp)  -- zero-pad
+                | some ei => extractInitialValue elemTyp ei
+              match ivOpt with
+              | none    => none  -- non-constant element
+              | some iv => match extractElems (remaining.tail) (idx + 1) with
+                  | none     => none
+                  | some rest => some (iv :: rest)
+          match extractElems inits 0 with
+          | some ivs => some (.ArrayInitial ivs)
+          | none     => none
+      | _ => none  -- compound init for non-array type is a type error (caught in TypeCheck)
 
 -- ---------------------------------------------------------------------------
 -- File-scope variable declaration processing
@@ -177,23 +223,21 @@ private def processFileScopeVar (decl : AST.Declaration) : VarM2 String := do
           if existingType != .Obj varType then
             throw s!"Variable '{name}' declared with conflicting types"
           match decl.init, init with
-          | some e, .Initial _ | some e, .DoubleInitial _ =>
-              match extractInitialValue varType e with
-              | some _ => throw s!"Variable '{name}' has conflicting definitions"
-              | none   => throw s!"Variable '{name}' has conflicting definitions"
-          | some e, _ =>
-              match extractInitialValue varType e with
+          | some _, .Initial _ | some _, .DoubleInitial _ | some _, .ArrayInitial _ =>
+              throw s!"Variable '{name}' has conflicting definitions"
+          | some i, _ =>
+              match extractInitialValue varType i with
               | some iv =>
                   addSym name { type := .Obj varType, attrs := .Static iv false }
               | none => throw s!"Initializer for static variable '{name}' must be a constant"
-          | none, .Initial _ | none, .DoubleInitial _ =>
+          | none, .Initial _ | none, .DoubleInitial _ | none, .ArrayInitial _ =>
               pure ()
           | none, _ =>
               pure ()
       | _ =>
           match decl.init with
-          | some e =>
-              match extractInitialValue varType e with
+          | some i =>
+              match extractInitialValue varType i with
               | some iv =>
                   addSym name { type := .Obj varType, attrs := .Static iv false }
               | none => throw s!"Initializer for file-scope static variable '{name}' must be a constant"
@@ -211,10 +255,10 @@ private def processFileScopeVar (decl : AST.Declaration) : VarM2 String := do
           if existingType != .Obj varType then
             throw s!"Variable '{name}' declared with conflicting types"
           match decl.init, init with
-          | some _, .Initial _ | some _, .DoubleInitial _ =>
+          | some _, .Initial _ | some _, .DoubleInitial _ | some _, .ArrayInitial _ =>
               throw s!"Variable '{name}' has conflicting definitions"
-          | some e, _ =>
-              match extractInitialValue varType e with
+          | some i, _ =>
+              match extractInitialValue varType i with
               | some iv =>
                   addSym name { type := .Obj varType, attrs := .Static iv true }
               | none => throw s!"Initializer for file-scope variable '{name}' must be a constant"
@@ -224,8 +268,8 @@ private def processFileScopeVar (decl : AST.Declaration) : VarM2 String := do
               pure ()
       | _ =>
           match decl.init with
-          | some e =>
-              match extractInitialValue varType e with
+          | some i =>
+              match extractInitialValue varType i with
               | some iv =>
                   addSym name { type := .Obj varType, attrs := .Static iv true }
               | none => throw s!"Initializer for file-scope variable '{name}' must be a constant"
@@ -286,6 +330,7 @@ private def resolveExp (identMap : IdentMap) : AST.Exp → VarM2 AST.Exp
       match left with
       | .Var _         => pure ()
       | .Dereference _ => pure ()   -- Chapter 14: dereference is a valid lvalue
+      | .Subscript _ _ => pure ()   -- Chapter 15: subscript is a valid lvalue
       | _              => throw "Invalid lvalue in assignment"
       return .Assignment (← resolveExp identMap left) (← resolveExp identMap right)
   | .Conditional cond e1 e2 =>
@@ -297,16 +342,21 @@ private def resolveExp (identMap : IdentMap) : AST.Exp → VarM2 AST.Exp
       match e' with
       | .Var _         => return .PostfixIncr e'
       | .Dereference _ => return .PostfixIncr e'   -- Chapter 14: (*p)++
+      | .Subscript _ _ => return .PostfixIncr e'   -- Chapter 15: a[i]++
       | _              => throw "Invalid lvalue in postfix increment"
   | .PostfixDecr e  => do
       let e' ← resolveExp identMap e
       match e' with
       | .Var _         => return .PostfixDecr e'
       | .Dereference _ => return .PostfixDecr e'   -- Chapter 14: (*p)--
+      | .Subscript _ _ => return .PostfixDecr e'   -- Chapter 15: a[i]--
       | _              => throw "Invalid lvalue in postfix decrement"
   -- Chapter 14: address-of and dereference
   | .AddrOf e      => return .AddrOf      (← resolveExp identMap e)
   | .Dereference e => return .Dereference (← resolveExp identMap e)
+  -- Chapter 15: array subscript — both sides resolved; subscript is an lvalue
+  | .Subscript arr idx =>
+      return .Subscript (← resolveExp identMap arr) (← resolveExp identMap idx)
   | .FunCall f args => do
       match lookupIdent identMap f with
       | none => throw s!"Undeclared function '{f}'"
@@ -316,6 +366,16 @@ private def resolveExp (identMap : IdentMap) : AST.Exp → VarM2 AST.Exp
             throw s!"Wrong number of arguments for '{f}': expected {paramCount}, got {args.length}"
           let args' ← args.mapM (resolveExp identMap)
           return .FunCall f args'
+
+-- ---------------------------------------------------------------------------
+-- Initializer resolution (must come after resolveExp)
+-- ---------------------------------------------------------------------------
+
+/-- Rename all variables in an initializer according to `identMap`.
+    Chapter 15: recurses into `CompoundInit` lists for array initializers. -/
+private def resolveInitializer (identMap : IdentMap) : AST.Initializer → VarM2 AST.Initializer
+  | .SingleInit e    => return .SingleInit (← resolveExp identMap e)
+  | .CompoundInit is => return .CompoundInit (← is.mapM (resolveInitializer identMap))
 
 -- ---------------------------------------------------------------------------
 -- Statement and block-item resolution (mutually recursive)
@@ -331,7 +391,8 @@ private partial def resolveForInit (identMap : IdentMap) : AST.ForInit → VarM2
       if decl.storageClass.isSome then
         throw s!"Storage class specifier in for-loop initializer for '{decl.name}'"
       let (identMap', renamed) ← declareLocalVar identMap decl.name decl.typ
-      let init' ← decl.init.mapM (resolveExp identMap')
+      -- Chapter 15: resolve initializer (SingleInit or CompoundInit)
+      let init' ← decl.init.mapM (resolveInitializer identMap')
       return (.InitDecl { decl with name := renamed, init := init', storageClass := none }, identMap')
 
 private partial def resolveStatement (identMap : IdentMap) : AST.Statement → VarM2 AST.Statement
@@ -381,7 +442,7 @@ private partial def resolveBlockItem (identMap : IdentMap) : AST.BlockItem → V
       match decl.storageClass with
       | some .Extern => do
           if decl.init.isSome then
-            throw s!"Variable '{decl.name}' declared extern with an initializer"
+            throw s!"Variable '{decl.name}' declared extern with an initializer at block scope"
           match lookupIdent identMap decl.name with
           | some { fromCurrent := true, hasLinkage := false, .. } =>
               throw s!"extern declaration of '{decl.name}' follows a local variable in the same scope"
@@ -408,9 +469,9 @@ private partial def resolveBlockItem (identMap : IdentMap) : AST.BlockItem → V
           let initVal : InitialValue ← do
             match decl.init with
             | none   => pure .Tentative
-            | some e =>
-                -- Chapter 13: use extractInitialValue to support both integer and double constants
-                match extractInitialValue decl.typ e with
+            | some i =>
+                -- Chapter 13/15: use extractInitialValue to support int, double, and array constants
+                match extractInitialValue decl.typ i with
                 | some iv => pure iv
                 | none    => throw s!"Initializer for static variable '{decl.name}' must be a constant"
           let renamed ← makeUnique decl.name
@@ -420,7 +481,8 @@ private partial def resolveBlockItem (identMap : IdentMap) : AST.BlockItem → V
           return (identMap', .D { decl with name := renamed, init := none })
       | none => do
           let (identMap', renamed) ← declareLocalVar identMap decl.name decl.typ
-          let init' ← decl.init.mapM (resolveExp identMap')
+          -- Chapter 15: resolve initializer (may be SingleInit or CompoundInit)
+          let init' ← decl.init.mapM (resolveInitializer identMap')
           return (identMap', .D { name := renamed, typ := decl.typ, init := init', storageClass := none })
   | .FD funDecl => do
       if funDecl.storageClass == some .Static then
@@ -521,7 +583,8 @@ private def resolveTopLevel (identMap : IdentMap) : AST.TopLevel → VarM2 (Iden
           identMap.map fun (n, e) => if n == decl.name then (n, { e with fromCurrent := true }) else (n, e)
         else
           (decl.name, entry) :: identMap
-      let init' ← decl.init.mapM (resolveExp identMap')
+      -- Chapter 15: resolve initializer (SingleInit or CompoundInit)
+      let init' ← decl.init.mapM (resolveInitializer identMap')
       return (identMap', .VarDecl { decl with init := init' })
   | .FunDecl fd => do
       liftM (checkUniqueParams fd.params)

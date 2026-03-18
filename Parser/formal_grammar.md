@@ -1,6 +1,6 @@
-# Formal Grammar — Chapter 14
+# Formal Grammar — Chapter 15
 
-Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Chapter 14.
+Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Chapter 15.
 
 ```
 <program>     ::= { <declaration> }
@@ -11,7 +11,10 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 <function-declaration> ::= <decl-spec>+ <declarator> "(" <param-list> ")" ( ";" | <block> )
                          | <decl-spec>+ <fun-declarator> ( ";" | <block> )
 
-<variable-declaration> ::= <decl-spec>+ <var-declarator> [ "=" <exp> ] ";"
+<variable-declaration> ::= <decl-spec>+ <var-declarator> [ "=" <initializer> ] ";"
+
+<initializer>  ::= <exp>                                        (scalar initializer)
+               | "{" <initializer> { "," <initializer> } [","] "}"  (Chapter 15: compound initializer)
 
 <decl-spec>     ::= <type-spec> | <storage-class>
 
@@ -22,8 +25,8 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 <storage-class> ::= "static" | "extern"
 
 <declarator>    ::= "*" <declarator>                   (Chapter 14: pointer declarator)
-                  | "(" <declarator> ")"               (Chapter 14: parenthesized declarator)
-                  | <identifier>
+                  | "(" <declarator> ")" { "[" <int-const> "]" }  (Chapter 15: array dims after paren group)
+                  | <identifier> { "[" <int-const> "]" }  (Chapter 15: array declarator)
 
 <var-declarator>  ::= <declarator>
                     (same as <declarator> but may not contain inline function params)
@@ -34,15 +37,19 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
                     | "(" <declarator> ")" "(" <param-list> ")"  (params follow paren group)
 
 <abstract-declarator> ::= "*" <abstract-declarator>?  (Chapter 14: pointer abstract decl)
-                         | "(" <abstract-declarator> ")"  (parenthesized abstract decl)
+                         | "(" <abstract-declarator> ")" { "[" <int-const> "]" }  (Chapter 15: array dims after paren)
+                         | { "[" <int-const> "]" }+   (Chapter 15: array abstract decl, one or more dims)
                          | ε                           (empty — no identifier)
-                  (Used in cast expressions, e.g. `(unsigned long (*))` → Pointer(ULong))
+                  (Used in cast expressions, e.g. `(unsigned long (*))` → Pointer(ULong),
+                   `(int (*)[3])` → Pointer(Array(Int,3)))
 
 <param-list>  ::= "void"
                 | <param> { "," <param> }
                   (Note: storage-class specifiers are NOT allowed in parameter types)
 
 <param>       ::= <type-spec>+ <declarator>            (Chapter 14: typed + declarator)
+                  (Chapter 15: outermost array dimension in parameter type is adjusted to pointer,
+                   e.g. `int arr[4]` becomes `int *arr` as a parameter)
 
 <block>       ::= "{" { <block-item> } "}"
 
@@ -71,6 +78,7 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
                 | <exp> <binop> <exp>
                 | <exp> "?" <exp> ":" <exp>
                 | <exp> <assign-op> <exp>
+                | <exp> "[" <exp> "]"                  (Chapter 15: subscript, e.g. arr[i])
 
 <factor>      ::= <int>
                 | <long>                               (Chapter 11: long constant, e.g. 100l)
@@ -115,6 +123,48 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 - Symbols wrapped in `? question marks ?` are terminals whose values vary.
 - `{ x }` denotes zero or more repetitions of `x`.
 - `[ x ]` denotes zero or one occurrence of `x` (optional).
+
+## Chapter 15 Changes
+
+- **`Array` type**: `int arr[4]`, `double mat[3][3]`, `int *ptrs[2]` etc. are now valid types.
+  An array type is written with one or more `[N]` dimension suffixes after the declarator name
+  (or after a parenthesized declarator for pointer-to-array types like `int (*p)[3]`).
+  Array types are **not** scalar: they cannot appear in casts, cannot be negated, compared, etc.
+- **Array size**: each dimension `N` must be a positive integer constant (no zero-length arrays).
+  Multi-dimensional arrays are arrays of arrays (row-major), e.g. `int a[2][3]` has type
+  `Array(Array(Int, 3), 2)`.
+- **Array alignment**: arrays of 16 or more bytes are 16-byte aligned (System V ABI); smaller
+  arrays use the alignment of their element type.
+- **Compound initializers**: `{ expr, expr, ... }` initializes an array element-by-element.
+  - Nested `{ ... }` initializes sub-arrays (multi-dimensional).
+  - If fewer initializers are provided than elements, the remaining elements are zero-initialized.
+  - A trailing comma after the last element is allowed.
+- **Subscript operator** `arr[i]`: added to `<exp>` at the same precedence level as postfix
+  `++`/`--` (tightest binding among binary-like operators).  Desugared to `*(arr + i)` during
+  type-checking: the pointer `arr + i` is computed via `AddPtr`, then dereferenced.
+- **Array-to-pointer decay**: in any expression context that expects a pointer (including
+  subscript, function call arguments, assignment to pointer, and binary `+`/`-`), an array
+  expression is automatically converted to a pointer to its first element.  This conversion is
+  performed by the type-checking pass and is represented as a `Cast(Pointer(elemTyp), arrExpr)`.
+  - Exception: the operand of `&` (address-of) does **not** decay — `&arr` yields a pointer to
+    the whole array.
+  - Exception: the initializer of an array variable does **not** decay — compound initializers
+    are handled directly.
+- **Array parameters**: the outermost array dimension in a parameter declaration is adjusted to a
+  pointer by the parser, e.g. `int arr[4]` becomes `int *arr` as a parameter type (C §6.7.6.3p7).
+  Inner dimensions (for multi-dimensional array parameters) are preserved.
+- **`GetAddress` for arrays**: `Cast(Pointer, Array)` — an explicit cast of an array to a pointer
+  type — emits `GetAddress` (the address of the array's first element), not `Copy`.
+- **Pointer arithmetic on arrays**: `arr + i` uses `AddPtr` with `scale = sizeof(elemTyp)`, and
+  `ptr++`/`ptr--` on a pointer-to-array advances by `sizeof(*ptr)` bytes (not 1).
+- **Static array initialization**: for static variables, uninitialized elements use
+  `Initial(0)` / `DoubleInitial(0.0)` / `ArrayInitial(...)` recursively, so that the emitter
+  can lay out the correct bytes.
+- **`extern` arrays with no definition**: variables with `NoInitializer` attribute are skipped
+  entirely in the static-variable emission pass (no `.zero N` is emitted for extern-only decls).
+- **Local array stack layout**: arrays are placed on the stack in `PseudoReplace` using a
+  two-step alignment: first align `maxBytes` up to `elemAlign`, then add `totalBytes`, then align
+  the result up to `elemAlign` again so the base address (lowest byte) is also `elemAlign`-aligned.
 
 ## Chapter 14 Changes
 

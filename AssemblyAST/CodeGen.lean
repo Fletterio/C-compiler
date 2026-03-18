@@ -590,6 +590,42 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
       else
         ([.Mov .Quadword (convertVal ptr) (.Reg .R11),
           .Mov srcT (convertVal src) (.Memory .R11 0)], ctr)
+  -- Chapter 15: pointer arithmetic -----------------------------------------------
+  | .AddPtr ptr idx scale dst =>
+      -- dst = ptr + idx * scale.  Lowers to:
+      --   1. movq ptr, R11                     — load pointer into scratch reg
+      --   2. movslq idx, R9 (or movq idx, R9)  — sign-extend/copy index to 64-bit
+      --   3a. leaq (R11, R9, scale), dst        — if scale ∈ {1,2,4,8} (x86 addressing)
+      --   3b. imulq $scale, R9; leaq (R11,R9,1) — otherwise (multi-dimensional arrays with
+      --                                            element sizes like 12, 16, 20, 24, …)
+      -- x86 `leaq (base, idx, scale)` only supports scale ∈ {1, 2, 4, 8}.
+      -- For larger or non-power-of-2 scales (e.g. `int a[N][3]` → scale = 12),
+      -- we multiply the index by the scale first using imulq, then use scale=1.
+      let idxT := valAsmType bst idx
+      let extendIdx : List Instruction :=
+        if idxT == .Longword then
+          [.Movsx (convertVal idx) (.Reg .R9)]    -- sign-extend 32-bit → 64-bit
+        else
+          [.Mov .Quadword (convertVal idx) (.Reg .R9)]  -- copy 64-bit directly
+      let scaleInstrs : List Instruction :=
+        if scale == 1 || scale == 2 || scale == 4 || scale == 8 then
+          -- Valid leaq scale: use (base, idx, scale) addressing directly
+          [.Lea (.Indexed .R11 .R9 scale) (convertVal dst)]
+        else
+          -- Scale not encodable in leaq: multiply first, then use scale=1
+          [.Binary .Quadword .Mult (.Imm scale) (.Reg .R9),
+           .Lea (.Indexed .R11 .R9 1) (convertVal dst)]
+      ([.Mov .Quadword (convertVal ptr) (.Reg .R11)] ++
+       extendIdx ++
+       scaleInstrs, ctr)
+  | .CopyToOffset src dstName offset =>
+      -- Copy scalar `src` to byte offset `offset` within array variable `dstName`.
+      -- PseudoReplace converts PseudoMem(dstName, offset) to Memory(BP, base + offset).
+      let srcT := valAsmType bst src
+      if srcT == .Double then
+        ([.Movsd (convertVal src) (.PseudoMem dstName offset)], ctr)
+      else
+        ([.Mov srcT (convertVal src) (.PseudoMem dstName offset)], ctr)
 
 /-- Convert a TACKY function definition to assembly, threading the global label
     counter so that ULong↔Double branch labels are unique across all functions
@@ -608,16 +644,28 @@ private def convertFunctionDef (f : Tacky.FunctionDef) (bst : BackendSymTable) (
      stackSize    := 0 },
    finalCtr)
 
-/-- Convert a typed TACKY StaticVariable to an assembly StaticVariable.
-    Chapter 13: handles `ConstDouble` init. -/
-private def convertStaticVar (name : String) (global : Bool) (typ : AST.Typ) (init : AST.Const)
-    : AsmTopLevel :=
-  match init with
-  | .ConstInt n    => .StaticVariable name global 4 (.IntInit n)
-  | .ConstLong n   => .StaticVariable name global 8 (.LongInit n)
-  | .ConstUInt n   => .StaticVariable name global 4 (.UIntInit n)
-  | .ConstULong n  => .StaticVariable name global 8 (.ULongInit n)
-  | .ConstDouble f => .StaticVariable name global 8 (.DoubleInit f)
+/-- Chapter 15: convert one `Tacky.StaticInit` element to its `AssemblyAST.StaticInit`.
+    The two types are structurally identical except for the namespace. -/
+private def convertStaticInit : Tacky.StaticInit → StaticInit
+  | .IntInit n    => .IntInit n
+  | .LongInit n   => .LongInit n
+  | .UIntInit n   => .UIntInit n
+  | .ULongInit n  => .ULongInit n
+  | .DoubleInit f => .DoubleInit f
+  | .ZeroInit n   => .ZeroInit n
+
+/-- Convert a TACKY StaticVariable (with a `List StaticInit`) to an assembly
+    StaticVariable.  Determines alignment from the AST type. -/
+private def convertStaticVar (name : String) (global : Bool) (typ : AST.Typ)
+    (inits : List Tacky.StaticInit) : AsmTopLevel :=
+  -- Alignment: Int/UInt → 4; everything else → 8; Array → element alignment
+  let alignment : Nat := match typ with
+    | .Int  | .UInt  => 4
+    | .Array elem n  =>
+        if elem.sizeOf * n < 16 then elem.alignOf else 16
+    | _              => 8
+  let asmInits := inits.map convertStaticInit
+  .StaticVariable name global alignment asmInits
 
 /-- Entry point for pass 1: TACKY → Assembly AST with pseudoregisters.
     The label counter is threaded across all functions so that every
@@ -629,8 +677,8 @@ def genProgram (p : Tacky.Program) (bst : BackendSymTable) : Program :=
     | .Function fd =>
         let (asmFd, ctr') := convertFunctionDef fd bst ctr
         (tls ++ [AsmTopLevel.Function asmFd], ctr')
-    | .StaticVariable n g t i =>
-        (tls ++ [convertStaticVar n g t i], ctr))
+    | .StaticVariable n g t inits =>
+        (tls ++ [convertStaticVar n g t inits], ctr))
     ([], 0)
   { topLevels }
 

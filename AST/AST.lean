@@ -94,21 +94,46 @@ namespace AST
     int         →  Int
 -/
 
-/-- The types supported through Chapter 14.
-    `Int`       is a 32-bit signed integer      (C `int`).
-    `Long`      is a 64-bit signed integer      (C `long`).
-    `UInt`      is a 32-bit unsigned integer    (C `unsigned int`).
-    `ULong`     is a 64-bit unsigned integer    (C `unsigned long`).
-    `Double`    is a 64-bit IEEE 754 float      (C `double`).
-    `Pointer t` is an 8-byte pointer to a value of type `t` (Chapter 14). -/
+/-- The types supported through Chapter 15.
+    `Int`          is a 32-bit signed integer      (C `int`).
+    `Long`         is a 64-bit signed integer      (C `long`).
+    `UInt`         is a 32-bit unsigned integer    (C `unsigned int`).
+    `ULong`        is a 64-bit unsigned integer    (C `unsigned long`).
+    `Double`       is a 64-bit IEEE 754 float      (C `double`).
+    `Pointer t`    is an 8-byte pointer to `t`     (Chapter 14).
+    `Array t n`    is a fixed-size array of `n` elements of type `t` (Chapter 15). -/
 inductive Typ where
-  | Int     : Typ        -- 32-bit signed integer
-  | Long    : Typ        -- 64-bit signed integer
-  | UInt    : Typ        -- 32-bit unsigned integer   (Chapter 12)
-  | ULong   : Typ        -- 64-bit unsigned integer   (Chapter 12)
-  | Double  : Typ        -- 64-bit floating-point     (Chapter 13)
-  | Pointer : Typ → Typ  -- 8-byte pointer to t       (Chapter 14)
+  | Int     : Typ              -- 32-bit signed integer
+  | Long    : Typ              -- 64-bit signed integer
+  | UInt    : Typ              -- 32-bit unsigned integer   (Chapter 12)
+  | ULong   : Typ              -- 64-bit unsigned integer   (Chapter 12)
+  | Double  : Typ              -- 64-bit floating-point     (Chapter 13)
+  | Pointer : Typ → Typ        -- 8-byte pointer to t       (Chapter 14)
+  | Array   : Typ → Nat → Typ  -- fixed-size array of n elements  (Chapter 15)
   deriving Repr, BEq
+
+/-- Return the size in bytes of a type. -/
+def Typ.sizeOf : Typ → Nat
+  | .Int      => 4
+  | .Long     => 8
+  | .UInt     => 4
+  | .ULong    => 8
+  | .Double   => 8
+  | .Pointer _ => 8
+  | .Array elem n => elem.sizeOf * n
+
+/-- Return the alignment in bytes of a type.
+    Arrays: same as element alignment if total size < 16 bytes, else 16 (ABI). -/
+def Typ.alignOf : Typ → Nat
+  | .Int      => 4
+  | .Long     => 8
+  | .UInt     => 4
+  | .ULong    => 8
+  | .Double   => 8
+  | .Pointer _ => 8
+  | .Array elem n =>
+      let total := elem.sizeOf * n
+      if total < 16 then elem.alignOf else 16
 
 /-- A typed constant.
     `ConstInt(n)`:    value fits in (or is explicitly typed as) 32-bit `int`.
@@ -166,7 +191,8 @@ inductive BinaryOp where
 /-- Expressions in the C subset.
     Chapter 11 adds `Cast` for explicit/implicit type conversions, and changes
     `Constant` to carry a typed `Const` instead of a raw `Int`.
-    Chapter 14 adds `AddrOf` (&) and `Dereference` (*). -/
+    Chapter 14 adds `AddrOf` (&) and `Dereference` (*).
+    Chapter 15 adds `Subscript` for array indexing (a[i]). -/
 inductive Exp where
   | Constant    : Const → Exp             -- Chapter 11: typed constant
   | Var         : String → Exp            -- variable reference
@@ -180,15 +206,26 @@ inductive Exp where
   | FunCall     : String → List Exp → Exp -- Chapter 9: foo(a, b, c)
   | AddrOf      : Exp → Exp               -- Chapter 14: &e (take address)
   | Dereference : Exp → Exp               -- Chapter 14: *e (dereference pointer)
+  | Subscript   : Exp → Exp → Exp         -- Chapter 15: a[i] (array subscript)
   deriving Repr, BEq
 
-/-- A variable declaration with an optional initializer expression.
+/-- An initializer for a variable declaration.
+    Chapter 15: compound initializers `{ e1, e2, ... }` for arrays.
+    Scalar variables use `SingleInit`; arrays use `CompoundInit`. -/
+inductive Initializer where
+  | SingleInit   : Exp → Initializer             -- scalar: = expr
+  | CompoundInit : List Initializer → Initializer -- aggregate: = { ... }
+  deriving Repr, BEq
+
+/-- A variable declaration with an optional initializer.
     Chapter 10 adds an optional storage-class specifier.
-    Chapter 11 adds `typ` for the declared type of the variable. -/
+    Chapter 11 adds `typ` for the declared type of the variable.
+    Chapter 15: `init` is now `Option Initializer` to support compound initializers
+    (e.g. `int arr[3] = {1, 2, 3}`). Scalar declarations use `SingleInit`. -/
 structure Declaration where
   name         : String
   typ          : Typ := .Int               -- Chapter 11: variable type (default int)
-  init         : Option Exp
+  init         : Option Initializer        -- Chapter 15: may be SingleInit or CompoundInit
   storageClass : Option StorageClass := none
   deriving Repr, BEq
 

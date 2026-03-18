@@ -47,9 +47,10 @@ private def roundUp16 (n : Int) : Int :=
   ((n + 15) / 16) * 16
 
 private def isMem : Operand → Bool
-  | .Memory _ _ => true   -- Chapter 14: Memory(BP,n) and Memory(Rx,0) are both "memory"
-  | .Data _     => true
-  | _           => false
+  | .Memory _ _     => true   -- Chapter 14: Memory(BP,n) and Memory(Rx,0) are both "memory"
+  | .Data _         => true
+  | .Indexed _ _ _  => true   -- Chapter 15: scaled-index addressing is a memory operand
+  | _               => false
 
 /-- True if `n` fits in a signed 32-bit integer. -/
 private def fitsInInt32 (n : Int) : Bool :=

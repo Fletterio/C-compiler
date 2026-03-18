@@ -120,9 +120,10 @@ private def emitRegXmm : Reg → String
     For `Double`, use XMM names (should only reach this via emitRegForType). -/
 private def emitRegForType (t : AsmType) (r : Reg) : String :=
   match t with
-  | .Longword => emitReg4 r
-  | .Quadword => emitReg8 r
-  | .Double   => emitRegXmm r
+  | .Longword      => emitReg4 r
+  | .Quadword      => emitReg8 r
+  | .Double        => emitRegXmm r
+  | .ByteArray _ _ => panic! "ByteArray AsmType cannot appear in register emission"
 
 -- ---------------------------------------------------------------------------
 -- Operand emission
@@ -130,39 +131,49 @@ private def emitRegForType (t : AsmType) (r : Reg) : String :=
 
 /-- Emit an operand using 32-bit register names (for Longword instructions).
     Chapter 14: `Memory(r, offset)` emits `offset(%r64)` — the address register
-    is always 64-bit even for 32-bit data operations. -/
+    is always 64-bit even for 32-bit data operations.
+    Chapter 15: `Indexed(base, idx, scale)` emits `(%base64, %idx64, scale)`. -/
 private def emitOperand : Operand → String
-  | .Imm n       => s!"${n}"
-  | .Reg r       => emitReg4 r
-  | .Memory r n  => s!"{n}({emitReg8 r})"   -- Chapter 14: offset(reg64)
-  | .Data nm     => s!"{nm}(%rip)"
-  | .Pseudo _    => panic! "Pseudo operand reached emission stage"
+  | .Imm n              => s!"${n}"
+  | .Reg r              => emitReg4 r
+  | .Memory r n         => s!"{n}({emitReg8 r})"
+  | .Data nm            => s!"{nm}(%rip)"
+  | .Indexed b i s      => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
+  | .Pseudo _           => panic! "Pseudo operand reached emission stage"
+  | .PseudoMem _ _      => panic! "PseudoMem operand reached emission stage"
 
-/-- Emit an operand using 64-bit register names (for Quadword instructions and pushq). -/
+/-- Emit an operand using 64-bit register names (for Quadword instructions and pushq).
+    Chapter 15: `Indexed` emits the same `(base, idx, scale)` form. -/
 private def emitOperand8 : Operand → String
-  | .Imm n       => s!"${n}"
-  | .Reg r       => emitReg8 r
-  | .Memory r n  => s!"{n}({emitReg8 r})"   -- Chapter 14: offset(reg64)
-  | .Data nm     => s!"{nm}(%rip)"
-  | .Pseudo _    => panic! "Pseudo operand reached emission stage"
+  | .Imm n              => s!"${n}"
+  | .Reg r              => emitReg8 r
+  | .Memory r n         => s!"{n}({emitReg8 r})"
+  | .Data nm            => s!"{nm}(%rip)"
+  | .Indexed b i s      => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
+  | .Pseudo _           => panic! "Pseudo operand reached emission stage"
+  | .PseudoMem _ _      => panic! "PseudoMem operand reached emission stage"
 
 /-- Chapter 13: emit an operand for SSE instructions.
     XMM registers use `%xmmN`; memory uses the standard form.
-    Chapter 14: `Memory(r, offset)` emits `offset(%r64)`. -/
+    Chapter 14: `Memory(r, offset)` emits `offset(%r64)`.
+    Chapter 15: `Indexed` emits `(base, idx, scale)` (same as integer form). -/
 private def emitXmmOperand : Operand → String
-  | .Reg r       => emitRegXmm r
-  | .Memory r n  => s!"{n}({emitReg8 r})"   -- Chapter 14: offset(reg64)
-  | .Data nm     => s!"{nm}(%rip)"
-  | .Imm _       => panic! "Immediate cannot appear in XMM operand position"
-  | .Pseudo _    => panic! "Pseudo operand reached emission stage"
+  | .Reg r              => emitRegXmm r
+  | .Memory r n         => s!"{n}({emitReg8 r})"
+  | .Data nm            => s!"{nm}(%rip)"
+  | .Indexed b i s      => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
+  | .Imm _              => panic! "Immediate cannot appear in XMM operand position"
+  | .Pseudo _           => panic! "Pseudo operand reached emission stage"
+  | .PseudoMem _ _      => panic! "PseudoMem operand reached emission stage"
 
 /-- Emit an operand using the register size appropriate for the given `AsmType`.
     Chapter 13: `.Double` maps to `emitXmmOperand` (XMM registers / memory). -/
 private def emitOperandForType (t : AsmType) : Operand → String :=
   match t with
-  | .Longword => emitOperand
-  | .Quadword => emitOperand8
-  | .Double   => emitXmmOperand
+  | .Longword      => emitOperand
+  | .Quadword      => emitOperand8
+  | .Double        => emitXmmOperand
+  | .ByteArray _ _ => panic! "ByteArray AsmType cannot appear as instruction operand type"
 
 /-- Emit a shift count: `Reg(CX)` → `%cl`, others use the 32-bit form. -/
 private def emitShiftCount : Operand → String
@@ -171,11 +182,13 @@ private def emitShiftCount : Operand → String
 
 /-- Emit a byte-sized operand for `set<cc>` instructions. -/
 private def emitByteOperand : Operand → String
-  | .Reg r       => emitReg1 r
-  | .Memory r n  => s!"{n}({emitReg8 r})"   -- Chapter 14
-  | .Data nm     => s!"{nm}(%rip)"
-  | .Imm n       => s!"${n}"
-  | .Pseudo _    => panic! "Pseudo operand reached emission stage"
+  | .Reg r          => emitReg1 r
+  | .Memory r n     => s!"{n}({emitReg8 r})"            -- Chapter 14
+  | .Data nm        => s!"{nm}(%rip)"
+  | .Imm n          => s!"${n}"
+  | .Indexed b i s  => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
+  | .Pseudo _       => panic! "Pseudo operand reached emission stage"
+  | .PseudoMem _ _  => panic! "PseudoMem operand reached emission stage"
 
 /-- Emit a condition code suffix for `j<cc>` and `set<cc>`. -/
 private def emitCondCode : CondCode → String
@@ -197,97 +210,98 @@ private def emitCondCode : CondCode → String
 -- Instruction emission
 -- ---------------------------------------------------------------------------
 
-/-- Emit a single assembly instruction as an indented string.
-    `localDefs` is the list of locally-defined function names, used to decide
-    whether to append `@PLT` to external `call` instructions. -/
-private def emitInstruction (localDefs : List String) : Instruction → String
-  -- Chapter 13: Movsd (scalar double move)
-  | .Movsd src dst =>
-      s!"    movsd {emitXmmOperand src}, {emitXmmOperand dst}"
-  -- Typed Mov: movl / movq (Double uses Movsd, not Mov)
-  | .Mov .Longword src dst =>
-      s!"    movl {emitOperand src}, {emitOperand dst}"
-  | .Mov .Quadword src dst =>
-      s!"    movq {emitOperand8 src}, {emitOperand8 dst}"
-  | .Mov .Double _ _ =>
-      panic! "Mov with Double asm type is invalid; use Movsd instead"
-  -- Movsx: sign-extend 32-bit int to 64-bit long (movslq)
-  | .Movsx src dst =>
-      s!"    movslq {emitOperand src}, {emitOperand8 dst}"
-  -- MovZeroExtend: zero-extend 32-bit uint to 64-bit (Chapter 12)
-  -- On x86-64, writing to a 32-bit register name zeros the upper 32 bits.
-  -- FixUp ensures dst is always a register here (memory dst was replaced in FixUp).
-  | .MovZeroExtend src dst =>
-      s!"    movl {emitOperand src}, {emitOperand dst}"
-  -- Typed Unary (Double negation uses Xorpd, not Unary)
-  | .Unary .Longword .Neg dst => s!"    negl {emitOperand dst}"
-  | .Unary .Quadword .Neg dst => s!"    negq {emitOperand8 dst}"
-  | .Unary .Longword .Not dst => s!"    notl {emitOperand dst}"
-  | .Unary .Quadword .Not dst => s!"    notq {emitOperand8 dst}"
-  | .Unary .Double _ _ => panic! "Unary with Double asm type is invalid; use Xorpd instead"
-  -- Chapter 13: Double Binary operations (SSE2 scalar-double arithmetic)
-  | .Binary .Double .Add       src dst => s!"    addsd {emitXmmOperand src}, {emitXmmOperand dst}"
-  | .Binary .Double .Sub       src dst => s!"    subsd {emitXmmOperand src}, {emitXmmOperand dst}"
-  | .Binary .Double .Mult      src dst => s!"    mulsd {emitXmmOperand src}, {emitXmmOperand dst}"
-  | .Binary .Double .DivDouble src dst => s!"    divsd {emitXmmOperand src}, {emitXmmOperand dst}"
-  | .Binary _ .DivDouble _ _  => panic! "DivDouble must be used with Double asm type"
-  -- Chapter 13: Xorpd (double negation via -0.0 XOR)
-  | .Xorpd src dst =>
-      s!"    xorpd {emitXmmOperand src}, {emitXmmOperand dst}"
-  -- Chapter 13: Comisd (double comparison; sets ZF/CF)
-  | .Comisd src dst =>
-      s!"    comisd {emitXmmOperand src}, {emitXmmOperand dst}"
-  -- Chapter 13: integer ↔ double conversions
-  -- cvtsi2sd[l/q]: integer (32/64-bit) → double; integer suffix specifies integer size
-  | .Cvtsi2sd .Longword src dst =>
-      s!"    cvtsi2sdl {emitOperand src}, {emitXmmOperand dst}"
-  | .Cvtsi2sd .Quadword src dst =>
-      s!"    cvtsi2sdq {emitOperand8 src}, {emitXmmOperand dst}"
-  | .Cvtsi2sd .Double _ _ =>
-      panic! "Cvtsi2sd with Double asm type is invalid"
-  -- cvttsd2si[l/q]: double → integer (32/64-bit), truncated toward zero
-  | .Cvttsd2si .Longword src dst =>
-      s!"    cvttsd2sil {emitXmmOperand src}, {emitOperand dst}"
-  | .Cvttsd2si .Quadword src dst =>
-      s!"    cvttsd2siq {emitXmmOperand src}, {emitOperand8 dst}"
-  | .Cvttsd2si .Double _ _ =>
-      panic! "Cvttsd2si with Double asm type is invalid"
-  -- Typed Binary (integer)
-  | .Binary t .Add  src dst =>
-      s!"    add{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
-  | .Binary t .Sub  src dst =>
-      s!"    sub{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
-  | .Binary t .Mult src dst =>
-      s!"    imul{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
-  | .Binary t .And  src dst =>
-      s!"    and{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
-  | .Binary t .Or   src dst =>
-      s!"    or{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
-  | .Binary t .Xor  src dst =>
-      s!"    xor{if t == .Longword then "l" else "q"} {emitOperandForType t src}, {emitOperandForType t dst}"
-  | .Binary t .Sal  cnt dst =>
-      s!"    sal{if t == .Longword then "l" else "q"} {emitShiftCount cnt}, {emitOperandForType t dst}"
-  | .Binary t .Sar  cnt dst =>
-      s!"    sar{if t == .Longword then "l" else "q"} {emitShiftCount cnt}, {emitOperandForType t dst}"
-  -- Chapter 12: logical shift right (unsigned)
-  | .Binary t .Shr  cnt dst =>
-      s!"    shr{if t == .Longword then "l" else "q"} {emitShiftCount cnt}, {emitOperandForType t dst}"
-  -- Typed Cmp (Double uses Comisd, not Cmp)
-  | .Cmp .Longword src dst => s!"    cmpl {emitOperand src}, {emitOperand dst}"
-  | .Cmp .Quadword src dst => s!"    cmpq {emitOperand8 src}, {emitOperand8 dst}"
-  | .Cmp .Double _ _       => panic! "Cmp with Double asm type is invalid; use Comisd instead"
-  -- Typed Idiv (signed division; Double uses divsd via Binary)
+-- ---------------------------------------------------------------------------
+-- Instruction emission helpers
+-- Breaking the large match into smaller helpers avoids Lean elaboration timeouts
+-- caused by exhaustiveness checking across too many (Instruction × AsmType) combos.
+-- ---------------------------------------------------------------------------
+
+/-- Emit a type suffix letter: `l` for Longword, `q` for Quadword/Double/other. -/
+private def typeSuffix (t : AsmType) : String :=
+  if t == .Longword then "l" else "q"
+
+/-- Emit Mov-family instructions. -/
+private def emitMovInstr : Instruction → String
+  | .Movsd src dst      => s!"    movsd {emitXmmOperand src}, {emitXmmOperand dst}"
+  | .Mov .Longword s d  => s!"    movl {emitOperand s}, {emitOperand d}"
+  | .Mov .Quadword s d  => s!"    movq {emitOperand8 s}, {emitOperand8 d}"
+  | .Mov _ _ _          => panic! "Mov with non-integer AsmType"
+  | .Movsx s d          => s!"    movslq {emitOperand s}, {emitOperand8 d}"
+  | .MovZeroExtend s d  => s!"    movl {emitOperand s}, {emitOperand d}"
+  | _                   => panic! "emitMovInstr: not a Mov instruction"
+
+/-- Emit Unary instructions. -/
+private def emitUnaryInstr : Instruction → String
+  | .Unary .Longword .Neg d => s!"    negl {emitOperand d}"
+  | .Unary .Quadword .Neg d => s!"    negq {emitOperand8 d}"
+  | .Unary .Longword .Not d => s!"    notl {emitOperand d}"
+  | .Unary .Quadword .Not d => s!"    notq {emitOperand8 d}"
+  | .Unary _ _ _            => panic! "Unary with invalid AsmType"
+  | _                       => panic! "emitUnaryInstr: not a Unary instruction"
+
+/-- Emit Binary instructions (integer and double). -/
+private def emitBinaryInstr : Instruction → String
+  | .Binary .Double .Add       s d => s!"    addsd {emitXmmOperand s}, {emitXmmOperand d}"
+  | .Binary .Double .Sub       s d => s!"    subsd {emitXmmOperand s}, {emitXmmOperand d}"
+  | .Binary .Double .Mult      s d => s!"    mulsd {emitXmmOperand s}, {emitXmmOperand d}"
+  | .Binary .Double .DivDouble s d => s!"    divsd {emitXmmOperand s}, {emitXmmOperand d}"
+  | .Binary _ .DivDouble _ _       => panic! "DivDouble must use Double AsmType"
+  | .Binary t .Add  s d => s!"    add{typeSuffix t} {emitOperandForType t s}, {emitOperandForType t d}"
+  | .Binary t .Sub  s d => s!"    sub{typeSuffix t} {emitOperandForType t s}, {emitOperandForType t d}"
+  | .Binary t .Mult s d => s!"    imul{typeSuffix t} {emitOperandForType t s}, {emitOperandForType t d}"
+  | .Binary t .And  s d => s!"    and{typeSuffix t} {emitOperandForType t s}, {emitOperandForType t d}"
+  | .Binary t .Or   s d => s!"    or{typeSuffix t} {emitOperandForType t s}, {emitOperandForType t d}"
+  | .Binary t .Xor  s d => s!"    xor{typeSuffix t} {emitOperandForType t s}, {emitOperandForType t d}"
+  | .Binary t .Sal  c d => s!"    sal{typeSuffix t} {emitShiftCount c}, {emitOperandForType t d}"
+  | .Binary t .Sar  c d => s!"    sar{typeSuffix t} {emitShiftCount c}, {emitOperandForType t d}"
+  | .Binary t .Shr  c d => s!"    shr{typeSuffix t} {emitShiftCount c}, {emitOperandForType t d}"
+  | _ => panic! "emitBinaryInstr: not a Binary instruction"
+
+/-- Emit double-specific SSE instructions. -/
+private def emitDoubleInstr : Instruction → String
+  | .Xorpd   s d => s!"    xorpd {emitXmmOperand s}, {emitXmmOperand d}"
+  | .Comisd  s d => s!"    comisd {emitXmmOperand s}, {emitXmmOperand d}"
+  | .Cvtsi2sd .Longword s d => s!"    cvtsi2sdl {emitOperand s}, {emitXmmOperand d}"
+  | .Cvtsi2sd .Quadword s d => s!"    cvtsi2sdq {emitOperand8 s}, {emitXmmOperand d}"
+  | .Cvtsi2sd _ _ _         => panic! "Cvtsi2sd with invalid AsmType"
+  | .Cvttsd2si .Longword s d => s!"    cvttsd2sil {emitXmmOperand s}, {emitOperand d}"
+  | .Cvttsd2si .Quadword s d => s!"    cvttsd2siq {emitXmmOperand s}, {emitOperand8 d}"
+  | .Cvttsd2si _ _ _         => panic! "Cvttsd2si with invalid AsmType"
+  | _ => panic! "emitDoubleInstr: not a double-specific instruction"
+
+/-- Emit comparison and division instructions. -/
+private def emitCmpDivInstr : Instruction → String
+  | .Cmp .Longword s d => s!"    cmpl {emitOperand s}, {emitOperand d}"
+  | .Cmp .Quadword s d => s!"    cmpq {emitOperand8 s}, {emitOperand8 d}"
+  | .Cmp _ _ _         => panic! "Cmp with invalid AsmType"
   | .Idiv .Longword op => s!"    idivl {emitOperand op}"
   | .Idiv .Quadword op => s!"    idivq {emitOperand8 op}"
-  | .Idiv .Double _   => panic! "Idiv with Double asm type is invalid"
-  -- Typed Div (unsigned division, Chapter 12)
-  | .Div .Longword op => s!"    divl {emitOperand op}"
-  | .Div .Quadword op => s!"    divq {emitOperand8 op}"
-  | .Div .Double _    => panic! "Div with Double asm type is invalid"
-  -- Cdq / Cqo (Double has no cdq equivalent)
-  | .Cdq .Longword => "    cdq"
-  | .Cdq .Quadword => "    cqo"
-  | .Cdq .Double   => panic! "Cdq with Double asm type is invalid"
+  | .Idiv _ _          => panic! "Idiv with invalid AsmType"
+  | .Div .Longword op  => s!"    divl {emitOperand op}"
+  | .Div .Quadword op  => s!"    divq {emitOperand8 op}"
+  | .Div _ _           => panic! "Div with invalid AsmType"
+  | .Cdq .Longword     => "    cdq"
+  | .Cdq .Quadword     => "    cqo"
+  | .Cdq _             => panic! "Cdq with invalid AsmType"
+  | _ => panic! "emitCmpDivInstr: not a cmp/div instruction"
+
+/-- Emit a single assembly instruction as an indented string.
+    `localDefs` is the list of locally-defined function names, used to decide
+    whether to append `@PLT` to external `call` instructions.
+    The large match is split into helper functions (above) to avoid Lean elaboration
+    timeouts from exhaustiveness checking across many (Instruction × AsmType) combos. -/
+private def emitInstruction (localDefs : List String) (instr : Instruction) : String :=
+  match instr with
+  -- Mov-family
+  | .Movsd .. | .Mov .. | .Movsx .. | .MovZeroExtend .. => emitMovInstr instr
+  -- Unary
+  | .Unary .. => emitUnaryInstr instr
+  -- Binary (integer and double)
+  | .Binary .. => emitBinaryInstr instr
+  -- Double-specific SSE
+  | .Xorpd .. | .Comisd .. | .Cvtsi2sd .. | .Cvttsd2si .. => emitDoubleInstr instr
+  -- Comparison and division
+  | .Cmp .. | .Idiv .. | .Div .. | .Cdq .. => emitCmpDivInstr instr
   -- Control flow (no size)
   | .Jmp name      => s!"    jmp .L{name}"
   | .JmpCC cc name => s!"    j{emitCondCode cc} .L{name}"
@@ -297,15 +311,12 @@ private def emitInstruction (localDefs : List String) : Instruction → String
   | .Push operand  => s!"    pushq {emitOperand8 operand}"
   -- Call: @PLT for external functions on Linux
   | .Call name =>
-      if localDefs.contains name then
-        s!"    call {name}"
-      else
-        s!"    call {name}@PLT"
+      if localDefs.contains name then s!"    call {name}"
+      else s!"    call {name}@PLT"
   -- Ret: full epilogue
   | .Ret => "    movq %rbp, %rsp\n    popq %rbp\n    ret"
   -- Chapter 14: leaq — compute address of memory operand into register
-  | .Lea src dst =>
-      s!"    leaq {emitOperand8 src}, {emitOperand8 dst}"
+  | .Lea src dst => s!"    leaq {emitOperand8 src}, {emitOperand8 dst}"
 
 -- ---------------------------------------------------------------------------
 -- Top-level emission
@@ -319,37 +330,34 @@ private def emitFunctionDef (localDefs : List String) (f : FunctionDef) : String
                     (f.instructions.map (emitInstruction localDefs))
   s!"{globalDirective}    .text\n{f.name}:\n{prologue}\n{instrs}"
 
-/-- Emit a static variable definition as assembly directives.
-    Chapter 11: emits `.long`/`.quad` or `.zero 4`/`.zero 8` based on `StaticInit`.
-    Chapter 13: `DoubleInit(f)` emits `.double f` (or `.zero 8` for zero) in `.data`. -/
-private def emitStaticVariable (name : String) (global : Bool) (alignment : Nat)
-    (init : StaticInit) : String :=
-  let globalDirective := if global then s!"    .globl {name}\n" else ""
-  match init with
+/-- Chapter 15: emit a single `StaticInit` element as an assembly directive string.
+    Returns `(directive, isZero)` where `isZero` is true iff the element is all zeros
+    (so the caller can decide whether to put it in `.data` or `.bss`). -/
+private def emitOneStaticInit : StaticInit → String × Bool
   | .IntInit n | .UIntInit n =>
-      if n != 0 then
-        s!"{globalDirective}    .data\n    .align {alignment}\n{name}:\n    .long {n}"
-      else
-        s!"{globalDirective}    .bss\n    .align {alignment}\n{name}:\n    .zero 4"
+      if n != 0 then (s!"    .long {n}", false) else ("    .zero 4", true)
   | .LongInit n | .ULongInit n =>
-      if n != 0 then
-        s!"{globalDirective}    .data\n    .align {alignment}\n{name}:\n    .quad {n}"
-      else
-        s!"{globalDirective}    .bss\n    .align {alignment}\n{name}:\n    .zero 8"
+      if n != 0 then (s!"    .quad {n}", false) else ("    .zero 8", true)
   | .DoubleInit f =>
-      -- Chapter 13: emit the raw 64-bit IEEE 754 bit pattern using .quad for exact fidelity.
-      -- Float.toBits gives the UInt64 bit representation.
-      if f == 0.0 || f == -0.0 then
-        -- Distinguish +0.0 (bits = 0) from -0.0 (sign bit = 1)
-        let bits : UInt64 := f.toBits
-        if bits == 0 then
-          s!"{globalDirective}    .bss\n    .align {alignment}\n{name}:\n    .zero 8"
-        else
-          -- -0.0: must store the bit pattern explicitly
-          s!"{globalDirective}    .data\n    .align {alignment}\n{name}:\n    .quad {bits}"
-      else
-        let bits : UInt64 := f.toBits
-        s!"{globalDirective}    .data\n    .align {alignment}\n{name}:\n    .quad {bits}"
+      let bits : UInt64 := f.toBits
+      if bits == 0 then ("    .zero 8", true)
+      else (s!"    .quad {bits}", false)
+  | .ZeroInit n =>
+      -- Chapter 15: emit .zero n for a block of n zero bytes
+      (s!"    .zero {n}", true)
+
+/-- Emit a static variable definition as assembly directives.
+    Chapter 15: `inits` is now `List StaticInit` (one entry per array element or one
+    for a scalar).  If all entries are zero, uses `.bss`; otherwise uses `.data`. -/
+private def emitStaticVariable (name : String) (global : Bool) (alignment : Nat)
+    (inits : List StaticInit) : String :=
+  let globalDirective := if global then s!"    .globl {name}\n" else ""
+  let emitted    := inits.map emitOneStaticInit
+  let allZero    := emitted.all (·.2)
+  -- `section` is a Lean keyword; use `sectionDir` as the variable name
+  let sectionDir := if allZero then "    .bss" else "    .data"
+  let directives := String.intercalate "\n" (emitted.map (·.1))
+  s!"{globalDirective}{sectionDir}\n    .align {alignment}\n{name}:\n{directives}"
 
 /-- Chapter 13: emit a read-only constant (float literal or neg-zero mask) in `.rodata`.
     Never exported with `.globl` (constants are translation-unit-local labels).
@@ -364,6 +372,10 @@ private def emitStaticConstant (name : String) (alignment : Nat) (init : StaticI
       s!"    .section .rodata\n    .align {alignment}\n{name}:\n    .quad {n}"
   | .IntInit n | .UIntInit n =>
       s!"    .section .rodata\n    .align {alignment}\n{name}:\n    .long {n}"
+  | .ZeroInit _ =>
+      -- StaticConstants are never zero-initialized (they are float/long literals),
+      -- but Lean requires exhaustiveness.
+      panic! "ZeroInit cannot appear in a StaticConstant"
 
 /-- Entry point for the emission pass. -/
 def emitProgram (p : Program) : String :=

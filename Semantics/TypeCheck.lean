@@ -77,6 +77,24 @@ private def isPointerType : AST.Typ → Bool
   | .Pointer _ => true
   | _          => false
 
+/-- True iff a type is an array type. -/
+private def isArrayType : AST.Typ → Bool
+  | .Array _ _ => true
+  | _          => false
+
+/-- True iff a type is an integer type (not pointer, array, or double). -/
+private def isIntegerType : AST.Typ → Bool
+  | .Int | .Long | .UInt | .ULong => true
+  | _                             => false
+
+/-- Array-to-pointer decay: if `e` has array type, wrap it in `AddrOf` to
+    produce a pointer to the first element.  Other types pass through unchanged.
+    This models C's implicit array→pointer conversion. -/
+private def decayArray (e : AST.Exp) (t : AST.Typ) : AST.Exp × AST.Typ :=
+  match t with
+  | .Array elem _ => (.AddrOf e, .Pointer elem)
+  | _             => (e, t)
+
 /-- Truncate an integer value `n` to the signed 32-bit range [−2^31, 2^31−1].
     Used when a `case` constant appears in an `int`-controlled switch. -/
 private def truncToInt32 (n : Int) : Int :=
@@ -148,6 +166,14 @@ private def implicitCastTo (target : AST.Typ) (current : AST.Typ) (e : AST.Exp) 
       throw "TypeCheck: cannot convert double to pointer (even with implicit cast)"
   | .Double, .Pointer _ =>
       throw "TypeCheck: cannot convert pointer to double (even with implicit cast)"
+  -- Chapter 15: array-to-pointer decay (implicit).
+  -- `int arr[N]` used where `int *` expected decays to `&arr[0]`.
+  -- The `AddrOf(Var ...)` wrapper emits a `GetAddress` / leaq in TackyGen.
+  | .Pointer elem, .Array arrElem _ =>
+      if elem == arrElem then return (.AddrOf e)
+      else throw s!"TypeCheck: array element type {repr arrElem} does not match pointer target {repr elem}"
+  | _, .Array _ _ =>
+      throw "TypeCheck: cannot implicitly convert an array to a non-pointer type"
   | .Pointer _, .Pointer _ =>
       -- Both are pointers but different pointee types: illegal implicit conversion
       throw "TypeCheck: cannot implicitly convert between different pointer types"
@@ -180,7 +206,9 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   | .Constant (.ConstUInt n)   => return (.Constant (.ConstUInt n),   .UInt)    -- Chapter 12
   | .Constant (.ConstULong n)  => return (.Constant (.ConstULong n),  .ULong)   -- Chapter 12
   | .Constant (.ConstDouble f) => return (.Constant (.ConstDouble f), .Double)  -- Chapter 13
-  -- Variable reference: look up type
+  -- Variable reference: look up type.
+  -- Arrays remain as Array type here; decay to pointer happens via
+  -- implicitCastTo when used in a rvalue/pointer context (e.g. assignment, function arg).
   | .Var v => do
       let t ← lookupVarTyp st v
       return (.Var v, t)
@@ -262,6 +290,13 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   | .Binary op left right => do
       let (left', leftTyp)   ← typeCheckExp st left
       let (right', rightTyp) ← typeCheckExp st right
+      -- Chapter 15: array-to-pointer decay in binary expression context.
+      -- In C, an array used in an expression decays to a pointer to its first element.
+      -- e.g. `arr + 2` where arr : int[3]  →  (&arr[0]) + 2 : int*
+      -- This happens implicitly for all binary operators (most are illegal for pointers,
+      -- but Add/Subtract allow pointer+int and ptr-ptr).
+      let (left', leftTyp)   := decayArray left' leftTyp
+      let (right', rightTyp) := decayArray right' rightTyp
       let isLeftPtr  := isPointerType leftTyp
       let isRightPtr := isPointerType rightTyp
       -- Chapter 14: equality/inequality with a pointer operand.
@@ -290,17 +325,60 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
           if !isNullPtrConstant left' then
             throw "TypeCheck: cannot compare a non-null-pointer-constant integer to a pointer (only integer constant 0 is allowed)"
           return (.Binary op (.Cast rightTyp left') right', .Int)
-      -- Chapter 14: arithmetic and bitwise operations on pointers are illegal.
-      -- Pointers may not appear as operands of *, /, %, &, |, ^, +, -.
-      -- (Pointer arithmetic with + and - is a Chapter 15 feature; for now, both disallowed.)
+      -- Chapter 14/15: arithmetic and bitwise operations on pointers.
+      -- Chapter 15: pointer arithmetic (+/-) is now legal for pointer+int combinations.
+      --   ptr + int → Pointer(elem)   (AddPtr in TackyGen)
+      --   int + ptr → Pointer(elem)
+      --   ptr - int → Pointer(elem)
+      --   ptr - ptr → Long (ptrdiff_t, divided by element size in TackyGen)
+      -- All other operations on pointers remain illegal.
       match op with
-      | .Multiply | .Divide | .Remainder | .BitAnd | .BitOr | .BitXor
-      | .Add | .Subtract =>
+      | .Add =>
+          if isLeftPtr && isRightPtr then
+            throw s!"TypeCheck: cannot add two pointers"
+          if isLeftPtr && isRightPtr == false then
+            -- ptr + int: the right operand must be an integer (not double)
+            if rightTyp == .Double then
+              throw s!"TypeCheck: cannot add a pointer and a double"
+            -- Result is the pointer type
+            return (.Binary .Add left' right', leftTyp)
+          if isRightPtr && isLeftPtr == false then
+            -- int + ptr: the left operand must be an integer (not double)
+            if leftTyp == .Double then
+              throw s!"TypeCheck: cannot add a double and a pointer"
+            -- Result is the pointer type
+            return (.Binary .Add left' right', rightTyp)
+          -- Otherwise: neither is a pointer, fall through to normal arithmetic
+      | .Subtract =>
+          if isLeftPtr && isRightPtr then
+            -- ptr - ptr: both must have the same pointer type; result is Long (ptrdiff_t)
+            if leftTyp != rightTyp then
+              throw s!"TypeCheck: cannot subtract pointers of different types"
+            return (.Binary .Subtract left' right', .Long)
+          if isLeftPtr && !isRightPtr then
+            -- ptr - int: right operand must be integer
+            if rightTyp == .Double then
+              throw s!"TypeCheck: cannot subtract a double from a pointer"
+            return (.Binary .Subtract left' right', leftTyp)
+          if !isLeftPtr && isRightPtr then
+            throw s!"TypeCheck: cannot subtract a pointer from a non-pointer"
+          -- Otherwise: neither is a pointer, fall through to normal arithmetic
+      | .Multiply | .Divide | .Remainder | .BitAnd | .BitOr | .BitXor =>
           if isLeftPtr then
             throw s!"TypeCheck: pointer type cannot be used as operand of this operator"
           if isRightPtr then
             throw s!"TypeCheck: pointer type cannot be used as operand of this operator"
-      | _ => pure ()
+      | _ =>
+          -- Chapter 15: relational operators (<, <=, >, >=) and any other operator.
+          -- Pointer-to-pointer comparison of the SAME type is valid (ordering within array).
+          -- Pointer-to-integer (any integer, including 0) is ALWAYS illegal for relational ops
+          -- (unlike == and !=, where integer 0 is a null pointer constant and thus allowed).
+          if isLeftPtr && isRightPtr then do
+            if leftTyp != rightTyp then
+              throw s!"TypeCheck: cannot compare pointers of different types with relational operator"
+            -- same-type pointer comparison: allowed — fall through to produce Int result
+          else if isLeftPtr || isRightPtr then
+            throw s!"TypeCheck: relational operator cannot mix pointer and non-pointer operands"
       -- Usual arithmetic conversions: widen the narrower operand
       let common := commonType leftTyp rightTyp
       -- Chapter 13: reject bitwise operations and modulo on Double operands.
@@ -330,6 +408,9 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- Assignment: RHS is cast to the type of the LHS variable
   | .Assignment (.Var lhsName) rhs => do
       let lhsTyp ← lookupVarTyp st lhsName
+      -- Chapter 15: arrays are not assignable in C (C §6.3.2.1)
+      if isArrayType lhsTyp then
+        throw s!"TypeCheck: cannot assign to '{lhsName}' which has array type (arrays are not assignable in C)"
       let (rhs', rhsTyp) ← typeCheckExp st rhs
       -- Chapter 14: use implicitCastTo to catch illegal pointer assignments
       let rhs'' ← implicitCastTo lhsTyp rhsTyp rhs'
@@ -338,12 +419,32 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   | .Assignment (.Dereference ptrExp) rhs => do
       let (ptr', ptrTyp) ← typeCheckExp st ptrExp
       let (rhs', rhsTyp) ← typeCheckExp st rhs
+      -- Chapter 15: apply array-to-pointer decay to the pointer expression.
+      -- e.g. `*arr = 3` where arr : int[N] — arr decays to int* before dereferencing.
+      let (ptr', ptrTyp) := decayArray ptr' ptrTyp
       match ptrTyp with
       | .Pointer t =>
+          -- Chapter 15: cannot assign to an array type, even through a pointer.
+          -- e.g. `*ptr_to_array = arr` is illegal — arrays are not assignable in C.
+          if isArrayType t then
+            throw s!"TypeCheck: cannot assign to an array type through a pointer dereference (arrays are not assignable in C)"
           -- Chapter 14: use implicitCastTo to catch illegal pointer assignments
           let rhs'' ← implicitCastTo t rhsTyp rhs'
           return (.Assignment (.Dereference ptr') rhs'', t)
       | _ => throw s!"TypeCheck: cannot assign through a non-pointer value"
+  -- Chapter 15: assignment through subscript `a[i] = rhs`
+  -- Desugar the LHS subscript to a dereference, then handle as *ptr = rhs.
+  | .Assignment (.Subscript arrExp idxExp) rhs => do
+      -- Rewrite a[i] = rhs as *(a + i) = rhs; typeCheckExp on Subscript gives Dereference(...)
+      let (lhs', lhsTyp) ← typeCheckExp st (.Subscript arrExp idxExp)
+      -- Chapter 15: cannot assign to an array-typed subscript (e.g., dim2[0] = dim
+      -- where dim2 : int[1][2] — the subscript has type int[2], which is an array).
+      if isArrayType lhsTyp then
+        throw s!"TypeCheck: cannot assign to an array type (arrays are not assignable in C)"
+      let (rhs', rhsTyp) ← typeCheckExp st rhs
+      -- lhs' should be Dereference(Binary.Add ...) with type = element type
+      let rhs'' ← implicitCastTo lhsTyp rhsTyp rhs'
+      return (.Assignment lhs' rhs'', lhsTyp)
   | .Assignment lhs _ =>
       throw s!"TypeCheck: invalid lvalue in assignment (should have been caught by VarResolution)"
   -- Conditional: both branches are widened to the common type.
@@ -398,24 +499,71 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
       match ptrTyp with
       | .Pointer t => return (.PostfixDecr (.Dereference ptr'), t)
       | _ => throw s!"TypeCheck: postfix -- requires a pointer dereference"
+  -- Chapter 15: postfix ++/-- on array subscript: a[i]++
+  | .PostfixIncr (.Subscript arrExp idxExp) => do
+      let (lhs', lhsTyp) ← typeCheckExp st (.Subscript arrExp idxExp)
+      return (.PostfixIncr lhs', lhsTyp)
+  | .PostfixDecr (.Subscript arrExp idxExp) => do
+      let (lhs', lhsTyp) ← typeCheckExp st (.Subscript arrExp idxExp)
+      return (.PostfixDecr lhs', lhsTyp)
   | .PostfixIncr e | .PostfixDecr e =>
       throw s!"TypeCheck: invalid lvalue in postfix operator"
   -- Chapter 14: address-of operator: `&e` has type `Pointer(typeOf e)`.
-  -- The operand must be an lvalue (a Var or a Dereference expression).
+  -- The operand must be an lvalue (Var, Dereference, or Subscript).
   -- Note: &*e is valid (cancels out), handled in TackyGen as an optimization.
+  -- Chapter 15: &arr where arr is an Array type gives Pointer(Array elem n), not Pointer(elem).
   | .AddrOf inner => do
       let (inner', innerTyp) ← typeCheckExp st inner
-      -- Only Var and Dereference are lvalues; everything else is an rvalue
+      -- Only lvalues are valid operands of &
       match inner' with
       | .Var _         => return (.AddrOf inner', .Pointer innerTyp)
       | .Dereference _ => return (.AddrOf inner', .Pointer innerTyp)
-      | _ => throw "TypeCheck: operand of address-of (&) must be an lvalue (a variable or *expr)"
+      | .Subscript _ _ => return (.AddrOf inner', .Pointer innerTyp)
+      | _ => throw "TypeCheck: operand of address-of (&) must be an lvalue (variable, *expr, or a[i])"
   -- Chapter 14: dereference operator: `*e` has type `t` when `typeOf e = Pointer(t)`
+  -- Chapter 15: apply array-to-pointer decay before the pointer check.
+  -- e.g. `*(arr + 1)` where `arr : int[N]` — `arr + 1` produces a Pointer(int), OK.
+  -- But also `**row_ptr` where `*row_ptr : Array(int, N)` — the inner result has
+  -- Array type, which decays to a Pointer before the outer * is applied.
   | .Dereference inner => do
       let (inner', innerTyp) ← typeCheckExp st inner
+      -- Decay: if `inner'` has array type, treat it as a pointer to the first element
+      let (inner', innerTyp) := decayArray inner' innerTyp
       match innerTyp with
       | .Pointer t => return (.Dereference inner', t)
       | _ => throw s!"TypeCheck: cannot dereference a non-pointer type"
+  -- Chapter 15: array subscript `a[i]` ≡ `*(a + i)`.
+  -- The array (or pointer) `a` is decayed to a pointer, then `i` indexes it.
+  -- The result type is the pointee type (an lvalue of element type).
+  | .Subscript arrExp idxExp => do
+      let (arr', arrTyp) ← typeCheckExp st arrExp
+      let (idx', idxTyp) ← typeCheckExp st idxExp
+      -- C §6.5.2.1: E1[E2] == *(E1 + E2), and subscript is commutative: E1[E2] == E2[E1].
+      -- The pointer/array operand can be on EITHER side (e.g. `3[arr]` is valid: arr + 3).
+      -- We track (ptrExpr, intExpr, intTyp) separately so we can:
+      --   1. Validate intTyp is actually an integer type.
+      --   2. Build `ptrExpr + intExpr` in the correct order.
+      let (ptrExpr, intExpr, intTyp, elemTyp) ← match arrTyp, idxTyp with
+        | .Array elem _, _  =>
+            -- Left side is array: decay to pointer to first element; right is index
+            pure (.AddrOf arr', idx', idxTyp, elem)
+        | .Pointer elem, _  =>
+            -- Left side is already a pointer (e.g. `p[i]`); right is index
+            pure (arr', idx', idxTyp, elem)
+        | _, .Array elem _  =>
+            -- Right side is array (e.g. `3[arr]`): decay array to pointer; left is index
+            pure (.AddrOf idx', arr', arrTyp, elem)
+        | _, .Pointer elem  =>
+            -- Right side is pointer (e.g. `0[ptr]` or `3[ptr]`): swap; left is index
+            pure (idx', arr', arrTyp, elem)
+        | _, _ =>
+            throw s!"TypeCheck: subscript base must have pointer or array type, not {repr arrTyp} or {repr idxTyp}"
+      -- Index must have integer type (not double, not pointer)
+      if !isIntegerType intTyp then
+        throw s!"TypeCheck: array subscript index must have integer type, got {repr intTyp}"
+      -- Desugar to *(ptrExpr + intExpr); pointer arithmetic is now legal (Ch15)
+      let addExp := AST.Exp.Binary .Add ptrExpr intExpr
+      return (.Dereference addExp, elemTyp)
   -- Function call: cast each argument to the declared parameter type
   | .FunCall fname args => do
       match lookupSym st fname with
@@ -430,6 +578,51 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
           -- For extra args beyond paramTypes (shouldn't occur), keep as-is
           let allArgs := castedArgs ++ (typedArgs.drop paramTypes.length).map (·.1)
           return (.FunCall fname allArgs, retTyp)
+
+-- ---------------------------------------------------------------------------
+-- Initializer type-checking (must come after typeCheckExp)
+-- ---------------------------------------------------------------------------
+
+/-- Build a zero-valued initializer for the given type.
+    C §6.7.9p10: elements not explicitly initialized are zero-initialized,
+    as if they had static storage duration.
+    For scalar types, emits the typed zero constant directly so that
+    TackyGen can use the correct AsmType without needing an implicit cast.
+    For array types, recursively creates a CompoundInit of zeros. -/
+private def makeZeroInit : AST.Typ → AST.Initializer
+  | .Int       => .SingleInit (.Constant (.ConstInt 0))
+  | .Long      => .SingleInit (.Constant (.ConstLong 0))
+  | .UInt      => .SingleInit (.Constant (.ConstUInt 0))
+  | .ULong     => .SingleInit (.Constant (.ConstULong 0))
+  | .Double    => .SingleInit (.Constant (.ConstDouble 0.0))
+  | .Pointer _ => .SingleInit (.Constant (.ConstInt 0))  -- null pointer constant
+  | .Array e n => .CompoundInit (List.replicate n (makeZeroInit e))
+
+/-- Type-check an initializer for a variable of the given type.
+    Chapter 15: `CompoundInit` is legal only for array types; each element
+    is type-checked against the element type.
+    Zero-pads the initializer list to the full array size (C §6.7.9p10). -/
+private partial def typeCheckInitializer (st : SymbolTable) (varTyp : AST.Typ)
+    : AST.Initializer → TcM AST.Initializer
+  | .SingleInit e => do
+      let (e', eTyp) ← typeCheckExp st e
+      -- Array types cannot be initialized with a scalar expression
+      if isArrayType varTyp then
+        throw s!"TypeCheck: cannot initialize an array with a scalar expression"
+      let e'' ← implicitCastTo varTyp eTyp e'
+      return .SingleInit e''
+  | .CompoundInit inits => do
+      match varTyp with
+      | .Array elemTyp size =>
+          -- C §6.7.9: the number of initializers cannot exceed the array size
+          if inits.length > size then
+            throw s!"TypeCheck: compound initializer has {inits.length} elements but array only has {size}"
+          -- Zero-pad to the full array size (C §6.7.9p10: unlisted elements
+          -- are zero-initialized as if they had static storage duration).
+          let padded := inits ++ List.replicate (size - inits.length) (makeZeroInit elemTyp)
+          let inits' ← padded.mapM (typeCheckInitializer st elemTyp)
+          return .CompoundInit inits'
+      | _ => throw s!"TypeCheck: compound initializer used for non-array type {repr varTyp}"
 
 -- ---------------------------------------------------------------------------
 -- Statement type-checking
@@ -487,6 +680,9 @@ private partial def typeCheckStmt (st : SymbolTable) (retTyp : AST.Typ) : AST.St
         throw s!"TypeCheck: switch controlling expression must have integer type, not double"
       if isPointerType expTyp then
         throw s!"TypeCheck: switch controlling expression must have integer type, not pointer"
+      -- Chapter 15: arrays also cannot be used as switch controlling expression
+      if isArrayType expTyp then
+        throw s!"TypeCheck: switch controlling expression must have integer type, not array"
       let body' ← typeCheckStmt st retTyp body
       -- C §6.8.4.2: if the switch controlling expression has 32-bit type,
       -- truncate each case constant to that type's range.
@@ -517,10 +713,8 @@ private partial def typeCheckForInit (st : SymbolTable) : AST.ForInit → TcM AS
       let eOpt' ← eOpt.mapM (fun e => do let (e', _) ← typeCheckExp st e; return e')
       return .InitExp eOpt'
   | .InitDecl decl => do
-      let init' ← decl.init.mapM fun e => do
-        let (e', eTyp) ← typeCheckExp st e
-        -- Chapter 14: use implicitCastTo to catch illegal pointer initializers
-        implicitCastTo decl.typ eTyp e'
+      -- Chapter 15: use typeCheckInitializer (handles both scalar and compound inits)
+      let init' ← decl.init.mapM (typeCheckInitializer st decl.typ)
       return .InitDecl { decl with init := init' }
 
 /-- Type-check a block item: statements are recursed into; declaration
@@ -531,11 +725,8 @@ private partial def typeCheckBlockItem (st : SymbolTable) (retTyp : AST.Typ) : A
       let stmt' ← typeCheckStmt st retTyp stmt
       return .S stmt'
   | .D decl => do
-      -- Type-check/cast the initializer to match the variable's declared type
-      -- Chapter 14: use implicitCastTo to catch illegal pointer initializers
-      let init' ← decl.init.mapM fun e => do
-        let (e', eTyp) ← typeCheckExp st e
-        implicitCastTo decl.typ eTyp e'
+      -- Chapter 15: use typeCheckInitializer (handles scalar SingleInit and CompoundInit)
+      let init' ← decl.init.mapM (typeCheckInitializer st decl.typ)
       return .D { decl with init := init' }
   | .FD fd => return .FD fd   -- local function declarations need no type-checking here
 
@@ -561,11 +752,8 @@ def typeCheckProgram (p : AST.Program) (st : SymbolTable) : Except String AST.Pr
         let fd' ← typeCheckFunctionDef st fd
         return .FunDef fd'
     | .VarDecl decl => do
-        -- Type-check the file-scope initializer if present
-        -- Chapter 14: use implicitCastTo to catch illegal pointer initializers
-        let init' ← decl.init.mapM fun e => do
-          let (e', eTyp) ← typeCheckExp st e
-          implicitCastTo decl.typ eTyp e'
+        -- Chapter 15: use typeCheckInitializer (handles scalar and compound inits)
+        let init' ← decl.init.mapM (typeCheckInitializer st decl.typ)
         return .VarDecl { decl with init := init' }
     | other => return other
   return { p with topLevels := topLevels' }

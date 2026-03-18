@@ -83,14 +83,19 @@ namespace AssemblyAST
                        | ★ XMM14 | XMM15
 -/
 
-/-- The three assembly sizes used through Chapter 13.
+/-- Assembly type for operands and instructions.
     `Longword` = 4 bytes (32-bit, suffix `l`).
     `Quadword` = 8 bytes (64-bit, suffix `q`).
-    `Double`   = 8 bytes (64-bit IEEE 754; uses XMM registers and `sd` instructions). -/
+    `Double`   = 8 bytes (64-bit IEEE 754; uses XMM registers and `sd` instructions).
+    `ByteArray(n, align)` = Chapter 15: an array of `n` total bytes with the given
+       alignment requirement.  Used only in the BackendSymTable `ObjEntry` to tell
+       PseudoReplace how large a stack slot to reserve for a local array variable.
+       Does NOT appear as an instruction operand type. -/
 inductive AsmType where
-  | Longword : AsmType   -- 4-byte, C `int` / `unsigned int`
-  | Quadword : AsmType   -- 8-byte, C `long` / `unsigned long`
-  | Double   : AsmType   -- 8-byte, C `double` (Chapter 13)
+  | Longword  : AsmType                -- 4-byte, C `int` / `unsigned int`
+  | Quadword  : AsmType                -- 8-byte, C `long` / `unsigned long`
+  | Double    : AsmType                -- 8-byte, C `double` (Chapter 13)
+  | ByteArray : Nat → Nat → AsmType   -- Chapter 15: (totalBytes, alignment)
   deriving Repr, BEq
 
 inductive Reg where
@@ -127,8 +132,17 @@ inductive Operand where
   /-- `Memory(r, offset)` = `offset(%r)` in AT&T syntax.
       Replaces the old `Stack(offset)` (which was always `Memory(BP, offset)`).
       Also used for pointer dereferences: `Memory(R10, 0)` = `(%r10)`. -/
-  | Memory : Reg → Int → Operand   -- Chapter 14 (replaces Stack)
-  | Data   : String → Operand
+  | Memory    : Reg → Int → Operand   -- Chapter 14 (replaces Stack)
+  | Data      : String → Operand
+  /-- Chapter 15: `PseudoMem(name, byteOffset)` — a named aggregate variable
+      with a byte offset from its base.  Replaced by `Memory(BP, baseOff + byteOffset)`
+      in the PseudoReplace pass.  Used for array element access. -/
+  | PseudoMem : String → Int → Operand
+  /-- Chapter 15: `Indexed(base, index, scale)` = `(base, index, scale)` in AT&T syntax,
+      i.e. `(%base, %index, scale)` (scaled-index addressing).
+      Used as the source operand of `leaq` for pointer arithmetic:
+        `leaq (%r11, %r9, scale), dst`  →  `dst = R11 + R9 * scale`. -/
+  | Indexed   : Reg → Reg → Int → Operand
   deriving Repr, BEq
 
 inductive UnaryOp where
@@ -205,13 +219,15 @@ inductive Instruction where
   | Lea            : Operand → Operand → Instruction   -- Chapter 14
   deriving Repr, BEq
 
-/-- A typed static variable initializer. -/
+/-- A typed static variable initializer element.
+    Chapter 15 adds `ZeroInit n` for compactly zero-initializing n bytes (`.zero n`). -/
 inductive StaticInit where
   | IntInit    : Int   → StaticInit   -- 32-bit signed (.long)
   | LongInit   : Int   → StaticInit   -- 64-bit signed (.quad)
   | UIntInit   : Int   → StaticInit   -- 32-bit unsigned (.long)
   | ULongInit  : Int   → StaticInit   -- 64-bit unsigned (.quad)
-  | DoubleInit : Float → StaticInit   -- 64-bit double (.double)  (Chapter 13)
+  | DoubleInit : Float → StaticInit   -- 64-bit double (Chapter 13, stored as .quad bits)
+  | ZeroInit   : Nat   → StaticInit   -- Chapter 15: .zero n (n zero bytes)
   deriving Repr, BEq
 
 structure FunctionDef where
@@ -225,8 +241,10 @@ structure FunctionDef where
 /-- A top-level assembly item. -/
 inductive AsmTopLevel where
   | Function       : FunctionDef → AsmTopLevel
-  /-- Static variable: name, global flag, alignment (4 or 8), initializer. -/
-  | StaticVariable : String → Bool → Nat → StaticInit → AsmTopLevel
+  /-- Static variable: name, global flag, alignment, list of initializer elements.
+      Chapter 15: changed from a single `StaticInit` to `List StaticInit` to
+      support arrays with one entry per element (or a `ZeroInit n` for all-zero). -/
+  | StaticVariable : String → Bool → Nat → List StaticInit → AsmTopLevel
   /-- Chapter 13: read-only constant: name, alignment, value.
       Emitted to `.section .rodata` (not .data/.bss). Never exported (no .globl). -/
   | StaticConstant : String → Nat → StaticInit → AsmTopLevel

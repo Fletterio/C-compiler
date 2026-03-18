@@ -31,16 +31,19 @@ inductive IdentType where
 
 /-- Describes how a static-storage variable is initialised.
 
-    Four cases:
+    Five cases:
       1. **Tentative**: declared at file scope without an initializer.
       2. **Initial(n)**: concrete integer initializer value.
       3. **DoubleInitial(f)**: concrete double initializer value.  (Chapter 13)
-      4. **NoInitializer**: declared `extern`; no storage emitted here. -/
+      4. **NoInitializer**: declared `extern`; no storage emitted here.
+      5. **ArrayInitial(ivs)**: list of element init values for static arrays. (Chapter 15)
+         Each element is itself an `InitialValue` (Initial, DoubleInitial, or Tentative=0). -/
 inductive InitialValue where
   | Tentative       : InitialValue
   | Initial         : Int   → InitialValue
   | DoubleInitial   : Float → InitialValue   -- Chapter 13: static double initializer
   | NoInitializer   : InitialValue
+  | ArrayInitial    : List InitialValue → InitialValue  -- Chapter 15: static array initializer
   deriving Repr, BEq
 
 /-- Attributes attached to a symbol table entry. -/

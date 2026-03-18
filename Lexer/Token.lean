@@ -76,6 +76,9 @@ inductive Token where
   -- Chapter 13: double type keyword and floating-point constant
   | KwDouble       : Token           -- double
   | DoubleConstant : Float → Token   -- floating-point literal, e.g. 3.14
+  -- Chapter 15: array subscript brackets
+  | OpenBracket  : Token   -- [
+  | CloseBracket : Token   -- ]
   deriving Repr, BEq
 
 /-- Human-readable description of a token, used in parser error messages. -/
@@ -147,5 +150,7 @@ def Token.describe : Token → String
   | .KwExtern      => "\"extern\""
   | .KwDouble      => "\"double\""
   | .DoubleConstant f => s!"double constant \"{f}\""
+  | .OpenBracket  => "\"[\""
+  | .CloseBracket => "\"]\""
 
 end Lexer

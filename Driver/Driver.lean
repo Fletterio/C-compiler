@@ -66,21 +66,33 @@ private def runCmd (cmd : String) (args : Array String) (errPrefix : String) : I
 /-- Convert an `AST.Typ` to the corresponding `AsmType`.
     Chapter 12: UInt → Longword, ULong → Quadword (same widths as signed).
     Chapter 13: Double → Double (8-byte, uses XMM registers).
-    Chapter 14: Pointer → Quadword (pointers are 8-byte, like unsigned long). -/
+    Chapter 14: Pointer → Quadword (pointers are 8-byte, like unsigned long).
+    Chapter 15: Array(elem, n) → ByteArray(totalBytes, alignment) so that
+      PseudoReplace can reserve the right amount of stack space. -/
 private def asmTypeOf : AST.Typ → AssemblyAST.AsmType
   | .Int  | .UInt  => .Longword
   | .Long | .ULong => .Quadword
   | .Double        => .Double
   | .Pointer _     => .Quadword   -- Chapter 14: pointer is 8-byte
+  | .Array elem n  =>             -- Chapter 15: array occupies totalBytes with alignment
+      let totalBytes := elem.sizeOf * n
+      -- Use the ARRAY's own alignOf, not just the element's alignOf.
+      -- For arrays of 16 bytes or more, the ABI mandates 16-byte alignment regardless
+      -- of element alignment.  Passing elem.alignOf would give 4 for int arrays and
+      -- 8 for pointer arrays, under-aligning large arrays.
+      let alignment  := (AST.Typ.Array elem n).alignOf
+      .ByteArray totalBytes alignment
 
 /-- True iff the type is a signed integer type.
     Double returns false (sign concept doesn't apply to IEEE 754 types).
-    Chapter 14: Pointer returns false (treated as unsigned for code generation). -/
+    Chapter 14: Pointer returns false (treated as unsigned for code generation).
+    Chapter 15: Array returns false (arrays are not scalars). -/
 private def isSignedTyp : AST.Typ → Bool
   | .Int | .Long     => true
   | .UInt | .ULong   => false
   | .Double          => false
   | .Pointer _       => false   -- Chapter 14: pointers are unsigned
+  | .Array _ _       => false   -- Chapter 15: arrays are aggregate types
 
 /-- Build the backend symbol table from:
     1. The frontend symbol table (all declared variables and functions).
