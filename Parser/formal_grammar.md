@@ -1,6 +1,6 @@
-# Formal Grammar — Chapter 15
+# Formal Grammar — Chapter 17
 
-Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Chapter 15.
+Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Chapter 17.
 
 ```
 <program>     ::= { <declaration> }
@@ -18,9 +18,10 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 
 <decl-spec>     ::= <type-spec> | <storage-class>
 
-<type-spec>     ::= "int" | "long" | "unsigned" | "signed" | "double"
+<type-spec>     ::= "int" | "long" | "unsigned" | "signed" | "double" | "char"
+                  | "void"                             (Chapter 17: void type)
                   (One or more type specifiers form a type; see type-spec rules below.
-                   "double" is standalone and cannot be combined with other type keywords.)
+                   "double" and "void" are standalone and cannot be combined with other type keywords.)
 
 <storage-class> ::= "static" | "extern"
 
@@ -38,10 +39,12 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 
 <abstract-declarator> ::= "*" <abstract-declarator>?  (Chapter 14: pointer abstract decl)
                          | "(" <abstract-declarator> ")" { "[" <int-const> "]" }  (Chapter 15: array dims after paren)
-                         | { "[" <int-const> "]" }+   (Chapter 15: array abstract decl, one or more dims)
+                         | { "[" <int-const> "]" }*   (Chapter 17: zero or more array dims; allows `sizeof(int[2])`)
                          | ε                           (empty — no identifier)
                   (Used in cast expressions, e.g. `(unsigned long (*))` → Pointer(ULong),
-                   `(int (*)[3])` → Pointer(Array(Int,3)))
+                   `(int (*)[3])` → Pointer(Array(Int,3)).
+                   Chapter 17: the base case now consumes trailing `[N]` dims so that
+                   `sizeof(int[2])` correctly parses `int[2]` as `Array(Int,2)`.)
 
 <param-list>  ::= "void"
                 | <param> { "," <param> }
@@ -55,7 +58,8 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
 
 <block-item>  ::= <statement> | <variable-declaration> | <function-declaration>
 
-<statement>   ::= "return" <exp> ";"
+<statement>   ::= "return" ";"                           (Chapter 17: void return)
+                | "return" <exp> ";"
                 | <exp> ";"
                 | "if" "(" <exp> ")" <statement> [ "else" <statement> ]
                 | <block>
@@ -94,6 +98,8 @@ Extended Backus-Naur Form (EBNF) grammar for the C subset implemented through Ch
                 | "++" <factor> | "--" <factor>
                 | <factor> "++" | <factor> "--"
                 | "(" <exp> ")"
+                | "sizeof" "(" <type-spec>+ <abstract-declarator> ")"  (Chapter 17: sizeof(type))
+                | "sizeof" <factor>                    (Chapter 17: sizeof(expr))
 
 <arg-list>    ::= [ <exp> { "," <exp> } ]
 

@@ -83,6 +83,8 @@ inductive Token where
   | KwChar       : Token          -- char
   | CharConstant : Int → Token    -- character literal, e.g. 'a' → 97
   | StringLiteral : String → Token -- string literal (unescaped contents), e.g. "hello"
+  -- Chapter 17: sizeof operator keyword
+  | KwSizeof     : Token          -- sizeof
   deriving Repr, BEq
 
 /-- Human-readable description of a token, used in parser error messages. -/
@@ -159,5 +161,6 @@ def Token.describe : Token → String
   | .KwChar        => "\"char\""
   | .CharConstant n => s!"character constant '{n}'"
   | .StringLiteral s => s!"string literal \"{s}\""
+  | .KwSizeof      => "\"sizeof\""
 
 end Lexer

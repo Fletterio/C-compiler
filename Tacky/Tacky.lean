@@ -121,7 +121,10 @@ inductive Val where
     Chapter 12 adds `ZeroExtend`.
     Chapter 13 adds six double ↔ integer conversion instructions. -/
 inductive Instruction where
-  | Return        : Val → Instruction
+  /-- Return from a function.
+      Chapter 17: `none` means `return;` in a void function (no value in RAX/XMM0).
+      `some v` means `return v;` in a non-void function. -/
+  | Return        : Option Val → Instruction
   | Unary         : UnaryOp → Val → Val → Instruction
   | Binary        : BinaryOp → Val → Val → Val → Instruction
   | Copy          : Val → Val → Instruction
@@ -129,7 +132,10 @@ inductive Instruction where
   | JumpIfZero    : Val → String → Instruction
   | JumpIfNotZero : Val → String → Instruction
   | Label         : String → Instruction
-  | FunCall       : String → List Val → Val → Instruction
+  /-- Function call.
+      Chapter 17: `dst` is `none` for void function calls (no return value to capture).
+      `some v` means the return value is stored in `v`. -/
+  | FunCall       : String → List Val → Option Val → Instruction
   /-- Sign-extend `src` into `dst`.
       Chapter 16: now carries the source `AST.Typ` so CodeGen can determine the
       source AsmType even for constant operands (where valAsmType returns Longword

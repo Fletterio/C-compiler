@@ -403,6 +403,9 @@ private def resolveExp (identMap : IdentMap) : AST.Exp → VarM2 AST.Exp
   -- Chapter 15: array subscript — both sides resolved; subscript is an lvalue
   | .Subscript arr idx =>
       return .Subscript (← resolveExp identMap arr) (← resolveExp identMap idx)
+  -- Chapter 17: sizeof — the inner expression/type need variable resolution on sub-expressions
+  | .SizeOf e     => return .SizeOf  (← resolveExp identMap e)
+  | .SizeOfT t    => return .SizeOfT t  -- types have no variables to rename
   | .FunCall f args => do
       match lookupIdent identMap f with
       | none => throw s!"Undeclared function '{f}'"
@@ -442,7 +445,9 @@ private partial def resolveForInit (identMap : IdentMap) : AST.ForInit → VarM2
       return (.InitDecl { decl with name := renamed, init := init', storageClass := none }, identMap')
 
 private partial def resolveStatement (identMap : IdentMap) : AST.Statement → VarM2 AST.Statement
-  | .Return e     => return .Return (← resolveExp identMap e)
+  -- Chapter 17: Return is now `Option Exp` — void functions use `Return none`
+  | .Return none     => return .Return none
+  | .Return (some e) => return .Return (some (← resolveExp identMap e))
   | .Expression e => return .Expression (← resolveExp identMap e)
   | .If cond thenStmt elseOpt => do
       let cond' ← resolveExp identMap cond

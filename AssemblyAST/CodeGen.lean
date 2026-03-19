@@ -190,8 +190,10 @@ private def emitParamCopies (params : List String) (bst : BackendSymTable) : Lis
 
 /-- Generate assembly for a TACKY FunCall instruction.
     Chapter 13: classifies each argument as integer or double, placing
-    arguments into the appropriate register bank or the stack. -/
-private def convertFunCall (name : String) (args : List Tacky.Val) (dst : Tacky.Val)
+    arguments into the appropriate register bank or the stack.
+    Chapter 17: `dst` is now `Option Tacky.Val` — void calls have `none` and
+    skip emitting the return-value move. -/
+private def convertFunCall (name : String) (args : List Tacky.Val) (dst : Option Tacky.Val)
     (bst : BackendSymTable) (labelCounter : Nat) : List Instruction × Nat :=
   -- Classify args into int-reg, xmm-reg, and stack groups (preserving order)
   -- Count separately: first 6 non-double args → intArgRegs; first 8 double args → xmmArgRegs
@@ -246,15 +248,19 @@ private def convertFunCall (name : String) (args : List Tacky.Val) (dst : Tacky.
     if deallocBytes != 0 then
       [.Binary .Quadword .Add (.Imm deallocBytes) (.Reg .SP)]
     else []
-  -- Retrieve return value
-  let retAsmType : AsmType := match lookupBst bst name with
-    | some (.FunEntry _ rt) => rt
-    | _                     => .Longword
+  -- Retrieve return value.
+  -- Chapter 17: for void calls (dst = none), skip the return-value move entirely.
   let retInstrs : List Instruction :=
-    if retAsmType == .Double then
-      [.Movsd (.Reg .XMM0) (convertVal dst)]
-    else
-      [.Mov retAsmType (.Reg .AX) (convertVal dst)]
+    match dst with
+    | none => []   -- void call: no return value to capture
+    | some dstVal =>
+        let retAsmType : AsmType := match lookupBst bst name with
+          | some (.FunEntry _ rt) => rt
+          | _                     => .Longword
+        if retAsmType == .Double then
+          [.Movsd (.Reg .XMM0) (convertVal dstVal)]
+        else
+          [.Mov retAsmType (.Reg .AX) (convertVal dstVal)]
   (padInstrs ++ intRegInstrs ++ xmmRegInstrs ++ pushInstrs ++
    callInstr ++ deallocInstrs ++ retInstrs, labelCounter)
 
@@ -332,7 +338,10 @@ private structure CgState where
 private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTable)
     (ctr : Nat) : List Instruction × Nat :=
   match instr with
-  | .Return v =>
+  -- Chapter 17: Return is now Option Val — void functions emit just Ret.
+  | .Return none =>
+      ([.Ret], ctr)
+  | .Return (some v) =>
       let t := valAsmType bst v
       if t == .Double then
         ([.Movsd (convertVal v) (.Reg .XMM0), .Ret], ctr)

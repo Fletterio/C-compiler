@@ -83,6 +83,7 @@ private def asmTypeOf : AST.Typ → AssemblyAST.AsmType
       let alignment  := (AST.Typ.Array elem n).alignOf
       .ByteArray totalBytes alignment
   | .Char | .SChar | .UChar => .Byte   -- Chapter 16: char types are 1-byte
+  | .Void            => .Longword      -- Chapter 17: void has no AsmType; use Longword as sentinel
 
 /-- True iff the type is a signed integer type.
     Double returns false (sign concept doesn't apply to IEEE 754 types).
@@ -96,6 +97,7 @@ private def isSignedTyp : AST.Typ → Bool
   | .Array _ _       => false   -- Chapter 15: arrays are aggregate types
   | .Char | .SChar   => true    -- Chapter 16: char and signed char are signed
   | .UChar           => false   -- Chapter 16: unsigned char is unsigned
+  | .Void            => false   -- Chapter 17: void has no sign
 
 /-- Build the backend symbol table from:
     1. The frontend symbol table (all declared variables and functions).

@@ -82,6 +82,7 @@ private def classifyWord (word : String) : Token :=
   | "signed"   => .KwSigned   -- Chapter 12: signed type keyword
   | "double"   => .KwDouble   -- Chapter 13: double type keyword
   | "char"     => .KwChar     -- Chapter 16: char type keyword
+  | "sizeof"   => .KwSizeof  -- Chapter 17: sizeof operator
   | _          => .Identifier word
 
 -- ---------------------------------------------------------------------------

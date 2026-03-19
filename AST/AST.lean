@@ -94,7 +94,7 @@ namespace AST
     int         →  Int
 -/
 
-/-- The types supported through Chapter 16.
+/-- The types supported through Chapter 17.
     `Int`          is a 32-bit signed integer      (C `int`).
     `Long`         is a 64-bit signed integer      (C `long`).
     `UInt`         is a 32-bit unsigned integer    (C `unsigned int`).
@@ -104,7 +104,8 @@ namespace AST
     `Array t n`    is a fixed-size array of `n` elements of type `t` (Chapter 15).
     `Char`         is a 1-byte character (impl-defined sign) (Chapter 16).
     `SChar`        is a 1-byte signed char                   (Chapter 16).
-    `UChar`        is a 1-byte unsigned char                 (Chapter 16). -/
+    `UChar`        is a 1-byte unsigned char                 (Chapter 16).
+    `Void`         is the incomplete/no-value type           (Chapter 17). -/
 inductive Typ where
   | Int     : Typ              -- 32-bit signed integer
   | Long    : Typ              -- 64-bit signed integer
@@ -116,6 +117,7 @@ inductive Typ where
   | Char    : Typ              -- 1-byte character (impl-defined sign) (Chapter 16)
   | SChar   : Typ              -- 1-byte signed char                   (Chapter 16)
   | UChar   : Typ              -- 1-byte unsigned char                 (Chapter 16)
+  | Void    : Typ              -- incomplete/no-value type              (Chapter 17)
   deriving Repr, BEq
 
 /-- Return the size in bytes of a type. -/
@@ -130,6 +132,7 @@ def Typ.sizeOf : Typ → Nat
   | .Char     => 1   -- Chapter 16: all char variants are 1 byte
   | .SChar    => 1
   | .UChar    => 1
+  | .Void     => 0   -- Chapter 17: void is incomplete; size 0 (should not be allocated)
 
 /-- Return the alignment in bytes of a type.
     Arrays: same as element alignment if total size < 16 bytes, else 16 (ABI). -/
@@ -146,6 +149,7 @@ def Typ.alignOf : Typ → Nat
   | .Char     => 1   -- Chapter 16: char types are 1-byte aligned
   | .SChar    => 1
   | .UChar    => 1
+  | .Void     => 0   -- Chapter 17: void is incomplete; no alignment
 
 /-- A typed constant.
     `ConstInt(n)`:    value fits in (or is explicitly typed as) 32-bit `int`.
@@ -209,7 +213,8 @@ inductive BinaryOp where
     `Constant` to carry a typed `Const` instead of a raw `Int`.
     Chapter 14 adds `AddrOf` (&) and `Dereference` (*).
     Chapter 15 adds `Subscript` for array indexing (a[i]).
-    Chapter 16 adds `StringLiteral` for string constants like "hello". -/
+    Chapter 16 adds `StringLiteral` for string constants like "hello".
+    Chapter 17 adds `SizeOf` (sizeof expression) and `SizeOfT` (sizeof type). -/
 inductive Exp where
   | Constant      : Const → Exp             -- Chapter 11: typed constant
   | Var           : String → Exp            -- variable reference
@@ -225,6 +230,8 @@ inductive Exp where
   | Dereference   : Exp → Exp               -- Chapter 14: *e (dereference pointer)
   | Subscript     : Exp → Exp → Exp         -- Chapter 15: a[i] (array subscript)
   | StringLiteral : String → Exp            -- Chapter 16: "hello" (type = Array(Char, n+1))
+  | SizeOf        : Exp → Exp               -- Chapter 17: sizeof(expr)
+  | SizeOfT       : Typ → Exp               -- Chapter 17: sizeof(type)
   deriving Repr, BEq
 
 /-- An initializer for a variable declaration.
@@ -261,7 +268,7 @@ mutual
 
 /-- A statement in the C subset. -/
 inductive Statement where
-  | Return     : Exp → Statement
+  | Return     : Option Exp → Statement  -- Chapter 17: optional return value (void functions use `Return none`)
   | Expression : Exp → Statement
   | If         : Exp → Statement → Option Statement → Statement
   | Compound   : List BlockItem → Statement

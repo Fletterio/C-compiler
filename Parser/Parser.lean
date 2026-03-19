@@ -93,6 +93,7 @@ private def isDeclSpecToken : Token → Bool
   | .KwSigned   => true   -- Chapter 12
   | .KwDouble   => true   -- Chapter 13
   | .KwChar     => true   -- Chapter 16
+  | .KwVoid     => true   -- Chapter 17: void type
   | .KwStatic   => true
   | .KwExtern   => true
   | _           => false
@@ -114,53 +115,64 @@ private def parseDeclSpecs (tokens : List Token)
     : Except String (Typ × Option StorageClass × List Token) :=
   let rec loop (toks : List Token) (sawInt : Bool) (sawLong : Bool)
                (sawUnsigned : Bool) (sawSigned : Bool) (sawDouble : Bool)
-               (sawChar : Bool)
+               (sawChar : Bool) (sawVoid : Bool)
                (sc : Option StorageClass) : Except String (Typ × Option StorageClass × List Token) :=
     match toks with
     | .KwInt :: rest =>
         if sawInt then .error "Duplicate type specifier 'int'"
         else if sawDouble then .error "Cannot combine 'int' with 'double'"
         else if sawChar then .error "Cannot combine 'int' with 'char'"
-        else loop rest true sawLong sawUnsigned sawSigned false sawChar sc
+        else if sawVoid then .error "Cannot combine 'int' with 'void'"
+        else loop rest true sawLong sawUnsigned sawSigned false sawChar false sc
     | .KwLong :: rest =>
         if sawLong then .error "Duplicate type specifier 'long'"
         else if sawDouble then .error "Cannot combine 'long' with 'double'"
         else if sawChar then .error "Cannot combine 'long' with 'char'"
-        else loop rest sawInt true sawUnsigned sawSigned false sawChar sc
+        else if sawVoid then .error "Cannot combine 'long' with 'void'"
+        else loop rest sawInt true sawUnsigned sawSigned false sawChar false sc
     | .KwUnsigned :: rest =>
         if sawUnsigned then .error "Duplicate type specifier 'unsigned'"
         else if sawSigned then .error "Conflicting type specifiers 'signed' and 'unsigned'"
         else if sawDouble then .error "Cannot combine 'unsigned' with 'double'"
-        else loop rest sawInt sawLong true sawSigned false sawChar sc
+        else if sawVoid then .error "Cannot combine 'unsigned' with 'void'"
+        else loop rest sawInt sawLong true sawSigned false sawChar false sc
     | .KwSigned :: rest =>
         if sawUnsigned then .error "Conflicting type specifiers 'unsigned' and 'signed'"
         else if sawDouble then .error "Cannot combine 'signed' with 'double'"
-        else loop rest sawInt sawLong sawUnsigned true false sawChar sc
+        else if sawVoid then .error "Cannot combine 'signed' with 'void'"
+        else loop rest sawInt sawLong sawUnsigned true false sawChar false sc
     | .KwDouble :: rest =>
         -- Chapter 13: 'double' is a standalone type; cannot be combined with
         -- int/long/unsigned/signed (unlike C's 'long double' which we don't support).
         if sawDouble then .error "Duplicate type specifier 'double'"
-        else if sawInt || sawLong || sawUnsigned || sawSigned || sawChar then
+        else if sawInt || sawLong || sawUnsigned || sawSigned || sawChar || sawVoid then
           .error "Cannot combine 'double' with other type specifiers"
-        else loop rest sawInt sawLong sawUnsigned sawSigned true sawChar sc
+        else loop rest sawInt sawLong sawUnsigned sawSigned true sawChar false sc
     | .KwChar :: rest =>
         -- Chapter 16: 'char' can only be combined with 'signed' or 'unsigned'.
         if sawChar then .error "Duplicate type specifier 'char'"
-        else if sawInt || sawLong || sawDouble then
+        else if sawInt || sawLong || sawDouble || sawVoid then
           .error "Cannot combine 'char' with other type specifiers"
-        else loop rest sawInt sawLong sawUnsigned sawSigned sawDouble true sc
+        else loop rest sawInt sawLong sawUnsigned sawSigned sawDouble true false sc
+    | .KwVoid :: rest =>
+        -- Chapter 17: 'void' is a standalone type; cannot be combined with anything.
+        if sawVoid then .error "Duplicate type specifier 'void'"
+        else if sawInt || sawLong || sawUnsigned || sawSigned || sawDouble || sawChar then
+          .error "Cannot combine 'void' with other type specifiers"
+        else loop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar true sc
     | .KwStatic :: rest =>
         match sc with
         | some _ => .error "Multiple storage class specifiers"
-        | none   => loop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar (some .Static)
+        | none   => loop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar sawVoid (some .Static)
     | .KwExtern :: rest =>
         match sc with
         | some _ => .error "Multiple storage class specifiers"
-        | none   => loop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar (some .Extern)
+        | none   => loop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar sawVoid (some .Extern)
     | _ =>
         -- End of declaration specifiers; determine the type.
         let typ : Except String Typ :=
-          if sawDouble then .ok .Double  -- Chapter 13: double
+          if sawVoid then .ok .Void   -- Chapter 17: void
+          else if sawDouble then .ok .Double  -- Chapter 13: double
           else if sawChar then
             -- Chapter 16: char types
             if sawUnsigned then .ok .UChar       -- unsigned char
@@ -171,11 +183,11 @@ private def parseDeclSpecs (tokens : List Token)
             else .ok .UInt               -- unsigned [int]
           else if sawLong then .ok .Long  -- [signed] [int] long
           else if sawInt || sawSigned then .ok .Int  -- [signed] int
-          else .error "Expected type specifier (int, long, unsigned, signed, double, char, etc.)"
+          else .error "Expected type specifier (int, long, unsigned, signed, double, char, void, etc.)"
         match typ with
         | .error e => .error e
         | .ok t    => .ok (t, sc, toks)
-  loop tokens false false false false false false none
+  loop tokens false false false false false false false none
 
 /-- Consume trailing `*` tokens and wrap the base type in successive `Pointer` layers.
     Chapter 14: `int *` → `Pointer(Int)`, `int **` → `Pointer(Pointer(Int))`, etc. -/
@@ -250,8 +262,11 @@ private def parseAbstractDeclarator (tokens : List Token) : (Typ → Typ) × Lis
           (fun t => innerWrap (arrWrap t), rest''')
       | .error _   => (innerWrap, rest')  -- best-effort recovery
   | _ =>
-      -- Not a star or paren: stop (base case)
-      (id, tokens)
+      -- Not a star or paren: stop at base level.
+      -- Chapter 17: also consume any trailing array dimension suffixes (e.g. `int[2]` in
+      -- `sizeof(int[2])`). Without this, `parseType "int[2]"` would return type `Int`
+      -- and leave `[2]` unconsumed, causing a parse error in `sizeof(int[2])`.
+      parseArrayDimensions tokens
 
 /-- Parse a type specifier for use in cast expressions and parameters.
     Delegates to `parseDeclSpecs` and strips storage-class info.
@@ -324,6 +339,24 @@ private partial def parseFactor (tokens : List Token) : Except String (Exp × Li
   -- Chapter 14: unary `*` (dereference) and `&` (address-of)
   | .Star      :: rest => do let (e, rest') ← parseFactor rest; .ok (.Dereference e, rest')
   | .Ampersand :: rest => do let (e, rest') ← parseFactor rest; .ok (.AddrOf e, rest')
+  -- Chapter 17: sizeof operator.
+  -- `sizeof(type)` is parsed when the token after `(` is a type specifier token.
+  -- `sizeof expr`  is parsed as a unary operator on a factor (no parentheses needed).
+  -- `sizeof(expr)` is also handled: the `(expr)` is a parenthesised factor.
+  | .KwSizeof :: .OpenParen :: rest =>
+      -- After `sizeof(`, peek: if a type specifier follows, it's sizeof(type).
+      -- Otherwise it's sizeof(expr) where (expr) is a parenthesised factor.
+      match parseType rest with
+      | .ok (t, .CloseParen :: rest') => .ok (.SizeOfT t, rest')
+      | _ =>
+          -- Not a type — parse as `sizeof(expr)` where (expr) is a paren expression
+          do
+            let (e, rest') ← parseExp 0 rest
+            let rest''     ← expect .CloseParen rest'
+            .ok (.SizeOf e, rest'')
+  | .KwSizeof :: rest => do
+      let (e, rest') ← parseFactor rest
+      .ok (.SizeOf e, rest')
   -- Prefix ++ and -- desugar to compound assignment
   | .PlusPlus :: rest   => do
       let (e, rest') ← parseFactor rest
@@ -574,6 +607,14 @@ private partial def parseOneParam (tokens : List Token) : Except String ((Typ ×
   let (name, wrapFn, _, tokens) ← parseDeclaratorName tokens
   -- wrapFn applies pointer levels and array dimensions from the declarator to the base type.
   let paramTyp := wrapFn baseTyp
+  -- Chapter 17: C §6.7.6.3 requires array element types to be complete.
+  -- Even though `void foo[3]` is adjusted to `void *`, it is illegal because
+  -- void is an incomplete type.  Detect this BEFORE adjustment (we lose the
+  -- original Array structure afterwards).
+  let _ ← match paramTyp with
+    | .Array .Void _ =>
+        throw "Parameter declared as 'array of void': void is an incomplete type"
+    | _ => pure ()
   -- C §6.7.6.3: "A declaration of a parameter as 'array of type' shall be adjusted to
   -- 'qualified pointer to type'."  The outermost Array wrapper is replaced by a Pointer.
   let adjustedTyp : AST.Typ := match paramTyp with
@@ -724,10 +765,14 @@ private partial def parseStatement (tokens : List Token) : Except String (Statem
   match tokens with
   | .Semicolon :: rest =>
       .ok (.Null, rest)
+  | .KwReturn :: .Semicolon :: rest =>
+      -- Chapter 17: `return;` for void functions — no expression
+      .ok (.Return none, rest)
   | .KwReturn :: rest => do
+      -- `return expr;` — parse expression then semicolon
       let (exp, rest') ← parseExp 0 rest
       let rest''       ← expect .Semicolon rest'
-      .ok (.Return exp, rest'')
+      .ok (.Return (some exp), rest'')
   | .KwIf :: rest => do
       let rest'          ← expect .OpenParen rest
       let (cond, rest'') ← parseExp 0 rest'

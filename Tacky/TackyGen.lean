@@ -575,11 +575,21 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
       let retTyp : AST.Typ := match Semantics.lookupSym st name with
         | some { type := .Fun _ _ rt, .. } => rt
         | _ => .Int
-      let dst := Val.Var (← makeTemporary retTyp)
-      return (dst, retTyp, argInstrs ++ [.FunCall name argVals dst])
+      -- Chapter 17: void function calls have no destination — emit dst = none.
+      -- The dummy Val.Constant 0 is returned from emitExp but will not be used
+      -- (callers that use the result of a void call will be caught by TypeCheck).
+      if retTyp == .Void then do
+        return (.Constant 0, .Void, argInstrs ++ [.FunCall name argVals none])
+      else do
+        let dst := Val.Var (← makeTemporary retTyp)
+        return (dst, retTyp, argInstrs ++ [.FunCall name argVals (some dst)])
   -- Chapter 15: Subscript is fully desugared by TypeCheck into Dereference(Binary.Add(...)).
   -- This case is unreachable in a well-typed program, but exhaustive matching requires it.
   | .Subscript _ _ => return (.Constant 0, .Int, [])
+  -- Chapter 17: SizeOf/SizeOfT are fully evaluated at compile time in TypeCheck
+  -- (replaced with ConstULong constants). These cases are unreachable in a well-typed program.
+  | .SizeOf _  => return (.Constant 0, .ULong, [])
+  | .SizeOfT _ => return (.Constant 0, .ULong, [])
 
 -- ---------------------------------------------------------------------------
 -- Statement and block-item lowering
@@ -652,9 +662,13 @@ mutual
 
 private partial def emitStatement (st : Semantics.SymbolTable) (funcName : String)
     : AST.Statement → GenM (List Instruction)
-  | .Return e => do
+  -- Chapter 17: Return is now Option Exp — void functions use `Return none`.
+  | .Return none => do
+      -- `return;` in a void function: emit Return with no value.
+      return [.Return none]
+  | .Return (some e) => do
       let (v, _, instrs) ← emitExp st e
-      return instrs ++ [.Return v]
+      return instrs ++ [.Return (some v)]
   | .Expression e => do
       let (_, _, instrs) ← emitExp st e
       return instrs
@@ -766,8 +780,14 @@ private def emitFunctionDef (st : Semantics.SymbolTable) (f : AST.FunctionDef)
   let paramNames := f.params.map (·.2)
   let body ← f.body.foldlM (fun acc item => do
     return acc ++ (← emitBlockItem st f.name item)) []
+  -- Chapter 17: void functions get an implicit `return;` (no value).
+  -- Non-void functions get an implicit `return 0;` (C §5.1.2.2.3: main returns 0;
+  -- other non-void functions have undefined behavior if they fall off the end, but
+  -- we emit 0 for safety).
+  let implicitReturn : Instruction :=
+    if f.retTyp == .Void then .Return none else .Return (some (.Constant 0))
   return { name := f.name, params := paramNames,
-           body := body ++ [.Return (.Constant 0)],
+           body := body ++ [implicitReturn],
            global := isGlobal }
 
 -- ---------------------------------------------------------------------------
@@ -787,6 +807,7 @@ private def zeroStaticInits : AST.Typ → List StaticInit
   | .Array elemTyp n => [.ZeroInit (elemTyp.sizeOf * n)]   -- .zero totalBytes
   | .Char | .SChar   => [.CharInit 0]       -- Chapter 16: 1-byte signed char
   | .UChar           => [.UCharInit 0]      -- Chapter 16: 1-byte unsigned char
+  | .Void            => []                  -- Chapter 17: void has no data; unreachable in practice
 
 /-- Convert a single scalar `SymbolTable.InitialValue` + type to one `StaticInit`.
     Used for non-array static variables.
