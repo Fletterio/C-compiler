@@ -81,6 +81,7 @@ private def classifyWord (word : String) : Token :=
   | "unsigned" => .KwUnsigned -- Chapter 12: unsigned type keyword
   | "signed"   => .KwSigned   -- Chapter 12: signed type keyword
   | "double"   => .KwDouble   -- Chapter 13: double type keyword
+  | "char"     => .KwChar     -- Chapter 16: char type keyword
   | _          => .Identifier word
 
 -- ---------------------------------------------------------------------------
@@ -250,6 +251,86 @@ private def tryParseFloat (intChars : List Char) (remaining : List Char)
 -- Single-token matcher
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Chapter 16: Escape sequence and character/string literal helpers
+-- ---------------------------------------------------------------------------
+
+/-- Parse a single escape sequence starting AFTER the backslash.
+    Returns `(charValue, remaining)` where `charValue` is the decoded character value,
+    or `none` if the escape is invalid or input is empty.
+    Supports: `\n \t \r \\ \' \" \a \b \f \v \0` and octal `\NNN` (1-3 digits). -/
+private def parseEscape (cs : List Char) : Option (Char × List Char) :=
+  match cs with
+  | 'n'  :: rest => some ('\n', rest)
+  | 't'  :: rest => some ('\t', rest)
+  | 'r'  :: rest => some ('\r', rest)
+  | '\\' :: rest => some ('\\', rest)
+  | '\'' :: rest => some ('\'', rest)
+  | '"'  :: rest => some ('"',  rest)
+  | '?'  :: rest => some ('?',  rest)     -- \? trigraph prevention escape (C99 §6.4.4.4)
+  | 'a'  :: rest => some ('\x07', rest)   -- alert/bell
+  | 'b'  :: rest => some ('\x08', rest)   -- backspace
+  | 'f'  :: rest => some ('\x0C', rest)   -- form feed
+  | 'v'  :: rest => some ('\x0B', rest)   -- vertical tab
+  | '0'  :: rest => some ('\x00', rest)   -- null byte (simple form)
+  -- Octal escape: 1-3 octal digits (0-7)
+  | c1 :: rest1 =>
+      if c1.val >= '0'.val && c1.val <= '7'.val then
+        let d1 := c1.val - '0'.val
+        match rest1 with
+        | c2 :: rest2 =>
+            if c2.val >= '0'.val && c2.val <= '7'.val then
+              let d2 := c2.val - '0'.val
+              match rest2 with
+              | c3 :: rest3 =>
+                  if c3.val >= '0'.val && c3.val <= '7'.val then
+                    let d3 := c3.val - '0'.val
+                    let v := d1 * 64 + d2 * 8 + d3
+                    some (Char.ofNat v.toNat, rest3)
+                  else
+                    let v := d1 * 8 + d2
+                    some (Char.ofNat v.toNat, rest2)
+              | _ =>
+                  let v := d1 * 8 + d2
+                  some (Char.ofNat v.toNat, rest2)
+            else
+              some (Char.ofNat d1.toNat, rest1)
+        | _ => some (Char.ofNat d1.toNat, rest1)
+      else none
+  | _ => none
+
+/-- Lex a character literal starting AFTER the opening `'`.
+    Returns `some (CharConstant n, remaining)` where `n` is the character value (0–255),
+    or `none` on a malformed literal. -/
+private def lexCharLiteral (chars : List Char) : Option (Token × List Char) :=
+  match chars with
+  | '\\' :: rest =>
+      match parseEscape rest with
+      | some (c, '\'' :: remaining) => some (.CharConstant (c.val.toNat : Int), remaining)
+      | _ => none
+  -- Reject an unescaped `'` here — that would be the empty literal `''`, which is illegal.
+  -- Also reject `\` since that should have been handled above (malformed escape).
+  | c :: '\'' :: rest =>
+      if c == '\'' || c == '\\' then none
+      else some (.CharConstant (c.val.toNat : Int), rest)
+  | _ => none
+
+/-- Lex a string literal starting AFTER the opening `"`.
+    Accumulates the decoded characters in `acc` (reversed), then reverses at the end.
+    Returns `some (StringLiteral s, remaining)` on success, `none` on error.
+    The returned string is the raw character content WITHOUT the null terminator;
+    null termination is handled at a higher level. -/
+private partial def lexStringLiteral (acc : List Char) (chars : List Char)
+    : Option (Token × List Char) :=
+  match chars with
+  | []          => none   -- unterminated string literal
+  | '"' :: rest => some (.StringLiteral (String.ofList acc.reverse), rest)
+  | '\\' :: rest =>
+      match parseEscape rest with
+      | some (c, remaining) => lexStringLiteral (c :: acc) remaining
+      | none                => none
+  | c :: rest   => lexStringLiteral (c :: acc) rest
+
 /-- Try to consume one token from the front of `chars`.
     Returns `some (token, remaining)` on success, or `none` if the first
     character does not start any valid token (triggering a lex error in the
@@ -258,13 +339,15 @@ private def tryParseFloat (intChars : List Char) (remaining : List Char)
     Strategy:
     - Single-character punctuation is matched directly.
     - `-` uses a one-character lookahead to distinguish `-` from `--`.
-    - Identifiers/keywords: scan the longest `\w+` run, require a word
+    - Identifiers/keywords: scan the longest word run, require a word
       boundary after it, then classify the resulting string.
     - Integer constants: scan the longest digit run, require a word boundary
       after it, then parse the digit string as a `Nat`.
     - Floating-point constants (Chapter 13): detected when a digit run is
-      followed by `'.'` or `'e'`/`'E'`, or when input starts with `'.'`
-      followed by a digit.  Parsed via `tryParseFloat`. -/
+      followed by a dot or e/E, or when input starts with a dot followed by a digit.
+      Parsed via `tryParseFloat`.
+    - Character literals (Chapter 16): 'c', backslash-n, backslash-0, octal escapes.
+    - String literals (Chapter 16): double-quoted strings with same escape sequences. -/
 private def nextToken (chars : List Char) : Option (Token × List Char) :=
   match chars with
   | []                  => none
@@ -325,6 +408,10 @@ private def nextToken (chars : List Char) : Option (Token × List Char) :=
   | '-' :: '-' :: rest  => some (.MinusMinus,       rest)
   | '-' :: '=' :: rest  => some (.MinusEqual,       rest)
   | '-' :: rest         => some (.Minus,            rest)
+  -- Chapter 16: character literal 'c' (with escape sequences)
+  | '\'' :: rest => lexCharLiteral rest
+  -- Chapter 16: string literal "..." (with escape sequences)
+  | '"' :: rest => lexStringLiteral [] rest
   -- Chapter 13: floating-point constant starting with '.' (e.g. .5, .25e3)
   -- Must be checked before the catch-all so '.' isn't treated as unknown.
   | '.' :: c :: _ =>
@@ -420,11 +507,26 @@ private partial def tokenizeAux : List Char → List Token → Except String (Li
 -- Public API
 -- ---------------------------------------------------------------------------
 
+/-- Merge adjacent string literal tokens: C translation phase 6.
+    `"foo" "bar"` → `StringLiteral "foobar"`.
+    Uses `partial` because Lean's termination checker cannot verify that
+    `sizeOf(s1 ++ s2)` is strictly smaller than `sizeOf s1 + sizeOf s2`
+    (the concatenated string is longer than either input). -/
+private partial def mergeAdjacentStrings : List Token → List Token
+  | .StringLiteral s1 :: .StringLiteral s2 :: rest =>
+      -- Concatenate the two literals and recurse to handle further adjacency.
+      mergeAdjacentStrings (.StringLiteral (s1 ++ s2) :: rest)
+  | tok :: rest => tok :: mergeAdjacentStrings rest
+  | [] => []
+
 /-- Tokenize a preprocessed C source string.
     Converts the string to a character list and delegates to `tokenizeAux`.
+    Performs adjacent string literal concatenation as a post-processing step
+    (C translation phase 6: `"foo" "bar"` → `"foobar"`).
     Returns the complete token list on success, or an error message identifying
     the first unrecognised character. -/
-def tokenize (input : String) : Except String (List Token) :=
-  tokenizeAux input.toList []
+def tokenize (input : String) : Except String (List Token) := do
+  let toks ← tokenizeAux input.toList []
+  return mergeAdjacentStrings toks
 
 end Lexer

@@ -338,31 +338,76 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
         ([.Movsd (convertVal v) (.Reg .XMM0), .Ret], ctr)
       else
         ([.Mov t (convertVal v) (.Reg .AX), .Ret], ctr)
-  | .SignExtend src dst =>
-      ([.Movsx (convertVal src) (convertVal dst)], ctr)
-  | .Truncate src dst =>
-      ([.Mov .Longword (convertVal src) (convertVal dst)], ctr)
-  | .ZeroExtend src dst =>
-      ([.MovZeroExtend (convertVal src) (convertVal dst)], ctr)
-  -- Chapter 13: integer ↔ double conversions
-  | .IntToDouble src dst =>
-      -- For Long src: use Quadword; for Int src: use Longword
-      let srcT := valAsmType bst src
-      let intT := if srcT == .Quadword then .Quadword else .Longword
-      ([.Cvtsi2sd intT (convertVal src) (convertVal dst)], ctr)
-  | .DoubleToInt src dst =>
+  | .SignExtend srcTyp src dst =>
+      -- Chapter 16: SignExtend now carries the AST srcTyp so we can correctly determine
+      -- the AsmType even for constant sources (where valAsmType always returns Longword).
+      -- Convert AST.Typ → AsmType: Char/SChar → Byte; Int/UInt → Longword; Long/ULong → Quadword.
+      let srcT := match srcTyp with
+        | .Char | .SChar             => AsmType.Byte
+        | .Int  | .UInt              => AsmType.Longword
+        | _                          => AsmType.Quadword   -- Long, ULong, Pointer
       let dstT := valAsmType bst dst
-      let intT := if dstT == .Quadword then .Quadword else .Longword
-      ([.Cvttsd2si intT (convertVal src) (convertVal dst)], ctr)
+      ([.Movsx srcT dstT (convertVal src) (convertVal dst)], ctr)
+  | .Truncate src dst =>
+      -- Chapter 16: dst may be Byte (char); emit Mov with the dst's AsmType.
+      let dstT := valAsmType bst dst
+      ([.Mov dstT (convertVal src) (convertVal dst)], ctr)
+  | .ZeroExtend srcTyp src dst =>
+      -- Chapter 16: ZeroExtend now carries the AST srcTyp (same reason as SignExtend).
+      -- UChar → Byte; UInt → Longword; ULong/Pointer → Quadword.
+      let srcT := match srcTyp with
+        | .UChar                     => AsmType.Byte
+        | .UInt                      => AsmType.Longword
+        | _                          => AsmType.Quadword   -- ULong, Pointer
+      let dstT := valAsmType bst dst
+      ([.MovZeroExtend srcT dstT (convertVal src) (convertVal dst)], ctr)
+  -- Chapter 13: integer ↔ double conversions (extended for Chapter 16 Byte type)
+  | .IntToDouble src dst =>
+      -- Chapter 16: char/schar src (Byte) must be sign-extended to Longword before cvtsi2sd.
+      -- Long src (Quadword): cvtsi2sdq; Int src (Longword): cvtsi2sdl.
+      let srcT := valAsmType bst src
+      match srcT with
+      | .Byte =>
+          -- char → double: sign-extend byte to longword via R10, then convert
+          ([.Movsx .Byte .Longword (convertVal src) (.Reg .R10),
+            .Cvtsi2sd .Longword (.Reg .R10) (convertVal dst)], ctr)
+      | .Quadword =>
+          ([.Cvtsi2sd .Quadword (convertVal src) (convertVal dst)], ctr)
+      | _ =>
+          ([.Cvtsi2sd .Longword (convertVal src) (convertVal dst)], ctr)
+  | .DoubleToInt src dst =>
+      -- Chapter 16: char/schar dst (Byte): convert to Longword in R10, then movb R10→dst.
+      let dstT := valAsmType bst dst
+      match dstT with
+      | .Byte =>
+          ([.Cvttsd2si .Longword (convertVal src) (.Reg .R10),
+            .Mov .Byte (.Reg .R10) (convertVal dst)], ctr)
+      | .Quadword =>
+          ([.Cvttsd2si .Quadword (convertVal src) (convertVal dst)], ctr)
+      | _ =>
+          ([.Cvttsd2si .Longword (convertVal src) (convertVal dst)], ctr)
   | .UIntToDouble src dst =>
-      -- Zero-extend UInt (32-bit) to 64-bit via MovZeroExtend into R10,
-      -- then cvtsi2sdq R10, dst
-      ([.MovZeroExtend (convertVal src) (.Reg .R10),
-        .Cvtsi2sd .Quadword (.Reg .R10) (convertVal dst)], ctr)
+      -- Chapter 16: uchar src (Byte): zero-extend byte to Quadword, then cvtsi2sdq.
+      -- UInt src (Longword): zero-extend 32→64 bits via R10, then cvtsi2sdq.
+      let srcT := valAsmType bst src
+      match srcT with
+      | .Byte =>
+          ([.MovZeroExtend .Byte .Quadword (convertVal src) (.Reg .R10),
+            .Cvtsi2sd .Quadword (.Reg .R10) (convertVal dst)], ctr)
+      | _ =>
+          ([.MovZeroExtend .Longword .Quadword (convertVal src) (.Reg .R10),
+            .Cvtsi2sd .Quadword (.Reg .R10) (convertVal dst)], ctr)
   | .DoubleToUInt src dst =>
-      -- Convert double to Long (Quadword), then truncate to Int (Longword)
-      ([.Cvttsd2si .Quadword (convertVal src) (.Reg .R10),
-        .Mov .Longword (.Reg .R10) (convertVal dst)], ctr)
+      -- Chapter 16: uchar dst (Byte): convert double→Quadword in R10, then movb R10→dst.
+      -- UInt dst (Longword): convert double→Quadword in R10, truncate to Longword.
+      let dstT := valAsmType bst dst
+      match dstT with
+      | .Byte =>
+          ([.Cvttsd2si .Quadword (convertVal src) (.Reg .R10),
+            .Mov .Byte (.Reg .R10) (convertVal dst)], ctr)
+      | _ =>
+          ([.Cvttsd2si .Quadword (convertVal src) (.Reg .R10),
+            .Mov .Longword (.Reg .R10) (convertVal dst)], ctr)
   | .ULongToDouble src dst =>
       let instrs := emitULongToDouble (convertVal src) (convertVal dst) ctr
       (instrs, ctr + 1)
@@ -603,10 +648,15 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
       -- we multiply the index by the scale first using imulq, then use scale=1.
       let idxT := valAsmType bst idx
       let extendIdx : List Instruction :=
-        if idxT == .Longword then
-          [.Movsx (convertVal idx) (.Reg .R9)]    -- sign-extend 32-bit → 64-bit
+        if idxT == .Byte then
+          -- Chapter 16: char index — sign-extend byte directly to 64-bit
+          [.Movsx .Byte .Quadword (convertVal idx) (.Reg .R9)]
+        else if idxT == .Longword then
+          -- Int index — sign-extend 32-bit → 64-bit (handles negative indices correctly)
+          [.Movsx .Longword .Quadword (convertVal idx) (.Reg .R9)]
         else
-          [.Mov .Quadword (convertVal idx) (.Reg .R9)]  -- copy 64-bit directly
+          -- Long/ULong/Pointer index — copy 64-bit directly
+          [.Mov .Quadword (convertVal idx) (.Reg .R9)]
       let scaleInstrs : List Instruction :=
         if scale == 1 || scale == 2 || scale == 4 || scale == 8 then
           -- Valid leaq scale: use (base, idx, scale) addressing directly
@@ -644,26 +694,31 @@ private def convertFunctionDef (f : Tacky.FunctionDef) (bst : BackendSymTable) (
      stackSize    := 0 },
    finalCtr)
 
-/-- Chapter 15: convert one `Tacky.StaticInit` element to its `AssemblyAST.StaticInit`.
+/-- Chapter 15+16: convert one `Tacky.StaticInit` element to its `AssemblyAST.StaticInit`.
     The two types are structurally identical except for the namespace. -/
 private def convertStaticInit : Tacky.StaticInit → StaticInit
-  | .IntInit n    => .IntInit n
-  | .LongInit n   => .LongInit n
-  | .UIntInit n   => .UIntInit n
-  | .ULongInit n  => .ULongInit n
-  | .DoubleInit f => .DoubleInit f
-  | .ZeroInit n   => .ZeroInit n
+  | .IntInit n      => .IntInit n
+  | .LongInit n     => .LongInit n
+  | .UIntInit n     => .UIntInit n
+  | .ULongInit n    => .ULongInit n
+  | .DoubleInit f   => .DoubleInit f
+  | .ZeroInit n     => .ZeroInit n
+  | .CharInit n     => .CharInit n       -- Chapter 16: 1-byte signed char (.byte)
+  | .UCharInit n    => .UCharInit n      -- Chapter 16: 1-byte unsigned char (.byte)
+  | .StringInit s b => .StringInit s b   -- Chapter 16: string bytes (.asciz/.ascii)
+  | .PointerInit s  => .PointerInit s    -- Chapter 16: 8-byte pointer to label (.quad)
 
 /-- Convert a TACKY StaticVariable (with a `List StaticInit`) to an assembly
     StaticVariable.  Determines alignment from the AST type. -/
 private def convertStaticVar (name : String) (global : Bool) (typ : AST.Typ)
     (inits : List Tacky.StaticInit) : AsmTopLevel :=
-  -- Alignment: Int/UInt → 4; everything else → 8; Array → element alignment
+  -- Alignment: Int/UInt → 4; Char/SChar/UChar → 1; Array → array.alignOf; everything else → 8
   let alignment : Nat := match typ with
-    | .Int  | .UInt  => 4
-    | .Array elem n  =>
+    | .Int  | .UInt              => 4
+    | .Char | .SChar | .UChar    => 1   -- Chapter 16: char types are 1-byte aligned
+    | .Array elem n              =>
         if elem.sizeOf * n < 16 then elem.alignOf else 16
-    | _              => 8
+    | _                          => 8
   let asmInits := inits.map convertStaticInit
   .StaticVariable name global alignment asmInits
 
@@ -678,7 +733,12 @@ def genProgram (p : Tacky.Program) (bst : BackendSymTable) : Program :=
         let (asmFd, ctr') := convertFunctionDef fd bst ctr
         (tls ++ [AsmTopLevel.Function asmFd], ctr')
     | .StaticVariable n g t inits =>
-        (tls ++ [convertStaticVar n g t inits], ctr))
+        (tls ++ [convertStaticVar n g t inits], ctr)
+    | .StaticConstant n align inits =>
+        -- Chapter 16: string constant items (`.Lstr.N`) from TackyGen flow through here.
+        -- Convert each StaticInit variant; the alignment and name pass unchanged.
+        let asmInits := inits.map convertStaticInit
+        (tls ++ [AsmTopLevel.StaticConstant n align asmInits], ctr))
     ([], 0)
   { topLevels }
 

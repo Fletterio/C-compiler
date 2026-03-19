@@ -130,13 +130,22 @@ inductive Instruction where
   | JumpIfNotZero : Val → String → Instruction
   | Label         : String → Instruction
   | FunCall       : String → List Val → Val → Instruction
-  /-- Sign-extend `src` (Int) into `dst` (Long/ULong): emits `movslq`. -/
-  | SignExtend    : Val → Val → Instruction
-  /-- Truncate `src` (Long/ULong) to `dst` (Int/UInt): emits `movl` (upper bits discarded). -/
+  /-- Sign-extend `src` into `dst`.
+      Chapter 16: now carries the source `AST.Typ` so CodeGen can determine the
+      source AsmType even for constant operands (where valAsmType returns Longword
+      regardless of whether the constant was a char, int, etc.).
+      - Char/SChar:  Byte → Longword or Byte → Quadword (movsbl / movsbq)
+      - Int:        Longword → Quadword (movslq) -/
+  | SignExtend    : AST.Typ → Val → Val → Instruction
+  /-- Truncate `src` (Long/ULong) to `dst` (Int/UInt/Char): emits `movl`/`movb`
+      (upper bits discarded; dst AsmType determined from BST). -/
   | Truncate      : Val → Val → Instruction
-  /-- Zero-extend `src` (UInt, 32-bit) into `dst` (Long/ULong, 64-bit).
-      On x86-64, movl to a 32-bit register zeroes the upper 32 bits. -/
-  | ZeroExtend    : Val → Val → Instruction
+  /-- Zero-extend `src` into `dst`.
+      Chapter 16: now carries the source `AST.Typ` so CodeGen can determine the
+      source AsmType even for constant operands.
+      - UChar:  Byte → Longword or Byte → Quadword (movzbl / movzbq)
+      - UInt:   Longword → Quadword (movl to 32-bit reg, auto-zeros upper 32 bits) -/
+  | ZeroExtend    : AST.Typ → Val → Val → Instruction
   -- Chapter 13: double ↔ integer conversions ---------------------
   /-- Convert signed 32-bit `src` (Int) to 64-bit double `dst`: `cvtsi2sdl`. -/
   | IntToDouble    : Val → Val → Instruction
@@ -183,7 +192,13 @@ structure FunctionDef where
 /-- Chapter 15: A single element of a static variable's initializer list.
     A scalar variable has a one-element list; an array has one entry per element.
     `ZeroInit n` emits `.zero n` — an efficient block of n zero bytes.
-    This mirrors the AssemblyAST.StaticInit type but lives in the TACKY layer. -/
+    This mirrors the AssemblyAST.StaticInit type but lives in the TACKY layer.
+    Chapter 16 adds:
+      `CharInit(n)`           — 1-byte char value (`.byte n`).
+      `UCharInit(n)`          — 1-byte unsigned char value (`.byte n`).
+      `StringInit(s, null)`   — string bytes; `null=true` → `.asciz` (with `\0`);
+                                 `null=false` → `.ascii` (without `\0`).
+      `PointerInit(label)`    — 8-byte pointer to a label (`.quad label`). -/
 inductive StaticInit where
   | IntInit    : Int   → StaticInit   -- 32-bit value  → .long
   | LongInit   : Int   → StaticInit   -- 64-bit value  → .quad
@@ -191,13 +206,18 @@ inductive StaticInit where
   | ULongInit  : Int   → StaticInit   -- 64-bit unsigned → .quad
   | DoubleInit : Float → StaticInit   -- 64-bit double → .quad (bit pattern)
   | ZeroInit   : Nat   → StaticInit   -- n zero bytes  → .zero n
+  | CharInit   : Int   → StaticInit   -- Chapter 16: 1-byte char → .byte n
+  | UCharInit  : Int   → StaticInit   -- Chapter 16: 1-byte uchar → .byte n
+  | StringInit : String → Bool → StaticInit  -- Chapter 16: string bytes (.asciz/.ascii)
+  | PointerInit : String → StaticInit -- Chapter 16: 8-byte pointer to label (.quad label)
   deriving Repr, BEq
 
 /-- A top-level item in the TACKY program.
     Chapter 11: `StaticVariable` carries the variable type for proper assembly
     section/directive selection (.long vs .quad, .zero 4 vs .zero 8).
     Chapter 13: init was `AST.Const` (was `Int`) to support double inits.
-    Chapter 15: init is `List StaticInit` to support array initializer lists. -/
+    Chapter 15: init is `List StaticInit` to support array initializer lists.
+    Chapter 16: `StaticConstant` holds read-only string data in `.rodata`. -/
 inductive TackyTopLevel where
   | Function       : FunctionDef → TackyTopLevel
   /-- Static variable: name, global flag, type, list of static initializers.
@@ -205,6 +225,11 @@ inductive TackyTopLevel where
       For array variables the list has one element per array element.
       `ZeroInit n` can compact a run of zero-valued elements. -/
   | StaticVariable : String → Bool → AST.Typ → List StaticInit → TackyTopLevel
+  /-- Chapter 16: Read-only constant in `.rodata`.  Used for string literals whose
+      address is taken (e.g. `char *p = "hello"`).
+      name = label (e.g. `.Lstr.0`), alignment = 1 for char arrays,
+      inits = list of `StringInit`/`ZeroInit` etc. -/
+  | StaticConstant : String → Nat → List StaticInit → TackyTopLevel
   deriving Repr, BEq
 
 /-- A complete TACKY program. -/

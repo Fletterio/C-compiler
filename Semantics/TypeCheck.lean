@@ -29,7 +29,21 @@ namespace Semantics
 -- Type helpers
 -- ---------------------------------------------------------------------------
 
+/-- True for the three char variants: Char, SChar, UChar. -/
+private def isCharType : AST.Typ → Bool
+  | .Char | .SChar | .UChar => true
+  | _                       => false
+
+/-- Integer promotion: char types (Char/SChar/UChar) promote to Int.
+    Int can represent all values of signed char (-128..127) and unsigned char (0..255).
+    C §6.3.1.1: "If an int can represent all values of the original type,
+    the value is converted to an int; otherwise it is converted to unsigned int." -/
+private def promoteChar : AST.Typ → AST.Typ
+  | .Char | .SChar | .UChar => .Int
+  | t                       => t
+
 /-- Return the common type for a binary operation (C "usual arithmetic conversions").
+    Chapter 16: char types (Char/SChar/UChar) promote to Int before comparison.
     Chapter 13: `Double` is a floating-point type and outranks all integer types.
     Chapter 12: extends to 4 types (Int, Long, UInt, ULong).
     Rules (C §6.3.1.8):
@@ -45,6 +59,9 @@ namespace Semantics
          UInt + Long  → Long (Long can represent all UInt values [0, 2^32−1]).
       (Rule 6, converting both to unsigned of the signed type, is not reachable here.) -/
 private def commonType (t1 t2 : AST.Typ) : AST.Typ :=
+  -- Chapter 16: integer promotions — char types promote to Int first
+  let t1 := promoteChar t1
+  let t2 := promoteChar t2
   -- Chapter 13: Double outranks all integer types
   if t1 == .Double || t2 == .Double then .Double
   else if t1 == t2 then t1
@@ -64,12 +81,15 @@ private def castTo (target : AST.Typ) (current : AST.Typ) (e : AST.Exp) : AST.Ex
 
 /-- Return true iff `e` is an integer null pointer constant (integer constant with value 0).
     In C, only integer constant expressions with value 0 are null pointer constants.
-    Double 0.0 and integer variables (even if their runtime value is 0) are NOT. -/
+    Double 0.0 and integer variables (even if their runtime value is 0) are NOT.
+    Chapter 16: ConstChar(0) and ConstUChar(0) are also null pointer constants. -/
 private def isNullPtrConstant : AST.Exp → Bool
   | .Constant (.ConstInt n)   => n == 0
   | .Constant (.ConstLong n)  => n == 0
   | .Constant (.ConstUInt n)  => n == 0
   | .Constant (.ConstULong n) => n == 0
+  | .Constant (.ConstChar n)  => n == 0   -- Chapter 16
+  | .Constant (.ConstUChar n) => n == 0   -- Chapter 16
   | _                         => false
 
 /-- True iff a type is a pointer type. -/
@@ -82,9 +102,11 @@ private def isArrayType : AST.Typ → Bool
   | .Array _ _ => true
   | _          => false
 
-/-- True iff a type is an integer type (not pointer, array, or double). -/
+/-- True iff a type is an integer type (not pointer, array, or double).
+    Chapter 16: char types (Char/SChar/UChar) are also integer types. -/
 private def isIntegerType : AST.Typ → Bool
   | .Int | .Long | .UInt | .ULong => true
+  | .Char | .SChar | .UChar       => true   -- Chapter 16
   | _                             => false
 
 /-- Array-to-pointer decay: if `e` has array type, wrap it in `AddrOf` to
@@ -206,6 +228,11 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   | .Constant (.ConstUInt n)   => return (.Constant (.ConstUInt n),   .UInt)    -- Chapter 12
   | .Constant (.ConstULong n)  => return (.Constant (.ConstULong n),  .ULong)   -- Chapter 12
   | .Constant (.ConstDouble f) => return (.Constant (.ConstDouble f), .Double)  -- Chapter 13
+  -- Chapter 16: char constants — type is Char (not promoted here; promotion happens at use site)
+  | .Constant (.ConstChar n)   => return (.Constant (.ConstChar n),   .Char)
+  | .Constant (.ConstUChar n)  => return (.Constant (.ConstUChar n),  .UChar)
+  -- Chapter 16: string literal — type is Array(Char, n+1) (decays to Pointer(Char) in expression contexts)
+  | .StringLiteral s => return (.StringLiteral s, .Array .Char (s.length + 1))
   -- Variable reference: look up type.
   -- Arrays remain as Array type here; decay to pointer happens via
   -- implicitCastTo when used in a rvalue/pointer context (e.g. assignment, function arg).
@@ -226,7 +253,10 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- Exception: logical NOT (!) always produces Int regardless of operand type.
   -- Chapter 13: bitwise complement (~) is not valid on Double.
   | .Unary .Not inner => do
-      let (inner', _) ← typeCheckExp st inner
+      let (inner', innerTyp) ← typeCheckExp st inner
+      -- C §6.3.2.1p3: array operand decays to pointer before applying !.
+      -- This handles `!"string literal"` where the string has array type.
+      let (inner', _) := decayArray inner' innerTyp
       -- Logical NOT always produces int (0 or 1)
       return (.Unary .Not inner', .Int)
   | .Unary .Complement inner => do
@@ -236,12 +266,18 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
         throw s!"TypeCheck: bitwise complement (~) is not valid on a double"
       if isPointerType innerTyp then
         throw s!"TypeCheck: bitwise complement (~) is not valid on a pointer"
+      -- Chapter 16: integer promotion — char types promote to Int before ~
+      let (inner', innerTyp) :=
+        if isCharType innerTyp then (.Cast .Int inner', .Int) else (inner', innerTyp)
       return (.Unary .Complement inner', innerTyp)
   -- Chapter 14: unary negation is not valid on a pointer
   | .Unary .Negate inner => do
       let (inner', innerTyp) ← typeCheckExp st inner
       if isPointerType innerTyp then
         throw s!"TypeCheck: unary negation (-) is not valid on a pointer"
+      -- Chapter 16: integer promotion — char types promote to Int before unary -
+      let (inner', innerTyp) :=
+        if isCharType innerTyp then (.Cast .Int inner', .Int) else (inner', innerTyp)
       return (.Unary .Negate inner', innerTyp)
   -- (All UnaryOp constructors are handled above: Not, Complement, Negate)
   -- Binary operators: apply usual arithmetic conversions
@@ -262,6 +298,9 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
         throw s!"TypeCheck: left operand of shift (<<) cannot be a pointer"
       if isPointerType rightTyp then
         throw s!"TypeCheck: right operand of shift (<<) cannot be a pointer"
+      -- Chapter 16: integer promotion — char types promote to Int (C §6.3.1.1)
+      let (left', leftTyp) :=
+        if isCharType leftTyp then (.Cast .Int left', .Int) else (left', leftTyp)
       return (.Binary .ShiftLeft left' right', leftTyp)
   | .Binary .ShiftRight left right => do
       let (left',  leftTyp)  ← typeCheckExp st left
@@ -275,6 +314,9 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
         throw s!"TypeCheck: left operand of shift (>>) cannot be a pointer"
       if isPointerType rightTyp then
         throw s!"TypeCheck: right operand of shift (>>) cannot be a pointer"
+      -- Chapter 16: integer promotion — char types promote to Int (C §6.3.1.1)
+      let (left', leftTyp) :=
+        if isCharType leftTyp then (.Cast .Int left', .Int) else (left', leftTyp)
       return (.Binary .ShiftRight left' right', leftTyp)
   -- Chapter 13: logical AND/OR — each operand is tested for truthiness
   -- independently; do NOT apply usual arithmetic conversions between them.
@@ -509,17 +551,19 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   | .PostfixIncr e | .PostfixDecr e =>
       throw s!"TypeCheck: invalid lvalue in postfix operator"
   -- Chapter 14: address-of operator: `&e` has type `Pointer(typeOf e)`.
-  -- The operand must be an lvalue (Var, Dereference, or Subscript).
+  -- The operand must be an lvalue (Var, Dereference, Subscript, or StringLiteral).
   -- Note: &*e is valid (cancels out), handled in TackyGen as an optimization.
   -- Chapter 15: &arr where arr is an Array type gives Pointer(Array elem n), not Pointer(elem).
+  -- Chapter 16: &"hello" is valid — string literals are lvalues in read-only data.
   | .AddrOf inner => do
       let (inner', innerTyp) ← typeCheckExp st inner
       -- Only lvalues are valid operands of &
       match inner' with
-      | .Var _         => return (.AddrOf inner', .Pointer innerTyp)
-      | .Dereference _ => return (.AddrOf inner', .Pointer innerTyp)
-      | .Subscript _ _ => return (.AddrOf inner', .Pointer innerTyp)
-      | _ => throw "TypeCheck: operand of address-of (&) must be an lvalue (variable, *expr, or a[i])"
+      | .Var _           => return (.AddrOf inner', .Pointer innerTyp)
+      | .Dereference _   => return (.AddrOf inner', .Pointer innerTyp)
+      | .Subscript _ _   => return (.AddrOf inner', .Pointer innerTyp)
+      | .StringLiteral _ => return (.AddrOf inner', .Pointer innerTyp)   -- Chapter 16
+      | _ => throw "TypeCheck: operand of address-of (&) must be an lvalue (variable, *expr, a[i], or string literal)"
   -- Chapter 14: dereference operator: `*e` has type `t` when `typeOf e = Pointer(t)`
   -- Chapter 15: apply array-to-pointer decay before the pointer check.
   -- e.g. `*(arr + 1)` where `arr : int[N]` — `arr + 1` produces a Pointer(int), OK.
@@ -588,7 +632,8 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
     as if they had static storage duration.
     For scalar types, emits the typed zero constant directly so that
     TackyGen can use the correct AsmType without needing an implicit cast.
-    For array types, recursively creates a CompoundInit of zeros. -/
+    For array types, recursively creates a CompoundInit of zeros.
+    Chapter 16: char types use ConstChar(0) / ConstUChar(0). -/
 private def makeZeroInit : AST.Typ → AST.Initializer
   | .Int       => .SingleInit (.Constant (.ConstInt 0))
   | .Long      => .SingleInit (.Constant (.ConstLong 0))
@@ -597,13 +642,57 @@ private def makeZeroInit : AST.Typ → AST.Initializer
   | .Double    => .SingleInit (.Constant (.ConstDouble 0.0))
   | .Pointer _ => .SingleInit (.Constant (.ConstInt 0))  -- null pointer constant
   | .Array e n => .CompoundInit (List.replicate n (makeZeroInit e))
+  | .Char | .SChar => .SingleInit (.Constant (.ConstChar 0))   -- Chapter 16
+  | .UChar         => .SingleInit (.Constant (.ConstUChar 0))  -- Chapter 16
 
 /-- Type-check an initializer for a variable of the given type.
     Chapter 15: `CompoundInit` is legal only for array types; each element
     is type-checked against the element type.
-    Zero-pads the initializer list to the full array size (C §6.7.9p10). -/
+    Zero-pads the initializer list to the full array size (C §6.7.9p10).
+    Chapter 16: `SingleInit(StringLiteral s)` for a char array is converted to
+    a `CompoundInit` of ConstChar elements (with null terminator, zero-padded).
+    `SingleInit(StringLiteral s)` for a pointer type decays to Pointer(Char). -/
 private partial def typeCheckInitializer (st : SymbolTable) (varTyp : AST.Typ)
     : AST.Initializer → TcM AST.Initializer
+  | .SingleInit (.StringLiteral s) => do
+      -- Chapter 16: string literal initializer — special handling.
+      match varTyp with
+      | .Array elemTyp size =>
+          -- String literal initializing a char array.
+          if !isCharType elemTyp then
+            throw s!"TypeCheck: string literal can only initialize a char array, not {repr varTyp}"
+          -- Build a CompoundInit from the string characters.
+          -- C §6.7.9p14: the null terminator is included if there is room.
+          let chars := s.toList
+          -- `mkChar c` constructs the appropriate typed constant for element type.
+          let mkChar : Char → AST.Const := fun c =>
+            match elemTyp with
+            | .UChar => .ConstUChar (c.toNat : Int)
+            | _      => .ConstChar  (c.toNat : Int)   -- Char or SChar
+          let mkCharInit : Char → AST.Initializer := fun c =>
+            .SingleInit (.Constant (mkChar c))
+          -- C §6.7.9p14: the string (including null terminator) may not exceed the array size.
+          -- `chars.length` is the number of non-null characters in the literal; the null
+          -- terminator would bring it to `chars.length + 1`, so we error when that exceeds `size`.
+          if chars.length > size then
+            throw s!"TypeCheck: string initializer (length {chars.length + 1} with null) is too long for array of size {size}"
+          -- Determine how many chars to store (truncate if array is smaller than string + null)
+          let hasNull := size > chars.length       -- room for '\0'
+          let storedChars := chars.take size       -- only first `size` chars (handles truncation)
+          let charInits := storedChars.map mkCharInit
+          let nullInit : List AST.Initializer :=
+            if hasNull then [mkCharInit '\x00'] else []
+          -- Zero-pad remaining elements after the null terminator
+          let filledCount := storedChars.length + nullInit.length
+          let padCount    := if size > filledCount then size - filledCount else 0
+          let padInits    := List.replicate padCount (mkCharInit '\x00')
+          return .CompoundInit (charInits ++ nullInit ++ padInits)
+      | _ => do
+          -- Non-array context: type-check as a regular string literal expression.
+          -- This handles `char *p = "hello"` — the string literal decays to Pointer(Char).
+          let (e', eTyp) ← typeCheckExp st (.StringLiteral s)
+          let e'' ← implicitCastTo varTyp eTyp e'
+          return .SingleInit e''
   | .SingleInit e => do
       let (e', eTyp) ← typeCheckExp st e
       -- Array types cannot be initialized with a scalar expression
@@ -684,16 +773,23 @@ private partial def typeCheckStmt (st : SymbolTable) (retTyp : AST.Typ) : AST.St
       if isArrayType expTyp then
         throw s!"TypeCheck: switch controlling expression must have integer type, not array"
       let body' ← typeCheckStmt st retTyp body
+      -- C §6.8.4.2p2: integer promotions are performed on the controlling expression.
+      -- Char/SChar/UChar all promote to Int (C §6.3.1.1p2).
+      -- We model this by inserting an explicit Cast to Int and treating the switch as Int-typed.
+      let (exp'', expTyp') : AST.Exp × AST.Typ :=
+        match expTyp with
+        | .Char | .SChar | .UChar => (.Cast .Int exp', .Int)
+        | _                       => (exp', expTyp)
       -- C §6.8.4.2: if the switch controlling expression has 32-bit type,
       -- truncate each case constant to that type's range.
       --   Int  switch → truncate to signed   int32 range.
       --   UInt switch → truncate to unsigned uint32 range.
       -- This must run BEFORE SwitchCollection validates for duplicates.
-      let body'' := match expTyp with
+      let body'' := match expTyp' with
         | .Int  => truncateSwitchCases truncToInt32  body'
         | .UInt => truncateSwitchCases truncToUInt32 body'
         | _     => body'   -- Long/ULong: no truncation needed
-      return .Switch exp' body'' lbl cases
+      return .Switch exp'' body'' lbl cases
   | .Case n body lbl => do
       let body' ← typeCheckStmt st retTyp body
       return .Case n body' lbl

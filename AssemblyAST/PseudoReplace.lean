@@ -67,6 +67,14 @@ private def ReplState.getOrInsert (s : ReplState) (id : String)
           let offset  : Int := -(bytes : Int)
           let op      := Operand.Memory .BP offset
           ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
+      | some (.ObjEntry .Byte _ false) =>
+          -- Chapter 16: local char (1-byte): no alignment needed, allocate 1 byte.
+          -- Note: even though byte slots don't require alignment, we still
+          -- always grow the frame by at least 1 byte per variable.
+          let bytes  := s.maxBytes + 1
+          let offset : Int := -(bytes : Int)
+          let op     := Operand.Memory .BP offset
+          ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
       | some (.ObjEntry (.ByteArray totalBytes elemAlign) _ false) =>
           -- Chapter 15: local array — reserve `totalBytes` bytes at alignment `elemAlign`.
           -- The "base" operand is Memory(BP, -(bytes)) where bytes is the total offset
@@ -112,15 +120,16 @@ private def replaceInstr (s : ReplState) (bst : BackendSymTable)
       let (s, src') := replaceOp s bst src
       let (s, dst') := replaceOp s bst dst
       (s, [.Movsd src' dst'])
-  | .Movsx src dst =>
+  | .Movsx srcT dstT src dst =>
+      -- Chapter 16: Movsx now carries explicit srcType and dstType (Byte→Longword, etc.)
       let (s, src') := replaceOp s bst src
       let (s, dst') := replaceOp s bst dst
-      (s, [.Movsx src' dst'])
-  | .MovZeroExtend src dst =>
-      -- Chapter 12: zero-extend 32-bit uint to 64-bit (FixUp handles memory dst)
+      (s, [.Movsx srcT dstT src' dst'])
+  | .MovZeroExtend srcT dstT src dst =>
+      -- Chapter 16: MovZeroExtend now carries explicit srcType and dstType
       let (s, src') := replaceOp s bst src
       let (s, dst') := replaceOp s bst dst
-      (s, [.MovZeroExtend src' dst'])
+      (s, [.MovZeroExtend srcT dstT src' dst'])
   | .Unary t op operand =>
       let (s, op') := replaceOp s bst operand
       (s, [.Unary t op op'])

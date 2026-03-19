@@ -49,12 +49,15 @@ namespace Tacky
     `floatConsts`: (Chapter 13) maps float-constant labels (e.g. `".LfpC.5"`)
                   to their float values, for emission as read-only static data.
     `needsNegZero`: (Chapter 13) true when a double Negate instruction has been
-                  emitted; the Driver will add the `.Lneg_zero` constant. -/
+                  emitted; the Driver will add the `.Lneg_zero` constant.
+    `strConsts`:  (Chapter 16) maps string-literal labels (e.g. `".Lstr.5"`)
+                  to their string contents, for emission as read-only `.rodata`. -/
 private structure GenState where
-  counter     : Nat
-  typeEnv     : List (String × AST.Typ)
-  floatConsts : List (String × Float)
+  counter      : Nat
+  typeEnv      : List (String × AST.Typ)
+  floatConsts  : List (String × Float)
   needsNegZero : Bool
+  strConsts    : List (String × String)  -- Chapter 16: label → raw string content
 
 private abbrev GenM := StateM GenState
 
@@ -81,6 +84,21 @@ private def internFloat (f : Float) : GenM String := do
   modify (fun st => { st with counter := st.counter + 1,
                                typeEnv := (label, .Double) :: st.typeEnv,
                                floatConsts := (label, f) :: st.floatConsts })
+  return label
+
+/-- (Chapter 16) Intern a string literal: allocate a unique read-only label.
+    The string content (without null terminator) is stored in `strConsts`.
+    Returns the label name to use as `Val.Var label`.
+    The label represents an Array(Char, n+1) in `.rodata`; when its address is
+    taken (via AddrOf), it yields `Pointer(Char)` — a C string pointer. -/
+private def internString (s : String) : GenM String := do
+  let st ← get
+  let label := s!".Lstr.{st.counter}"
+  let arrTyp := AST.Typ.Array .Char (s.length + 1)
+  modify (fun state => { state with
+    counter   := state.counter + 1,
+    typeEnv   := (label, arrTyp) :: state.typeEnv,
+    strConsts := (label, s) :: state.strConsts })
   return label
 
 -- ---------------------------------------------------------------------------
@@ -175,6 +193,15 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
       -- Chapter 13: float constants cannot be immediates; intern as a static label.
       let label ← internFloat f
       return (.Var label, .Double, [])
+  -- Chapter 16: char constants — store as Constant(n) with char type
+  | .Constant (.ConstChar n)   => return (.Constant n, .Char,  [])
+  | .Constant (.ConstUChar n)  => return (.Constant n, .UChar, [])
+  -- Chapter 16: string literal — intern as a read-only string constant in .rodata.
+  -- The result Val is Var(label), type Array(Char, n+1).
+  -- When AddrOf wraps this (array-to-pointer decay), GetAddress emits leaq label(%rip), dst.
+  | .StringLiteral s => do
+      let label ← internString s
+      return (.Var label, .Array .Char (s.length + 1), [])
   | .Var v => do
       let t : AST.Typ := match Semantics.lookupSym st v with
         | some { type := .Obj t, .. } => t
@@ -189,11 +216,11 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
         match targetTyp, srcTyp with
         -- ---- integer ↔ integer conversions (Ch11/Ch12) ----
         -- Widening sign-extend (signed int → wider signed or unsigned type)
-        | .Long,  .Int  => return (dst, .Long,  instrs ++ [.SignExtend src dst])
-        | .ULong, .Int  => return (dst, .ULong, instrs ++ [.SignExtend src dst])
+        | .Long,  .Int  => return (dst, .Long,  instrs ++ [.SignExtend srcTyp src dst])
+        | .ULong, .Int  => return (dst, .ULong, instrs ++ [.SignExtend srcTyp src dst])
         -- Widening zero-extend (unsigned int → wider type)
-        | .Long,  .UInt => return (dst, .Long,  instrs ++ [.ZeroExtend src dst])
-        | .ULong, .UInt => return (dst, .ULong, instrs ++ [.ZeroExtend src dst])
+        | .Long,  .UInt => return (dst, .Long,  instrs ++ [.ZeroExtend srcTyp src dst])
+        | .ULong, .UInt => return (dst, .ULong, instrs ++ [.ZeroExtend srcTyp src dst])
         -- Narrowing truncation (64-bit → 32-bit: keep lower 32 bits)
         | .Int,  .Long  => return (dst, .Int,  instrs ++ [.Truncate src dst])
         | .UInt, .Long  => return (dst, .UInt, instrs ++ [.Truncate src dst])
@@ -214,22 +241,70 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
         | .ULong,  .Double => return (dst, .ULong, instrs ++ [.DoubleToULong src dst])
         -- Chapter 14: pointer ↔ integer casts
         -- Integer → Pointer: sign-extend (Int), zero-extend (UInt), or copy (Long/ULong)
-        | .Pointer _, .Int   => return (dst, targetTyp, instrs ++ [.SignExtend src dst])
-        | .Pointer _, .UInt  => return (dst, targetTyp, instrs ++ [.ZeroExtend src dst])
+        | .Pointer _, .Int   => return (dst, targetTyp, instrs ++ [.SignExtend srcTyp src dst])
+        | .Pointer _, .UInt  => return (dst, targetTyp, instrs ++ [.ZeroExtend srcTyp src dst])
         | .Pointer _, .Long  => return (dst, targetTyp, instrs ++ [.Copy src dst])
         | .Pointer _, .ULong => return (dst, targetTyp, instrs ++ [.Copy src dst])
         -- Pointer → Pointer (reinterpret cast between pointer types)
         | .Pointer _, .Pointer _ => return (dst, targetTyp, instrs ++ [.Copy src dst])
         -- Chapter 15: Array → Pointer (explicit cast, e.g. `(long *)arr` where arr : long[4]).
         -- An array variable used as a value must decay to a pointer to its first element.
-        -- This requires taking the address (GetAddress, which compiles to `leaq`), NOT copying
-        -- the value at arr[0] into the pointer.
-        | .Pointer _, .Array _ _ => return (dst, targetTyp, instrs ++ [.GetAddress src dst])
+        -- There are two sub-cases:
+        --   (a) `arr` is an lvalue array variable → use GetAddress (`leaq arr, dst`).
+        --   (b) The source is `Dereference(p)` where p : Pointer(Array).
+        --       TackyGen's Dereference-of-array optimization returns (ptrVal, Array, instrs)
+        --       WITHOUT emitting a Load — ptrVal is already the pointer to the array's first
+        --       element (i.e. it IS the correct pointer value).  Applying GetAddress here would
+        --       take the address of the *stack slot* holding ptrVal, which is wrong.
+        --       Instead just Copy the pointer value into a typed temporary.
+        | .Pointer _, .Array _ _ =>
+            match inner with
+            | .Dereference _ => return (dst, targetTyp, instrs ++ [.Copy src dst])
+            | _              => return (dst, targetTyp, instrs ++ [.GetAddress src dst])
         -- Pointer → Integer: truncate (Pointer→Int/UInt, 64→32) or copy (Pointer→Long/ULong)
         | .Int,   .Pointer _ => return (dst, targetTyp, instrs ++ [.Truncate src dst])
         | .UInt,  .Pointer _ => return (dst, targetTyp, instrs ++ [.Truncate src dst])
         | .Long,  .Pointer _ => return (dst, targetTyp, instrs ++ [.Copy src dst])
         | .ULong, .Pointer _ => return (dst, targetTyp, instrs ++ [.Copy src dst])
+        -- ---- Chapter 16: char ↔ integer conversions ----
+        -- Char/SChar (signed byte) widening to wider types → sign-extend
+        -- Pass srcTyp so CodeGen knows the source is Byte-sized even for constant operands.
+        | .Int,   .Char | .Int,   .SChar => return (dst, targetTyp, instrs ++ [.SignExtend srcTyp src dst])
+        | .Long,  .Char | .Long,  .SChar => return (dst, targetTyp, instrs ++ [.SignExtend srcTyp src dst])
+        | .UInt,  .Char | .UInt,  .SChar => return (dst, targetTyp, instrs ++ [.SignExtend srcTyp src dst])
+        | .ULong, .Char | .ULong, .SChar => return (dst, targetTyp, instrs ++ [.SignExtend srcTyp src dst])
+        -- UChar (unsigned byte) widening to wider types → zero-extend
+        | .Int,   .UChar => return (dst, targetTyp, instrs ++ [.ZeroExtend srcTyp src dst])
+        | .Long,  .UChar => return (dst, targetTyp, instrs ++ [.ZeroExtend srcTyp src dst])
+        | .UInt,  .UChar => return (dst, targetTyp, instrs ++ [.ZeroExtend srcTyp src dst])
+        | .ULong, .UChar => return (dst, targetTyp, instrs ++ [.ZeroExtend srcTyp src dst])
+        -- Wider integer → Char/SChar/UChar → truncate (keep lower 8 bits)
+        | .Char,  .Int  | .Char,  .Long  | .Char,  .UInt  | .Char,  .ULong =>
+            return (dst, targetTyp, instrs ++ [.Truncate src dst])
+        | .SChar, .Int  | .SChar, .Long  | .SChar, .UInt  | .SChar, .ULong =>
+            return (dst, targetTyp, instrs ++ [.Truncate src dst])
+        | .UChar, .Int  | .UChar, .Long  | .UChar, .UInt  | .UChar, .ULong =>
+            return (dst, targetTyp, instrs ++ [.Truncate src dst])
+        -- Char/SChar ↔ UChar (same 8 bits, reinterpret): copy into new typed temp
+        | .UChar, .Char  | .UChar, .SChar  => return (dst, targetTyp, instrs ++ [.Copy src dst])
+        | .Char,  .UChar | .SChar, .UChar  => return (dst, targetTyp, instrs ++ [.Copy src dst])
+        | .Char,  .SChar | .SChar, .Char   => return (dst, targetTyp, instrs ++ [.Copy src dst])
+        -- Char/SChar → Double: sign-extend-to-int then convert (CodeGen handles byte src)
+        | .Double, .Char | .Double, .SChar => return (dst, targetTyp, instrs ++ [.IntToDouble  src dst])
+        -- UChar → Double: zero-extend-to-int then convert (CodeGen handles byte src)
+        | .Double, .UChar => return (dst, targetTyp, instrs ++ [.UIntToDouble src dst])
+        -- Double → Char/SChar: convert to int then truncate to byte (CodeGen handles byte dst)
+        | .Char,  .Double | .SChar, .Double => return (dst, targetTyp, instrs ++ [.DoubleToInt  src dst])
+        -- Double → UChar: convert to uint then truncate to byte (CodeGen handles byte dst)
+        | .UChar, .Double => return (dst, targetTyp, instrs ++ [.DoubleToUInt src dst])
+        -- Pointer → Char/SChar/UChar: truncate 64-bit pointer to byte
+        | .Char,  .Pointer _ | .SChar, .Pointer _ | .UChar, .Pointer _ =>
+            return (dst, targetTyp, instrs ++ [.Truncate src dst])
+        -- Char/SChar → Pointer: sign-extend byte to 64-bit
+        | .Pointer _, .Char | .Pointer _, .SChar =>
+            return (dst, targetTyp, instrs ++ [.SignExtend srcTyp src dst])
+        -- UChar → Pointer: zero-extend byte to 64-bit
+        | .Pointer _, .UChar => return (dst, targetTyp, instrs ++ [.ZeroExtend srcTyp src dst])
         -- Same-size reinterpret (int↔uint or long↔ulong): copy into a new typed temporary
         | _, _ => return (dst, targetTyp, instrs ++ [.Copy src dst])
   | .Unary .Not inner => do
@@ -356,7 +431,17 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
       else
         -- Plain assignment: emit rhs normally, no double evaluation
         let (rhsVal, _, rhsInstrs) ← emitExp st rhs
-        return (rhsVal, valTyp, ptrInstrs ++ rhsInstrs ++ [.Store rhsVal ptrVal])
+        -- When assigning through a pointer to a narrow type (e.g. char *p; *p = 'J'),
+        -- the rhs may be a Constant (e.g. Constant 74).  `valAsmType(Constant 74)` returns
+        -- Longword (since 74 fits in 32 bits), but the Store should only write 1 byte.
+        -- Fix: route Constant operands through a typed temporary so the BST records the
+        -- correct AsmType (Byte for Char/SChar/UChar), and CodeGen uses the right move width.
+        let (storeVal, storeInstrs) ← match rhsVal with
+          | .Constant _ =>
+              let tmp := Val.Var (← makeTemporary valTyp)
+              pure (tmp, [Instruction.Copy rhsVal tmp])
+          | _ => pure (rhsVal, [])
+        return (rhsVal, valTyp, ptrInstrs ++ rhsInstrs ++ storeInstrs ++ [.Store storeVal ptrVal])
   | .Assignment _ _ => return (.Constant 0, .Int, [])
   | .PostfixIncr (.Var v) => do
       let varTyp : AST.Typ := match Semantics.lookupSym st v with
@@ -690,30 +775,37 @@ private def emitFunctionDef (st : Semantics.SymbolTable) (f : AST.FunctionDef)
 -- ---------------------------------------------------------------------------
 
 /-- Chapter 15: produce `List StaticInit` for a zero-valued aggregate or scalar.
-    Arrays use a single `ZeroInit(n)` entry for efficiency (emits `.zero n`). -/
+    Arrays use a single `ZeroInit(n)` entry for efficiency (emits `.zero n`).
+    Chapter 16: char types use a single zero byte. -/
 private def zeroStaticInits : AST.Typ → List StaticInit
-  | .Int       => [.IntInit 0]
-  | .Long      => [.LongInit 0]
-  | .UInt      => [.UIntInit 0]
-  | .ULong     => [.ULongInit 0]
-  | .Double    => [.DoubleInit 0.0]
-  | .Pointer _ => [.ULongInit 0]      -- null pointer = 0 (64-bit)
+  | .Int             => [.IntInit 0]
+  | .Long            => [.LongInit 0]
+  | .UInt            => [.UIntInit 0]
+  | .ULong           => [.ULongInit 0]
+  | .Double          => [.DoubleInit 0.0]
+  | .Pointer _       => [.ULongInit 0]      -- null pointer = 0 (64-bit)
   | .Array elemTyp n => [.ZeroInit (elemTyp.sizeOf * n)]   -- .zero totalBytes
+  | .Char | .SChar   => [.CharInit 0]       -- Chapter 16: 1-byte signed char
+  | .UChar           => [.UCharInit 0]      -- Chapter 16: 1-byte unsigned char
 
 /-- Convert a single scalar `SymbolTable.InitialValue` + type to one `StaticInit`.
-    Used for non-array static variables. -/
+    Used for non-array static variables.
+    Chapter 16: char types use CharInit/UCharInit. -/
 private def scalarInitToStaticInit (t : AST.Typ) (n : Int) : StaticInit :=
   match t with
-  | .Int       => .IntInit n
-  | .Long      => .LongInit n
-  | .UInt      => .UIntInit n
-  | .ULong     => .ULongInit n
-  | .Pointer _ => .ULongInit n   -- pointer stored as 64-bit value
-  | _          => .IntInit n     -- shouldn't happen for non-double scalar
+  | .Int             => .IntInit n
+  | .Long            => .LongInit n
+  | .UInt            => .UIntInit n
+  | .ULong           => .ULongInit n
+  | .Pointer _       => .ULongInit n   -- pointer stored as 64-bit value
+  | .Char | .SChar   => .CharInit n    -- Chapter 16: 1-byte signed char
+  | .UChar           => .UCharInit n   -- Chapter 16: 1-byte unsigned char
+  | _                => .IntInit n     -- shouldn't happen for non-double scalar
 
 /-- Chapter 15: convert a `SymbolTable.InitialValue` to `List StaticInit`.
     Handles scalars, doubles, tentative (zero-initialized), and arrays.
-    For array elements, recurses into the element type. -/
+    For array elements, recurses into the element type.
+    Chapter 16: handles `StringInitial s` for char arrays. -/
 private def initValToStaticInits (t : AST.Typ)
     : Semantics.InitialValue → List StaticInit
   | .Initial n        => [scalarInitToStaticInit t n]
@@ -723,6 +815,16 @@ private def initValToStaticInits (t : AST.Typ)
   | .ArrayInitial elemInits =>
       let elemTyp := match t with | .Array e _ => e | et => et
       elemInits.foldl (fun acc iv => acc ++ initValToStaticInits elemTyp iv) []
+  | .StringInitial s =>
+      -- Chapter 16: char array initialized from a string literal.
+      -- Emit StringInit + zero padding based on the array's declared size.
+      let size := match t with | .Array _ n => n | _ => s.length + 1
+      let hasNull := size > s.length
+      let truncated := String.ofList (s.toList.take size)   -- truncate if array is smaller than string
+      let padCount  := if size > s.length + 1 then size - s.length - 1 else 0
+      let mainInit  := StaticInit.StringInit truncated hasNull
+      let padInit   := if padCount > 0 then [StaticInit.ZeroInit padCount] else []
+      [mainInit] ++ padInit
 
 /-- Collect static variable entries from the symbol table and emit them as
     TackyTopLevel.StaticVariable items.
@@ -742,10 +844,12 @@ private def emitStaticVars (symTable : Semantics.SymbolTable) : List TackyTopLev
     | _, _ => none
 
 /-- Entry point for the IR generation pass.
-    Returns `(Program, typeEnv, floatConsts, needsNegZero)`. -/
+    Returns `(Program, typeEnv, floatConsts, needsNegZero, strConsts)`.
+    Chapter 16: `strConsts` is a list of (label, content) for string literals;
+    the Driver will create `AssemblyAST.StaticConstant` items for each. -/
 def emitProgram (p : AST.Program) (symTable : Semantics.SymbolTable)
     (initCounter : Nat := 0)
-    : Program × List (String × AST.Typ) × List (String × Float) × Bool :=
+    : Program × List (String × AST.Typ) × List (String × Float) × Bool × List (String × String) :=
   let astFuncs := p.topLevels.filterMap fun tl =>
     match tl with
     | .FunDef fd  => some fd
@@ -759,12 +863,13 @@ def emitProgram (p : AST.Program) (symTable : Semantics.SymbolTable)
       let tackyFd ← emitFunctionDef symTable fd isGlobal
       return acc ++ [.Function tackyFd]) []
   let initState : GenState :=
-    { counter := initCounter, typeEnv := [], floatConsts := [], needsNegZero := false }
+    { counter := initCounter, typeEnv := [], floatConsts := [], needsNegZero := false, strConsts := [] }
   let (funcItems, finalState) := action.run initState
   let staticItems := emitStaticVars symTable
   ({ topLevels := funcItems ++ staticItems },
    finalState.typeEnv,
    finalState.floatConsts,
-   finalState.needsNegZero)
+   finalState.needsNegZero,
+   finalState.strConsts)
 
 end Tacky

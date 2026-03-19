@@ -86,27 +86,30 @@ private def fixInstr : Instruction → List Instruction
         else
           [.Mov t src dst]
   -- ----------------------------------------------------------------
-  -- Movsx: sign-extend int to long
-  --   Invalid: Imm source, or memory destination
+  -- Movsx: sign-extend (now carries explicit srcT and dstT — Chapter 16)
+  --   Invalid: Imm source, or memory destination.
+  --   Byte→Longword  (`movsbl`): src = byte mem/reg, dst = 32-bit reg
+  --   Byte→Quadword  (`movsbq`): src = byte mem/reg, dst = 64-bit reg
+  --   Longword→Quadword (`movslq`): src = 32-bit mem/reg, dst = 64-bit reg
   -- ----------------------------------------------------------------
-  | .Movsx src dst =>
+  | .Movsx srcT dstT src dst =>
       match src, dst with
       | .Imm _, _ =>
-          -- Load Imm into R10 (as 32-bit), then sign-extend to dst
+          -- Load immediate into R10 with srcT size, then sign-extend to R11/dst
           if isMem dst then
-            [.Mov .Longword src (.Reg .R10),
-             .Movsx (.Reg .R10) (.Reg .R11),
-             .Mov .Quadword (.Reg .R11) dst]
+            [.Mov srcT src (.Reg .R10),
+             .Movsx srcT dstT (.Reg .R10) (.Reg .R11),
+             .Mov dstT (.Reg .R11) dst]
           else
-            [.Mov .Longword src (.Reg .R10),
-             .Movsx (.Reg .R10) dst]
+            [.Mov srcT src (.Reg .R10),
+             .Movsx srcT dstT (.Reg .R10) dst]
       | _, _ =>
           if isMem dst then
-            -- Memory destination: go through R11
-            [.Movsx src (.Reg .R11),
-             .Mov .Quadword (.Reg .R11) dst]
+            -- Memory destination: sign-extend to R11, then store with dstT
+            [.Movsx srcT dstT src (.Reg .R11),
+             .Mov dstT (.Reg .R11) dst]
           else
-            [.Movsx src dst]
+            [.Movsx srcT dstT src dst]
   -- ----------------------------------------------------------------
   -- Idiv: operand cannot be an immediate
   -- ----------------------------------------------------------------
@@ -118,17 +121,21 @@ private def fixInstr : Instruction → List Instruction
   | .Div t (.Imm n) =>
       [.Mov t (.Imm n) (.Reg .R10), .Div t (.Reg .R10)]
   -- ----------------------------------------------------------------
-  -- MovZeroExtend: zero-extend 32-bit uint to 64-bit (Chapter 12)
-  --   If dst is memory, we can't movl directly (only 4 bytes written).
-  --   Fix: movl src, R11d (zero-extends R11 to 64 bits), then movq R11, dst.
-  --   If dst is a register, movl to the 32-bit register naturally zero-extends.
+  -- MovZeroExtend: zero-extend smaller type to larger (now typed — Chapter 16)
+  --   Byte→Longword  (`movzbl`): writes 32-bit register, implicitly zeros upper 32 bits
+  --   Byte→Quadword  (`movzbl`): same instruction; zero-extends to 64-bit via 32-bit write
+  --   Longword→Quadword (`movl`): movl to a register naturally zero-extends to 64 bits
+  --
+  --   If dst is memory, we cannot write a zero-extended value directly.
+  --   Fix: MovZeroExtend srcT dstT src R11 (register dst → emitted directly),
+  --        then Mov dstT R11 dst.
   -- ----------------------------------------------------------------
-  | .MovZeroExtend src dst =>
+  | .MovZeroExtend srcT dstT src dst =>
       if isMem dst then
-        [.Mov .Longword src (.Reg .R11),
-         .Mov .Quadword (.Reg .R11) dst]
+        [.MovZeroExtend srcT dstT src (.Reg .R11),
+         .Mov dstT (.Reg .R11) dst]
       else
-        [.MovZeroExtend src dst]
+        [.MovZeroExtend srcT dstT src dst]
   -- ----------------------------------------------------------------
   -- Binary: mem-to-mem, large Quadword immediate, Mult mem-dst
   -- Chapter 13: Double binary ops (addsd/subsd/mulsd/divsd) require

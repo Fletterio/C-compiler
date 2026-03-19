@@ -94,14 +94,17 @@ namespace AST
     int         →  Int
 -/
 
-/-- The types supported through Chapter 15.
+/-- The types supported through Chapter 16.
     `Int`          is a 32-bit signed integer      (C `int`).
     `Long`         is a 64-bit signed integer      (C `long`).
     `UInt`         is a 32-bit unsigned integer    (C `unsigned int`).
     `ULong`        is a 64-bit unsigned integer    (C `unsigned long`).
     `Double`       is a 64-bit IEEE 754 float      (C `double`).
     `Pointer t`    is an 8-byte pointer to `t`     (Chapter 14).
-    `Array t n`    is a fixed-size array of `n` elements of type `t` (Chapter 15). -/
+    `Array t n`    is a fixed-size array of `n` elements of type `t` (Chapter 15).
+    `Char`         is a 1-byte character (impl-defined sign) (Chapter 16).
+    `SChar`        is a 1-byte signed char                   (Chapter 16).
+    `UChar`        is a 1-byte unsigned char                 (Chapter 16). -/
 inductive Typ where
   | Int     : Typ              -- 32-bit signed integer
   | Long    : Typ              -- 64-bit signed integer
@@ -110,6 +113,9 @@ inductive Typ where
   | Double  : Typ              -- 64-bit floating-point     (Chapter 13)
   | Pointer : Typ → Typ        -- 8-byte pointer to t       (Chapter 14)
   | Array   : Typ → Nat → Typ  -- fixed-size array of n elements  (Chapter 15)
+  | Char    : Typ              -- 1-byte character (impl-defined sign) (Chapter 16)
+  | SChar   : Typ              -- 1-byte signed char                   (Chapter 16)
+  | UChar   : Typ              -- 1-byte unsigned char                 (Chapter 16)
   deriving Repr, BEq
 
 /-- Return the size in bytes of a type. -/
@@ -121,6 +127,9 @@ def Typ.sizeOf : Typ → Nat
   | .Double   => 8
   | .Pointer _ => 8
   | .Array elem n => elem.sizeOf * n
+  | .Char     => 1   -- Chapter 16: all char variants are 1 byte
+  | .SChar    => 1
+  | .UChar    => 1
 
 /-- Return the alignment in bytes of a type.
     Arrays: same as element alignment if total size < 16 bytes, else 16 (ABI). -/
@@ -134,19 +143,26 @@ def Typ.alignOf : Typ → Nat
   | .Array elem n =>
       let total := elem.sizeOf * n
       if total < 16 then elem.alignOf else 16
+  | .Char     => 1   -- Chapter 16: char types are 1-byte aligned
+  | .SChar    => 1
+  | .UChar    => 1
 
 /-- A typed constant.
     `ConstInt(n)`:    value fits in (or is explicitly typed as) 32-bit `int`.
     `ConstLong(n)`:   value has the `l`/`L` suffix and is a 64-bit `long`.
     `ConstUInt(n)`:   value has the `u`/`U` suffix — 32-bit unsigned int.     (Ch12)
     `ConstULong(n)`:  value has the `ul`/`lu` suffix — 64-bit unsigned long.  (Ch12)
-    `ConstDouble(f)`: floating-point literal, e.g. 3.14 or 1.5e10.            (Ch13) -/
+    `ConstDouble(f)`: floating-point literal, e.g. 3.14 or 1.5e10.            (Ch13)
+    `ConstChar(n)`:   character literal, type `char`, value in -128..127.      (Ch16)
+    `ConstUChar(n)`:  unsigned char literal, value in 0..255.                  (Ch16) -/
 inductive Const where
   | ConstInt    : Int   → Const  -- 32-bit signed integer literal, e.g. 42
   | ConstLong   : Int   → Const  -- 64-bit signed long literal, e.g. 42L
   | ConstUInt   : Int   → Const  -- 32-bit unsigned int literal, e.g. 42u    (Chapter 12)
   | ConstULong  : Int   → Const  -- 64-bit unsigned long literal, e.g. 42ul  (Chapter 12)
   | ConstDouble : Float → Const  -- 64-bit double literal, e.g. 3.14         (Chapter 13)
+  | ConstChar   : Int   → Const  -- character literal, type char              (Chapter 16)
+  | ConstUChar  : Int   → Const  -- unsigned char literal, type uchar         (Chapter 16)
   deriving Repr, BEq
 
 /-- Storage-class specifier.  Chapter 10 introduces `static` and `extern`.
@@ -192,21 +208,23 @@ inductive BinaryOp where
     Chapter 11 adds `Cast` for explicit/implicit type conversions, and changes
     `Constant` to carry a typed `Const` instead of a raw `Int`.
     Chapter 14 adds `AddrOf` (&) and `Dereference` (*).
-    Chapter 15 adds `Subscript` for array indexing (a[i]). -/
+    Chapter 15 adds `Subscript` for array indexing (a[i]).
+    Chapter 16 adds `StringLiteral` for string constants like "hello". -/
 inductive Exp where
-  | Constant    : Const → Exp             -- Chapter 11: typed constant
-  | Var         : String → Exp            -- variable reference
-  | Cast        : Typ → Exp → Exp         -- Chapter 11: (type)expr cast
-  | Unary       : UnaryOp → Exp → Exp
-  | Binary      : BinaryOp → Exp → Exp → Exp
-  | Assignment  : Exp → Exp → Exp         -- lvalue = rhs
-  | Conditional : Exp → Exp → Exp → Exp  -- cond ? e1 : e2
-  | PostfixIncr : Exp → Exp               -- extra credit: e++
-  | PostfixDecr : Exp → Exp               -- extra credit: e--
-  | FunCall     : String → List Exp → Exp -- Chapter 9: foo(a, b, c)
-  | AddrOf      : Exp → Exp               -- Chapter 14: &e (take address)
-  | Dereference : Exp → Exp               -- Chapter 14: *e (dereference pointer)
-  | Subscript   : Exp → Exp → Exp         -- Chapter 15: a[i] (array subscript)
+  | Constant      : Const → Exp             -- Chapter 11: typed constant
+  | Var           : String → Exp            -- variable reference
+  | Cast          : Typ → Exp → Exp         -- Chapter 11: (type)expr cast
+  | Unary         : UnaryOp → Exp → Exp
+  | Binary        : BinaryOp → Exp → Exp → Exp
+  | Assignment    : Exp → Exp → Exp         -- lvalue = rhs
+  | Conditional   : Exp → Exp → Exp → Exp  -- cond ? e1 : e2
+  | PostfixIncr   : Exp → Exp               -- extra credit: e++
+  | PostfixDecr   : Exp → Exp               -- extra credit: e--
+  | FunCall       : String → List Exp → Exp -- Chapter 9: foo(a, b, c)
+  | AddrOf        : Exp → Exp               -- Chapter 14: &e (take address)
+  | Dereference   : Exp → Exp               -- Chapter 14: *e (dereference pointer)
+  | Subscript     : Exp → Exp → Exp         -- Chapter 15: a[i] (array subscript)
+  | StringLiteral : String → Exp            -- Chapter 16: "hello" (type = Array(Char, n+1))
   deriving Repr, BEq
 
 /-- An initializer for a variable declaration.

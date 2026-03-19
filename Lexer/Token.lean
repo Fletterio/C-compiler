@@ -79,6 +79,10 @@ inductive Token where
   -- Chapter 15: array subscript brackets
   | OpenBracket  : Token   -- [
   | CloseBracket : Token   -- ]
+  -- Chapter 16: char type keyword, character constants, string literals
+  | KwChar       : Token          -- char
+  | CharConstant : Int → Token    -- character literal, e.g. 'a' → 97
+  | StringLiteral : String → Token -- string literal (unescaped contents), e.g. "hello"
   deriving Repr, BEq
 
 /-- Human-readable description of a token, used in parser error messages. -/
@@ -150,7 +154,10 @@ def Token.describe : Token → String
   | .KwExtern      => "\"extern\""
   | .KwDouble      => "\"double\""
   | .DoubleConstant f => s!"double constant \"{f}\""
-  | .OpenBracket  => "\"[\""
-  | .CloseBracket => "\"]\""
+  | .OpenBracket   => "\"[\""
+  | .CloseBracket  => "\"]\""
+  | .KwChar        => "\"char\""
+  | .CharConstant n => s!"character constant '{n}'"
+  | .StringLiteral s => s!"string literal \"{s}\""
 
 end Lexer

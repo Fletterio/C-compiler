@@ -90,12 +90,14 @@ namespace AssemblyAST
     `ByteArray(n, align)` = Chapter 15: an array of `n` total bytes with the given
        alignment requirement.  Used only in the BackendSymTable `ObjEntry` to tell
        PseudoReplace how large a stack slot to reserve for a local array variable.
-       Does NOT appear as an instruction operand type. -/
+       Does NOT appear as an instruction operand type.
+    `Byte`     = 1 byte (8-bit, suffix `b`). Chapter 16: for char types. -/
 inductive AsmType where
   | Longword  : AsmType                -- 4-byte, C `int` / `unsigned int`
   | Quadword  : AsmType                -- 8-byte, C `long` / `unsigned long`
   | Double    : AsmType                -- 8-byte, C `double` (Chapter 13)
   | ByteArray : Nat → Nat → AsmType   -- Chapter 15: (totalBytes, alignment)
+  | Byte      : AsmType                -- 1-byte, C `char` (Chapter 16)
   deriving Repr, BEq
 
 inductive Reg where
@@ -185,10 +187,15 @@ inductive Instruction where
   | Mov            : AsmType → Operand → Operand → Instruction
   /-- Chapter 13: scalar double move: `movsd src, dst`. -/
   | Movsd          : Operand → Operand → Instruction
-  /-- Sign-extend 32-bit int to 64-bit long: `movslq src, dst`. -/
-  | Movsx          : Operand → Operand → Instruction
-  /-- Zero-extend 32-bit unsigned to 64-bit: `movl src32, dst32`. -/
-  | MovZeroExtend  : Operand → Operand → Instruction
+  /-- Sign-extend src to dst.  Chapter 16: now carries explicit (srcType, dstType) so we
+      can generate `movsbl` (Byte→Longword), `movsbq` (Byte→Quadword), or `movslq`
+      (Longword→Quadword).  Prior to Ch16 this was always Longword→Quadword. -/
+  | Movsx          : AsmType → AsmType → Operand → Operand → Instruction
+  /-- Zero-extend src to dst.  Chapter 16: now carries explicit (srcType, dstType) so we
+      can generate `movzbl` (Byte→Longword), `movzbq` (Byte→Quadword), or `movl`
+      (Longword→Quadword, by writing the lower 32 bits).  Prior to Ch16 this was always
+      Longword→Quadword (`movl src32, dst32` zero-extends to 64 bits on x86-64). -/
+  | MovZeroExtend  : AsmType → AsmType → Operand → Operand → Instruction
   | Unary          : AsmType → UnaryOp → Operand → Instruction
   | Binary         : AsmType → BinaryOp → Operand → Operand → Instruction
   | Cmp            : AsmType → Operand → Operand → Instruction
@@ -220,7 +227,13 @@ inductive Instruction where
   deriving Repr, BEq
 
 /-- A typed static variable initializer element.
-    Chapter 15 adds `ZeroInit n` for compactly zero-initializing n bytes (`.zero n`). -/
+    Chapter 15 adds `ZeroInit n` for compactly zero-initializing n bytes (`.zero n`).
+    Chapter 16 adds char/string initializers:
+      `CharInit(n)`           — 1-byte signed char value (`.byte n`).
+      `UCharInit(n)`          — 1-byte unsigned char value (`.byte n`).
+      `StringInit(s, null)`   — string literal bytes; if `null=true`, append `\0` (`.asciz`);
+                                 if `null=false`, do NOT append `\0` (`.ascii`).
+      `PointerInit(label)`    — 8-byte pointer to a label (`.quad label`). -/
 inductive StaticInit where
   | IntInit    : Int   → StaticInit   -- 32-bit signed (.long)
   | LongInit   : Int   → StaticInit   -- 64-bit signed (.quad)
@@ -228,6 +241,10 @@ inductive StaticInit where
   | ULongInit  : Int   → StaticInit   -- 64-bit unsigned (.quad)
   | DoubleInit : Float → StaticInit   -- 64-bit double (Chapter 13, stored as .quad bits)
   | ZeroInit   : Nat   → StaticInit   -- Chapter 15: .zero n (n zero bytes)
+  | CharInit   : Int   → StaticInit   -- Chapter 16: 1-byte signed char (.byte n)
+  | UCharInit  : Int   → StaticInit   -- Chapter 16: 1-byte unsigned char (.byte n)
+  | StringInit : String → Bool → StaticInit  -- Chapter 16: string bytes (.asciz if true, .ascii if false)
+  | PointerInit : String → StaticInit -- Chapter 16: 8-byte pointer to label (.quad label)
   deriving Repr, BEq
 
 structure FunctionDef where
@@ -245,9 +262,11 @@ inductive AsmTopLevel where
       Chapter 15: changed from a single `StaticInit` to `List StaticInit` to
       support arrays with one entry per element (or a `ZeroInit n` for all-zero). -/
   | StaticVariable : String → Bool → Nat → List StaticInit → AsmTopLevel
-  /-- Chapter 13: read-only constant: name, alignment, value.
-      Emitted to `.section .rodata` (not .data/.bss). Never exported (no .globl). -/
-  | StaticConstant : String → Nat → StaticInit → AsmTopLevel
+  /-- Chapter 13+16: read-only constant: name, alignment, list of initializer elements.
+      Emitted to `.section .rodata` (not .data/.bss). Never exported (no .globl).
+      Chapter 16: changed to `List StaticInit` to support string constants that may
+      consist of a `StringInit` followed by a `ZeroInit` for explicit zero-padding. -/
+  | StaticConstant : String → Nat → List StaticInit → AsmTopLevel
   deriving Repr, BEq
 
 structure Program where

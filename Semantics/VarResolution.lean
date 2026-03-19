@@ -95,6 +95,11 @@ private def getSym (name : String) : VarM2 (Option SymbolEntry) := do
 -- Helper: extract integer value from a constant expression (for static inits)
 -- ---------------------------------------------------------------------------
 
+/-- True for the three char variants: Char, SChar, UChar. -/
+private def isCharType : AST.Typ → Bool
+  | .Char | .SChar | .UChar => true
+  | _                       => false
+
 /-- Extract the raw integer value from a constant expression.
     Accepts integer literals and (via truncation) ConstDouble literals.
     C allows initializing `static int i = 4.9;` — the double is truncated
@@ -112,6 +117,8 @@ private def extractConst : AST.Exp → Option Int
       if f.isNaN || f.isInf then some 0
       else if f >= 0.0 then some (Float.toUInt64 f).toNat
       else some (-(Float.toUInt64 (-f)).toNat)
+  | .Constant (.ConstChar n)   => some n     -- Chapter 16
+  | .Constant (.ConstUChar n)  => some n     -- Chapter 16
   | _                          => none
 
 /-- Extract the raw float value from a constant expression.
@@ -124,6 +131,8 @@ private def extractDoubleConst : AST.Exp → Option Float
   | .Constant (.ConstLong n)   => some (Float.ofInt n)    -- implicit long→double
   | .Constant (.ConstUInt n)   => some (Float.ofInt n)    -- implicit uint→double
   | .Constant (.ConstULong n)  => some (Float.ofInt n)    -- implicit ulong→double
+  | .Constant (.ConstChar n)   => some (Float.ofInt n)    -- Chapter 16: implicit char→double
+  | .Constant (.ConstUChar n)  => some (Float.ofInt n)    -- Chapter 16: implicit uchar→double
   | _                          => none
 
 /-- Extract an `InitialValue` from a constant expression given the variable's (scalar) type.
@@ -148,13 +157,28 @@ private def extractScalarInitialValue (varTyp : AST.Typ) (e : AST.Exp) : Option 
 private def zeroInitialValue : AST.Typ → InitialValue
   | .Double    => .DoubleInitial 0.0
   | .Array e n => .ArrayInitial (List.replicate n (zeroInitialValue e))
-  | _          => .Initial 0  -- all integer/pointer/Long/ULong/Int/UInt types
+  | _          => .Initial 0  -- all integer/pointer/char types zero as 0
 
 /-- Extract an `InitialValue` from an `Initializer` for a static variable.
     Handles both scalar `SingleInit` and array `CompoundInit`.
     Missing array elements are zero-initialized.
-    Returns `none` if any element is not a constant expression. -/
+    Returns `none` if any element is not a constant expression.
+    Chapter 16: `SingleInit(StringLiteral s)` for char array types → `StringInitial s`. -/
 private def extractInitialValue (varTyp : AST.Typ) : AST.Initializer → Option InitialValue
+  | .SingleInit (.StringLiteral s) =>
+      -- Chapter 16: string literal as char array initializer → StringInitial.
+      -- Only valid for Array(Char/SChar/UChar, n).  All other types → type error.
+      match varTyp with
+      | .Array elemTyp size =>
+          if isCharType elemTyp then
+            -- C §6.7.9p14: the string (including null terminator) must fit in the array.
+            -- `s.length` is the number of non-null chars; +1 for the null terminator.
+            -- Exception: `size = 0` means an unsized `char arr[] = "..."` declaration
+            -- whose size will be filled in by `fixupCharArraySize` before we get here.
+            if size > 0 && s.length > size then none   -- too long → signal error
+            else some (.StringInitial s)
+          else none
+      | _ => none
   | .SingleInit e =>
       -- Chapter 15: array types cannot be initialized with a scalar expression.
       -- Return `none` so the caller throws a meaningful error.
@@ -187,11 +211,29 @@ private def extractInitialValue (varTyp : AST.Typ) : AST.Initializer → Option 
       | _ => none  -- compound init for non-array type is a type error (caught in TypeCheck)
 
 -- ---------------------------------------------------------------------------
+-- Array-size inference for char arrays (Chapter 16)
+-- ---------------------------------------------------------------------------
+
+/-- For `char arr[] = "hello"` (Array(charTyp, 0) with SingleInit(StringLiteral s)),
+    infer the array size as `s.length + 1` (for the null terminator).
+    For all other declaration forms, the declaration is returned unchanged. -/
+private def fixupCharArraySize (decl : AST.Declaration) : AST.Declaration :=
+  match decl.typ, decl.init with
+  | .Array elemTyp 0, some (.SingleInit (.StringLiteral s)) =>
+      if isCharType elemTyp then
+        { decl with typ := .Array elemTyp (s.length + 1) }
+      else
+        decl  -- non-char element type: leave as-is (will be caught by TypeCheck)
+  | _, _ => decl
+
+-- ---------------------------------------------------------------------------
 -- File-scope variable declaration processing
 -- ---------------------------------------------------------------------------
 
 /-- Process a file-scope variable declaration, applying linkage rules. -/
 private def processFileScopeVar (decl : AST.Declaration) : VarM2 String := do
+  -- Chapter 16: fix up array size for `char arr[] = "hello"` before type checks.
+  let decl := fixupCharArraySize decl
   let name := decl.name
   let varType := decl.typ  -- Chapter 11: use declared type
   match decl.storageClass with
@@ -223,14 +265,16 @@ private def processFileScopeVar (decl : AST.Declaration) : VarM2 String := do
           if existingType != .Obj varType then
             throw s!"Variable '{name}' declared with conflicting types"
           match decl.init, init with
-          | some _, .Initial _ | some _, .DoubleInitial _ | some _, .ArrayInitial _ =>
+          | some _, .Initial _ | some _, .DoubleInitial _ | some _, .ArrayInitial _
+          | some _, .StringInitial _ =>
               throw s!"Variable '{name}' has conflicting definitions"
           | some i, _ =>
               match extractInitialValue varType i with
               | some iv =>
                   addSym name { type := .Obj varType, attrs := .Static iv false }
               | none => throw s!"Initializer for static variable '{name}' must be a constant"
-          | none, .Initial _ | none, .DoubleInitial _ | none, .ArrayInitial _ =>
+          | none, .Initial _ | none, .DoubleInitial _ | none, .ArrayInitial _
+          | none, .StringInitial _ =>
               pure ()
           | none, _ =>
               pure ()
@@ -255,7 +299,8 @@ private def processFileScopeVar (decl : AST.Declaration) : VarM2 String := do
           if existingType != .Obj varType then
             throw s!"Variable '{name}' declared with conflicting types"
           match decl.init, init with
-          | some _, .Initial _ | some _, .DoubleInitial _ | some _, .ArrayInitial _ =>
+          | some _, .Initial _ | some _, .DoubleInitial _ | some _, .ArrayInitial _
+          | some _, .StringInitial _ =>
               throw s!"Variable '{name}' has conflicting definitions"
           | some i, _ =>
               match extractInitialValue varType i with
@@ -317,8 +362,9 @@ private def processFileScopeFun (name : String) (paramCount : Nat)
 
 /-- Rename all variables in an expression according to `identMap`. -/
 private def resolveExp (identMap : IdentMap) : AST.Exp → VarM2 AST.Exp
-  | .Constant c     => return .Constant c
-  | .Var v          => do
+  | .Constant c       => return .Constant c
+  | .StringLiteral s  => return .StringLiteral s  -- Chapter 16: no variables to rename
+  | .Var v            => do
       match lookupIdent identMap v with
       | none => throw s!"Undeclared variable '{v}'"
       | some { info := .Fun _ _, .. } => throw s!"'{v}' is a function, not a variable"
@@ -462,6 +508,8 @@ private partial def resolveBlockItem (identMap : IdentMap) : AST.BlockItem → V
           let identMap' := (decl.name, entry) :: identMap
           return (identMap', .D { decl with name := decl.name })
       | some .Static => do
+          -- Chapter 16: fix up array size for `static char arr[] = "hello"`.
+          let decl := fixupCharArraySize decl
           match lookupIdent identMap decl.name with
           | some { fromCurrent := true, .. } =>
               throw s!"Duplicate declaration of '{decl.name}' in the same scope"
@@ -470,7 +518,7 @@ private partial def resolveBlockItem (identMap : IdentMap) : AST.BlockItem → V
             match decl.init with
             | none   => pure .Tentative
             | some i =>
-                -- Chapter 13/15: use extractInitialValue to support int, double, and array constants
+                -- Chapter 13/15/16: use extractInitialValue to support int, double, array, and string constants
                 match extractInitialValue decl.typ i with
                 | some iv => pure iv
                 | none    => throw s!"Initializer for static variable '{decl.name}' must be a constant"
@@ -480,8 +528,10 @@ private partial def resolveBlockItem (identMap : IdentMap) : AST.BlockItem → V
           let identMap' := (decl.name, entry) :: identMap
           return (identMap', .D { decl with name := renamed, init := none })
       | none => do
+          -- Chapter 16: fix up array size for `char arr[] = "hello"`.
+          let decl := fixupCharArraySize decl
           let (identMap', renamed) ← declareLocalVar identMap decl.name decl.typ
-          -- Chapter 15: resolve initializer (may be SingleInit or CompoundInit)
+          -- Chapter 15/16: resolve initializer (may be SingleInit or CompoundInit)
           let init' ← decl.init.mapM (resolveInitializer identMap')
           return (identMap', .D { name := renamed, typ := decl.typ, init := init', storageClass := none })
   | .FD funDecl => do
@@ -576,6 +626,8 @@ private def resolveFunctionDef (identMap : IdentMap) (f : AST.FunctionDef) : Var
 
 private def resolveTopLevel (identMap : IdentMap) : AST.TopLevel → VarM2 (IdentMap × AST.TopLevel)
   | .VarDecl decl => do
+      -- Chapter 16: fix up array size for `char arr[] = "hello"` before processing.
+      let decl := fixupCharArraySize decl
       let _ ← processFileScopeVar decl
       let entry : IdentEntry := { info := .Var decl.name, fromCurrent := true, hasLinkage := true }
       let identMap' :=
@@ -583,7 +635,7 @@ private def resolveTopLevel (identMap : IdentMap) : AST.TopLevel → VarM2 (Iden
           identMap.map fun (n, e) => if n == decl.name then (n, { e with fromCurrent := true }) else (n, e)
         else
           (decl.name, entry) :: identMap
-      -- Chapter 15: resolve initializer (SingleInit or CompoundInit)
+      -- Chapter 15/16: resolve initializer (SingleInit or CompoundInit)
       let init' ← decl.init.mapM (resolveInitializer identMap')
       return (identMap', .VarDecl { decl with init := init' })
   | .FunDecl fd => do

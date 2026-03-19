@@ -116,10 +116,11 @@ private def emitRegXmm : Reg → String
   | .XMM15 => "%xmm15"
   | r      => panic! s!"emitRegXmm: {repr r} is not an XMM register"
 
-/-- Emit a register name in either 32-bit or 64-bit form based on `AsmType`.
-    For `Double`, use XMM names (should only reach this via emitRegForType). -/
+/-- Emit a register name in the size appropriate for `AsmType`.
+    Chapter 16: `.Byte` maps to 8-bit register names via `emitReg1`. -/
 private def emitRegForType (t : AsmType) (r : Reg) : String :=
   match t with
+  | .Byte          => emitReg1 r
   | .Longword      => emitReg4 r
   | .Quadword      => emitReg8 r
   | .Double        => emitRegXmm r
@@ -166,10 +167,23 @@ private def emitXmmOperand : Operand → String
   | .Pseudo _           => panic! "Pseudo operand reached emission stage"
   | .PseudoMem _ _      => panic! "PseudoMem operand reached emission stage"
 
+/-- Emit a byte-sized operand for `set<cc>` and `movb` instructions.
+    Chapter 16: used for Byte (char) operands. -/
+private def emitByteOperand : Operand → String
+  | .Reg r          => emitReg1 r
+  | .Memory r n     => s!"{n}({emitReg8 r})"            -- Chapter 14
+  | .Data nm        => s!"{nm}(%rip)"
+  | .Imm n          => s!"${n}"
+  | .Indexed b i s  => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
+  | .Pseudo _       => panic! "Pseudo operand reached emission stage"
+  | .PseudoMem _ _  => panic! "PseudoMem operand reached emission stage"
+
 /-- Emit an operand using the register size appropriate for the given `AsmType`.
-    Chapter 13: `.Double` maps to `emitXmmOperand` (XMM registers / memory). -/
+    Chapter 13: `.Double` maps to `emitXmmOperand` (XMM registers / memory).
+    Chapter 16: `.Byte` maps to `emitByteOperand` (8-bit register names). -/
 private def emitOperandForType (t : AsmType) : Operand → String :=
   match t with
+  | .Byte          => emitByteOperand
   | .Longword      => emitOperand
   | .Quadword      => emitOperand8
   | .Double        => emitXmmOperand
@@ -179,16 +193,6 @@ private def emitOperandForType (t : AsmType) : Operand → String :=
 private def emitShiftCount : Operand → String
   | .Reg .CX => "%cl"
   | other    => emitOperand other
-
-/-- Emit a byte-sized operand for `set<cc>` instructions. -/
-private def emitByteOperand : Operand → String
-  | .Reg r          => emitReg1 r
-  | .Memory r n     => s!"{n}({emitReg8 r})"            -- Chapter 14
-  | .Data nm        => s!"{nm}(%rip)"
-  | .Imm n          => s!"${n}"
-  | .Indexed b i s  => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
-  | .Pseudo _       => panic! "Pseudo operand reached emission stage"
-  | .PseudoMem _ _  => panic! "PseudoMem operand reached emission stage"
 
 /-- Emit a condition code suffix for `j<cc>` and `set<cc>`. -/
 private def emitCondCode : CondCode → String
@@ -216,24 +220,49 @@ private def emitCondCode : CondCode → String
 -- caused by exhaustiveness checking across too many (Instruction × AsmType) combos.
 -- ---------------------------------------------------------------------------
 
-/-- Emit a type suffix letter: `l` for Longword, `q` for Quadword/Double/other. -/
+/-- Emit a type suffix letter: `b` for Byte, `l` for Longword, `q` for Quadword/Double/other. -/
 private def typeSuffix (t : AsmType) : String :=
-  if t == .Longword then "l" else "q"
+  match t with
+  | .Byte     => "b"
+  | .Longword => "l"
+  | _         => "q"
 
-/-- Emit Mov-family instructions. -/
+/-- Emit Mov-family instructions.
+    Chapter 16: Mov .Byte emits `movb`; typed Movsx and MovZeroExtend select the
+    correct mnemonic based on (srcType, dstType). -/
 private def emitMovInstr : Instruction → String
-  | .Movsd src dst      => s!"    movsd {emitXmmOperand src}, {emitXmmOperand dst}"
-  | .Mov .Longword s d  => s!"    movl {emitOperand s}, {emitOperand d}"
-  | .Mov .Quadword s d  => s!"    movq {emitOperand8 s}, {emitOperand8 d}"
-  | .Mov _ _ _          => panic! "Mov with non-integer AsmType"
-  | .Movsx s d          => s!"    movslq {emitOperand s}, {emitOperand8 d}"
-  | .MovZeroExtend s d  => s!"    movl {emitOperand s}, {emitOperand d}"
-  | _                   => panic! "emitMovInstr: not a Mov instruction"
+  | .Movsd src dst          => s!"    movsd {emitXmmOperand src}, {emitXmmOperand dst}"
+  | .Mov .Byte s d          => s!"    movb {emitByteOperand s}, {emitByteOperand d}"
+  | .Mov .Longword s d      => s!"    movl {emitOperand s}, {emitOperand d}"
+  | .Mov .Quadword s d      => s!"    movq {emitOperand8 s}, {emitOperand8 d}"
+  | .Mov _ _ _              => panic! "Mov with non-integer AsmType"
+  -- Movsx: sign-extension mnemonics
+  --   Byte→Longword  : movsbl (sign-extend byte to 32-bit)
+  --   Byte→Quadword  : movsbq (sign-extend byte to 64-bit)
+  --   Longword→Quadword : movslq (sign-extend 32-bit to 64-bit)
+  | .Movsx .Byte .Longword s d    => s!"    movsbl {emitByteOperand s}, {emitOperand d}"
+  | .Movsx .Byte .Quadword s d    => s!"    movsbq {emitByteOperand s}, {emitOperand8 d}"
+  | .Movsx .Longword .Quadword s d => s!"    movslq {emitOperand s}, {emitOperand8 d}"
+  | .Movsx _ _ _ _          => panic! "Movsx with unsupported srcType/dstType combination"
+  -- MovZeroExtend: zero-extension mnemonics
+  --   Byte→Longword  : movzbl (zero-extend byte to 32-bit; auto-zeros upper 32 bits)
+  --   Byte→Quadword  : movzbl (same instruction; 32-bit write zeros upper 32 bits of 64-bit reg)
+  --   Longword→Quadword : movl (32-bit write to register; auto-zeros upper 32 bits on x86-64)
+  --   For Byte dst, use 32-bit (emitOperand) since movzbl always targets a 32-bit register.
+  | .MovZeroExtend .Byte .Longword s d  => s!"    movzbl {emitByteOperand s}, {emitOperand d}"
+  | .MovZeroExtend .Byte .Quadword s d  => s!"    movzbl {emitByteOperand s}, {emitOperand d}"
+  | .MovZeroExtend .Longword .Quadword s d => s!"    movl {emitOperand s}, {emitOperand d}"
+  | .MovZeroExtend _ _ _ _  => panic! "MovZeroExtend with unsupported srcType/dstType combination"
+  | _                       => panic! "emitMovInstr: not a Mov instruction"
 
-/-- Emit Unary instructions. -/
+/-- Emit Unary instructions.
+    Chapter 16: `.Byte` case added for `negb`/`notb` (unlikely in practice due to
+    integer promotion, but needed for completeness). -/
 private def emitUnaryInstr : Instruction → String
+  | .Unary .Byte    .Neg d => s!"    negb {emitByteOperand d}"
   | .Unary .Longword .Neg d => s!"    negl {emitOperand d}"
   | .Unary .Quadword .Neg d => s!"    negq {emitOperand8 d}"
+  | .Unary .Byte    .Not d => s!"    notb {emitByteOperand d}"
   | .Unary .Longword .Not d => s!"    notl {emitOperand d}"
   | .Unary .Quadword .Not d => s!"    notq {emitOperand8 d}"
   | .Unary _ _ _            => panic! "Unary with invalid AsmType"
@@ -269,8 +298,10 @@ private def emitDoubleInstr : Instruction → String
   | .Cvttsd2si _ _ _         => panic! "Cvttsd2si with invalid AsmType"
   | _ => panic! "emitDoubleInstr: not a double-specific instruction"
 
-/-- Emit comparison and division instructions. -/
+/-- Emit comparison and division instructions.
+    Chapter 16: `Cmp .Byte` emits `cmpb` for byte comparisons. -/
 private def emitCmpDivInstr : Instruction → String
+  | .Cmp .Byte     s d => s!"    cmpb {emitByteOperand s}, {emitByteOperand d}"
   | .Cmp .Longword s d => s!"    cmpl {emitOperand s}, {emitOperand d}"
   | .Cmp .Quadword s d => s!"    cmpq {emitOperand8 s}, {emitOperand8 d}"
   | .Cmp _ _ _         => panic! "Cmp with invalid AsmType"
@@ -319,6 +350,30 @@ private def emitInstruction (localDefs : List String) (instr : Instruction) : St
   | .Lea src dst => s!"    leaq {emitOperand8 src}, {emitOperand8 dst}"
 
 -- ---------------------------------------------------------------------------
+-- String escaping helper (Chapter 16)
+-- ---------------------------------------------------------------------------
+
+/-- Escape a single character for use in an assembly string literal (GAS syntax).
+    Non-printable characters (outside ASCII 32–126) are emitted as octal escapes `\ooo`.
+    `"` and `\` are escaped as `\"` and `\\`. Common C escape sequences are used for
+    `\n`, `\t`, `\r`. -/
+private def escapeChar (c : Char) : String :=
+  if c == '"'  then "\\\""
+  else if c == '\\' then "\\\\"
+  else if c == '\n' then "\\n"
+  else if c == '\t' then "\\t"
+  else if c == '\r' then "\\r"
+  else if c.toNat >= 32 && c.toNat <= 126 then c.toString
+  else
+    -- Octal escape: backslash + three octal digits
+    let n := c.toNat
+    s!"\\{n / 64}{(n / 8) % 8}{n % 8}"
+
+/-- Escape all characters in a string for assembly `.asciz`/`.ascii` directives. -/
+private def escapeForAsm (s : String) : String :=
+  s.foldl (fun acc c => acc ++ escapeChar c) ""
+
+-- ---------------------------------------------------------------------------
 -- Top-level emission
 -- ---------------------------------------------------------------------------
 
@@ -330,7 +385,7 @@ private def emitFunctionDef (localDefs : List String) (f : FunctionDef) : String
                     (f.instructions.map (emitInstruction localDefs))
   s!"{globalDirective}    .text\n{f.name}:\n{prologue}\n{instrs}"
 
-/-- Chapter 15: emit a single `StaticInit` element as an assembly directive string.
+/-- Chapter 15+16: emit a single `StaticInit` element as an assembly directive string.
     Returns `(directive, isZero)` where `isZero` is true iff the element is all zeros
     (so the caller can decide whether to put it in `.data` or `.bss`). -/
 private def emitOneStaticInit : StaticInit → String × Bool
@@ -343,8 +398,20 @@ private def emitOneStaticInit : StaticInit → String × Bool
       if bits == 0 then ("    .zero 8", true)
       else (s!"    .quad {bits}", false)
   | .ZeroInit n =>
-      -- Chapter 15: emit .zero n for a block of n zero bytes
+      -- Chapter 15: .zero n for a block of n zero bytes
       (s!"    .zero {n}", true)
+  | .CharInit n | .UCharInit n =>
+      -- Chapter 16: 1-byte signed/unsigned char (.byte n; .zero 1 if zero)
+      if n != 0 then (s!"    .byte {n}", false) else ("    .zero 1", true)
+  | .StringInit s true =>
+      -- Chapter 16: null-terminated string (.asciz appends implicit '\0')
+      (s!"    .asciz \"{escapeForAsm s}\"", false)
+  | .StringInit s false =>
+      -- Chapter 16: string bytes without null terminator (.ascii)
+      (s!"    .ascii \"{escapeForAsm s}\"", false)
+  | .PointerInit lbl =>
+      -- Chapter 16: 8-byte pointer to a label (e.g. for `char *p = "hello";` in static storage)
+      (s!"    .quad {lbl}", false)
 
 /-- Emit a static variable definition as assembly directives.
     Chapter 15: `inits` is now `List StaticInit` (one entry per array element or one
@@ -359,23 +426,14 @@ private def emitStaticVariable (name : String) (global : Bool) (alignment : Nat)
   let directives := String.intercalate "\n" (emitted.map (·.1))
   s!"{globalDirective}{sectionDir}\n    .align {alignment}\n{name}:\n{directives}"
 
-/-- Chapter 13: emit a read-only constant (float literal or neg-zero mask) in `.rodata`.
+/-- Chapter 13+16: emit a read-only constant in `.rodata`.
     Never exported with `.globl` (constants are translation-unit-local labels).
-    Uses `.quad` with the raw IEEE 754 bit pattern for exact round-trip fidelity. -/
-private def emitStaticConstant (name : String) (alignment : Nat) (init : StaticInit) : String :=
-  match init with
-  | .DoubleInit f =>
-      let bits : UInt64 := f.toBits
-      s!"    .section .rodata\n    .align {alignment}\n{name}:\n    .quad {bits}"
-  | .LongInit n | .ULongInit n =>
-      -- Used for threshold constants (e.g. 2^63 for ULong↔Double conversion)
-      s!"    .section .rodata\n    .align {alignment}\n{name}:\n    .quad {n}"
-  | .IntInit n | .UIntInit n =>
-      s!"    .section .rodata\n    .align {alignment}\n{name}:\n    .long {n}"
-  | .ZeroInit _ =>
-      -- StaticConstants are never zero-initialized (they are float/long literals),
-      -- but Lean requires exhaustiveness.
-      panic! "ZeroInit cannot appear in a StaticConstant"
+    Chapter 16: changed to accept `List StaticInit` to support string constants
+    that may have a `StringInit` followed by a `ZeroInit` for padding. -/
+private def emitStaticConstant (name : String) (alignment : Nat) (inits : List StaticInit) : String :=
+  let emitted   := inits.map emitOneStaticInit
+  let directives := String.intercalate "\n" (emitted.map (·.1))
+  s!"    .section .rodata\n    .align {alignment}\n{name}:\n{directives}"
 
 /-- Entry point for the emission pass. -/
 def emitProgram (p : Program) : String :=
@@ -389,7 +447,7 @@ def emitProgram (p : Program) : String :=
     match tl with
     | .Function f                              => emitFunctionDef localDefs f
     | .StaticVariable name glob align init     => emitStaticVariable name glob align init
-    | .StaticConstant name align init          => emitStaticConstant name align init
+    | .StaticConstant name align inits         => emitStaticConstant name align inits
   let body := String.intercalate "\n" topLevelStrings
   s!"{body}\n    .section .note.GNU-stack,\"\",@progbits\n"
 

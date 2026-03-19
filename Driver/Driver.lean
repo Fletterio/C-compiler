@@ -82,6 +82,7 @@ private def asmTypeOf : AST.Typ → AssemblyAST.AsmType
       -- 8 for pointer arrays, under-aligning large arrays.
       let alignment  := (AST.Typ.Array elem n).alignOf
       .ByteArray totalBytes alignment
+  | .Char | .SChar | .UChar => .Byte   -- Chapter 16: char types are 1-byte
 
 /-- True iff the type is a signed integer type.
     Double returns false (sign concept doesn't apply to IEEE 754 types).
@@ -93,6 +94,8 @@ private def isSignedTyp : AST.Typ → Bool
   | .Double          => false
   | .Pointer _       => false   -- Chapter 14: pointers are unsigned
   | .Array _ _       => false   -- Chapter 15: arrays are aggregate types
+  | .Char | .SChar   => true    -- Chapter 16: char and signed char are signed
+  | .UChar           => false   -- Chapter 16: unsigned char is unsigned
 
 /-- Build the backend symbol table from:
     1. The frontend symbol table (all declared variables and functions).
@@ -113,6 +116,7 @@ private def buildBackendSymTable
     (frontendSt : Semantics.SymbolTable)
     (typeEnv    : List (String × AST.Typ))
     (floatConsts : List (String × Float) := [])
+    (strConsts   : List (String × String) := [])   -- Chapter 16
     : AssemblyAST.BackendSymTable :=
   -- Convert frontend entries
   let fromFrontend : AssemblyAST.BackendSymTable :=
@@ -138,7 +142,11 @@ private def buildBackendSymTable
   -- that buildBackendSymTable would otherwise create from typeEnv).
   let floatConstBst : AssemblyAST.BackendSymTable :=
     floatConsts.map fun (name, _) => (name, .ObjEntry .Double false true)
-  floatConstBst ++ fromFrontend ++ fromTypeEnv
+  -- Chapter 16: string const labels must be static (RIP-relative Data operands).
+  -- Each string literal label refers to a ByteArray(n+1, 1) in .rodata.
+  let strConstBst : AssemblyAST.BackendSymTable :=
+    strConsts.map fun (name, s) => (name, .ObjEntry (.ByteArray (s.length + 1) 1) false true)
+  strConstBst ++ floatConstBst ++ fromFrontend ++ fromTypeEnv
 
 -- ---------------------------------------------------------------------------
 -- Pipeline steps
@@ -206,16 +214,18 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
   match Semantics.resolveLabels resolvedAst with
   | .ok ()     => pure ()
   | .error msg => throw (IO.userError s!"Semantic error: {msg}")
-  -- TACKY generation: returns (program, typeEnv, floatConsts, needsNegZero)
+  -- TACKY generation: returns (program, typeEnv, floatConsts, needsNegZero, strConsts)
   -- Chapter 13: floatConsts = list of (label, Float) for float literal constants;
   --             needsNegZero = true if any double negation was emitted (needs .Lneg_zero).
-  let (tacky, typeEnv, floatConsts, needsNegZero) :=
+  -- Chapter 16: strConsts = list of (label, String) for string literal constants.
+  let (tacky, typeEnv, floatConsts, needsNegZero, strConsts) :=
     Tacky.emitProgram resolvedAst symTable initCounter
   if stage == .Tacky then return none
   -- Build backend symbol table from frontend sym table + TACKY typeEnv.
   -- Float const labels (in floatConsts) need isStatic = true so PseudoReplace maps
   -- them to Data(name) operands instead of stack slots.
-  let bst := buildBackendSymTable symTable typeEnv floatConsts
+  -- Chapter 16: string const labels (in strConsts) also need isStatic = true.
+  let bst := buildBackendSymTable symTable typeEnv floatConsts strConsts
   -- Assembly generation pass 1: TACKY → Assembly AST
   let asmAst := AssemblyAST.genProgram tacky bst
   -- Assembly generation pass 2: replace pseudoregisters
@@ -225,21 +235,29 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
   -- Chapter 13: append StaticConstant items for float literals, neg-zero, and
   -- the ULong↔Double threshold constant.
   -- These must be appended AFTER fixUp (StaticConstants have no pseudo operands).
+  -- Chapter 13: emit float literal constants in `.rodata` (one per unique float value).
+  -- `StaticConstant` now takes `List StaticInit`; each float is a singleton list.
   let floatConstItems : List AssemblyAST.AsmTopLevel :=
     floatConsts.map fun (name, f) =>
-      .StaticConstant name 8 (.DoubleInit f)
+      .StaticConstant name 8 [.DoubleInit f]
   let negZeroItems : List AssemblyAST.AsmTopLevel :=
     if needsNegZero then
       -- -0.0 IEEE 754 bit pattern: 0x8000000000000000 = sign bit only
-      [.StaticConstant ".Lneg_zero" 16 (.LongInit (-9223372036854775808))]
+      [.StaticConstant ".Lneg_zero" 16 [.LongInit (-9223372036854775808)]]
     else []
   -- Always emit the ULong threshold (2^63 = 0x43E0000000000000 as IEEE 754 double bits).
   -- CodeGen references .Lulong_thresh whenever DoubleToULong or ULongToDouble appears.
   -- Emitting unconditionally is safe: unused rodata is harmless.
   let threshItems : List AssemblyAST.AsmTopLevel :=
-    [.StaticConstant ".Lulong_thresh" 8 (.ULongInit 4890909195324358656)]
+    [.StaticConstant ".Lulong_thresh" 8 [.ULongInit 4890909195324358656]]
+  -- Chapter 16: emit StaticConstant items for string literals.
+  -- Each string constant is a null-terminated char array in .rodata (alignment 1).
+  -- The label (e.g. `.Lstr.5`) was allocated by TackyGen.internString.
+  let strConstItems : List AssemblyAST.AsmTopLevel :=
+    strConsts.map fun (name, s) =>
+      .StaticConstant name 1 [.StringInit s true]
   let asmAst : AssemblyAST.Program :=
-    { topLevels := asmAst.topLevels ++ floatConstItems ++ negZeroItems ++ threshItems }
+    { topLevels := asmAst.topLevels ++ floatConstItems ++ negZeroItems ++ threshItems ++ strConstItems }
   if stage == .Codegen then return none
   -- Emit assembly
   let assemblyPath := changeExtension preprocessedPath ".s"
