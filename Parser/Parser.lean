@@ -94,107 +94,11 @@ private def isDeclSpecToken : Token → Bool
   | .KwDouble   => true   -- Chapter 13
   | .KwChar     => true   -- Chapter 16
   | .KwVoid     => true   -- Chapter 17: void type
+  | .KwStruct   => true   -- Chapter 18: struct type
+  | .KwUnion    => true   -- Chapter 18: union type (extra credit)
   | .KwStatic   => true
   | .KwExtern   => true
   | _           => false
-
-/-- Parse all declaration specifiers in any order (C allows intermixing).
-    Collects `int`, `long`, `unsigned`, `static`, `extern` in any order, then
-    returns the resolved type and storage class.
-
-    Valid type combos (Chapter 12):
-      `int`, `long`, `int long`, `long int` → Int / Long (signed)
-      `unsigned`, `unsigned int`, `int unsigned` → UInt
-      `unsigned long`, `long unsigned`, `unsigned long int`, … → ULong
-
-    At most one storage class (`static` or `extern`).
-
-    Used for top-level and block-scope declarations where C allows
-    `int static long x` as equivalent to `static long x`. -/
-private def parseDeclSpecs (tokens : List Token)
-    : Except String (Typ × Option StorageClass × List Token) :=
-  let rec loop (toks : List Token) (sawInt : Bool) (sawLong : Bool)
-               (sawUnsigned : Bool) (sawSigned : Bool) (sawDouble : Bool)
-               (sawChar : Bool) (sawVoid : Bool)
-               (sc : Option StorageClass) : Except String (Typ × Option StorageClass × List Token) :=
-    match toks with
-    | .KwInt :: rest =>
-        if sawInt then .error "Duplicate type specifier 'int'"
-        else if sawDouble then .error "Cannot combine 'int' with 'double'"
-        else if sawChar then .error "Cannot combine 'int' with 'char'"
-        else if sawVoid then .error "Cannot combine 'int' with 'void'"
-        else loop rest true sawLong sawUnsigned sawSigned false sawChar false sc
-    | .KwLong :: rest =>
-        if sawLong then .error "Duplicate type specifier 'long'"
-        else if sawDouble then .error "Cannot combine 'long' with 'double'"
-        else if sawChar then .error "Cannot combine 'long' with 'char'"
-        else if sawVoid then .error "Cannot combine 'long' with 'void'"
-        else loop rest sawInt true sawUnsigned sawSigned false sawChar false sc
-    | .KwUnsigned :: rest =>
-        if sawUnsigned then .error "Duplicate type specifier 'unsigned'"
-        else if sawSigned then .error "Conflicting type specifiers 'signed' and 'unsigned'"
-        else if sawDouble then .error "Cannot combine 'unsigned' with 'double'"
-        else if sawVoid then .error "Cannot combine 'unsigned' with 'void'"
-        else loop rest sawInt sawLong true sawSigned false sawChar false sc
-    | .KwSigned :: rest =>
-        if sawUnsigned then .error "Conflicting type specifiers 'unsigned' and 'signed'"
-        else if sawDouble then .error "Cannot combine 'signed' with 'double'"
-        else if sawVoid then .error "Cannot combine 'signed' with 'void'"
-        else loop rest sawInt sawLong sawUnsigned true false sawChar false sc
-    | .KwDouble :: rest =>
-        -- Chapter 13: 'double' is a standalone type; cannot be combined with
-        -- int/long/unsigned/signed (unlike C's 'long double' which we don't support).
-        if sawDouble then .error "Duplicate type specifier 'double'"
-        else if sawInt || sawLong || sawUnsigned || sawSigned || sawChar || sawVoid then
-          .error "Cannot combine 'double' with other type specifiers"
-        else loop rest sawInt sawLong sawUnsigned sawSigned true sawChar false sc
-    | .KwChar :: rest =>
-        -- Chapter 16: 'char' can only be combined with 'signed' or 'unsigned'.
-        if sawChar then .error "Duplicate type specifier 'char'"
-        else if sawInt || sawLong || sawDouble || sawVoid then
-          .error "Cannot combine 'char' with other type specifiers"
-        else loop rest sawInt sawLong sawUnsigned sawSigned sawDouble true false sc
-    | .KwVoid :: rest =>
-        -- Chapter 17: 'void' is a standalone type; cannot be combined with anything.
-        if sawVoid then .error "Duplicate type specifier 'void'"
-        else if sawInt || sawLong || sawUnsigned || sawSigned || sawDouble || sawChar then
-          .error "Cannot combine 'void' with other type specifiers"
-        else loop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar true sc
-    | .KwStatic :: rest =>
-        match sc with
-        | some _ => .error "Multiple storage class specifiers"
-        | none   => loop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar sawVoid (some .Static)
-    | .KwExtern :: rest =>
-        match sc with
-        | some _ => .error "Multiple storage class specifiers"
-        | none   => loop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar sawVoid (some .Extern)
-    | _ =>
-        -- End of declaration specifiers; determine the type.
-        let typ : Except String Typ :=
-          if sawVoid then .ok .Void   -- Chapter 17: void
-          else if sawDouble then .ok .Double  -- Chapter 13: double
-          else if sawChar then
-            -- Chapter 16: char types
-            if sawUnsigned then .ok .UChar       -- unsigned char
-            else if sawSigned then .ok .SChar    -- signed char
-            else .ok .Char                       -- plain char (impl-defined sign)
-          else if sawUnsigned then
-            if sawLong then .ok .ULong   -- unsigned long [int]
-            else .ok .UInt               -- unsigned [int]
-          else if sawLong then .ok .Long  -- [signed] [int] long
-          else if sawInt || sawSigned then .ok .Int  -- [signed] int
-          else .error "Expected type specifier (int, long, unsigned, signed, double, char, void, etc.)"
-        match typ with
-        | .error e => .error e
-        | .ok t    => .ok (t, sc, toks)
-  loop tokens false false false false false false false none
-
-/-- Consume trailing `*` tokens and wrap the base type in successive `Pointer` layers.
-    Chapter 14: `int *` → `Pointer(Int)`, `int **` → `Pointer(Pointer(Int))`, etc. -/
-private def consumeStars (baseTyp : Typ) (tokens : List Token) : Typ × List Token :=
-  match tokens with
-  | .Star :: rest => consumeStars (.Pointer baseTyp) rest
-  | _             => (baseTyp, tokens)
 
 /-- Chapter 15: Parse zero or more array dimension suffixes `[N]` after a declarator name.
     Returns a type-wrapping function and the remaining tokens.
@@ -238,6 +142,201 @@ private def parseArrayDimensions (tokens : List Token) : (Typ → Typ) × List T
       -- Not an array dimension suffix; stop and return the identity wrap.
       (id, tokens)
 
+/-- Chapter 18: Parse a simplified member declarator: [*]* identifier [[n]]*.
+    Used inside struct/union body parsing instead of the full `parseDeclaratorName`
+    to avoid a circular dependency between the struct-member mutual block and the
+    parameter-parsing mutual block.
+    Supports: `int x`, `int *p`, `int arr[3]`, `int **pp[2]`, etc.
+    Does NOT support: parenthesized declarators like `int (*fn)(void)`. -/
+private def parseMemberDeclarator (tokens : List Token)
+    : Except String (String × (Typ → Typ) × List Token) :=
+  -- Consume leading '*' tokens, building up a pointer-wrapping function.
+  -- Each '*' adds a Pointer layer OUTSIDE whatever has been wrapped so far.
+  -- e.g. `int **x` → wrapFn = fun t => Pointer (Pointer t)
+  let rec applyStars (wrapSoFar : Typ → Typ) (toks : List Token)
+      : Except String (String × (Typ → Typ) × List Token) :=
+    match toks with
+    | .Star :: rest =>
+        applyStars (fun t => Typ.Pointer (wrapSoFar t)) rest
+    | .Identifier name :: rest =>
+        -- Consume any trailing array dimension suffixes: `[N]`, `[N][M]`, etc.
+        let (arrWrap, rest') := parseArrayDimensions rest
+        -- Final type-wrapping function: inner = arrWrap (handles [N] dims),
+        -- outer = pointer wrapping (handles leading *'s).
+        .ok (name, fun t => wrapSoFar (arrWrap t), rest')
+    | tok :: _ => .error s!"Expected member name but found {tok.describe}"
+    | []       => .error "Expected member name but reached end of input"
+  applyStars id tokens
+
+-- Chapter 18: `parseDeclSpecs`, `declSpecLoop`, and `parseStructMembers` are mutually
+-- recursive: struct/union type specifiers in declSpecLoop call parseStructMembers,
+-- which calls parseDeclSpecs, which delegates to declSpecLoop.
+mutual
+
+/-- Parse the body of a struct or union definition: `member ; ... }`.
+    Called AFTER consuming the opening `{`.
+    Returns a list of (type, name) pairs and the remaining tokens after the `}`. -/
+private partial def parseStructMembers (tokens : List Token)
+    : Except String (List (AST.Typ × String) × List Token) :=
+  match tokens with
+  | [] => .error "Unexpected end of input inside struct/union definition"
+  | _ => do
+      -- Parse the member's type specifier; ignore nested struct def info (3rd field).
+      let (memberTyp, _, _, rest) ← parseDeclSpecs tokens
+      -- Parse the member's declarator (simplified: no function declarators).
+      let (name, wrapFn, rest') ← parseMemberDeclarator rest
+      let finalTyp := wrapFn memberTyp
+      -- Semicolon terminates each member declaration.
+      let rest'' ← expect .Semicolon rest'
+      -- Recurse for any additional members (CloseBrace terminates the list).
+      match rest'' with
+      | .CloseBrace :: rest''' => .ok ([(finalTyp, name)], rest''')
+      | _ =>
+          let (more, rest''') ← parseStructMembers rest''
+          .ok ((finalTyp, name) :: more, rest''')
+
+/-- Chapter 18: declaration-specifier accumulation loop, extracted from `parseDeclSpecs`
+    so that `mutual` can properly express the recursion through `parseStructMembers`.
+    Accumulates type-specifier flags and calls `parseStructMembers` for struct/union bodies. -/
+private partial def declSpecLoop
+    (toks : List Token) (sawInt : Bool) (sawLong : Bool)
+    (sawUnsigned : Bool) (sawSigned : Bool) (sawDouble : Bool)
+    (sawChar : Bool) (sawVoid : Bool)
+    (sc : Option StorageClass)
+    : Except String (Typ × Option StorageClass × Option (String × List (AST.Typ × String)) × List Token) :=
+  match toks with
+  | .KwStruct :: rest =>
+      -- Chapter 18: struct type specifier.
+      -- Cannot be combined with any other type specifier keyword.
+      if sawInt || sawLong || sawUnsigned || sawSigned || sawDouble || sawChar || sawVoid then
+        .error "Cannot combine 'struct' with other type specifiers"
+      else match rest with
+        | .Identifier tag :: .OpenBrace :: rest' => do
+            -- struct tag { members } — parse the member list
+            let fullTag := "struct." ++ tag
+            let (members, rest'') ← parseStructMembers rest'
+            .ok (.Struct fullTag, sc, some (fullTag, members), rest'')
+        | .Identifier tag :: rest' =>
+            -- struct tag — forward reference (no body)
+            .ok (.Struct ("struct." ++ tag), sc, none, rest')
+        | tok :: _ => .error s!"Expected struct tag name but found {tok.describe}"
+        | []       => .error "Expected struct tag name but reached end of input"
+  | .KwUnion :: rest =>
+      -- Chapter 18: union type specifier (extra credit).
+      if sawInt || sawLong || sawUnsigned || sawSigned || sawDouble || sawChar || sawVoid then
+        .error "Cannot combine 'union' with other type specifiers"
+      else match rest with
+        | .Identifier tag :: .OpenBrace :: rest' => do
+            -- union tag { members } — parse the member list
+            let fullTag := "union." ++ tag
+            let (members, rest'') ← parseStructMembers rest'
+            .ok (.Union fullTag, sc, some (fullTag, members), rest'')
+        | .Identifier tag :: rest' =>
+            -- union tag — forward reference
+            .ok (.Union ("union." ++ tag), sc, none, rest')
+        | tok :: _ => .error s!"Expected union tag name but found {tok.describe}"
+        | []       => .error "Expected union tag name but reached end of input"
+  | .KwInt :: rest =>
+      if sawInt then .error "Duplicate type specifier 'int'"
+      else if sawDouble then .error "Cannot combine 'int' with 'double'"
+      else if sawChar then .error "Cannot combine 'int' with 'char'"
+      else if sawVoid then .error "Cannot combine 'int' with 'void'"
+      else declSpecLoop rest true sawLong sawUnsigned sawSigned false sawChar false sc
+  | .KwLong :: rest =>
+      if sawLong then .error "Duplicate type specifier 'long'"
+      else if sawDouble then .error "Cannot combine 'long' with 'double'"
+      else if sawChar then .error "Cannot combine 'long' with 'char'"
+      else if sawVoid then .error "Cannot combine 'long' with 'void'"
+      else declSpecLoop rest sawInt true sawUnsigned sawSigned false sawChar false sc
+  | .KwUnsigned :: rest =>
+      if sawUnsigned then .error "Duplicate type specifier 'unsigned'"
+      else if sawSigned then .error "Conflicting type specifiers 'signed' and 'unsigned'"
+      else if sawDouble then .error "Cannot combine 'unsigned' with 'double'"
+      else if sawVoid then .error "Cannot combine 'unsigned' with 'void'"
+      else declSpecLoop rest sawInt sawLong true sawSigned false sawChar false sc
+  | .KwSigned :: rest =>
+      if sawUnsigned then .error "Conflicting type specifiers 'unsigned' and 'signed'"
+      else if sawDouble then .error "Cannot combine 'signed' with 'double'"
+      else if sawVoid then .error "Cannot combine 'signed' with 'void'"
+      else declSpecLoop rest sawInt sawLong sawUnsigned true false sawChar false sc
+  | .KwDouble :: rest =>
+      -- Chapter 13: 'double' is a standalone type; cannot be combined with
+      -- int/long/unsigned/signed (unlike C's 'long double' which we don't support).
+      if sawDouble then .error "Duplicate type specifier 'double'"
+      else if sawInt || sawLong || sawUnsigned || sawSigned || sawChar || sawVoid then
+        .error "Cannot combine 'double' with other type specifiers"
+      else declSpecLoop rest sawInt sawLong sawUnsigned sawSigned true sawChar false sc
+  | .KwChar :: rest =>
+      -- Chapter 16: 'char' can only be combined with 'signed' or 'unsigned'.
+      if sawChar then .error "Duplicate type specifier 'char'"
+      else if sawInt || sawLong || sawDouble || sawVoid then
+        .error "Cannot combine 'char' with other type specifiers"
+      else declSpecLoop rest sawInt sawLong sawUnsigned sawSigned sawDouble true false sc
+  | .KwVoid :: rest =>
+      -- Chapter 17: 'void' is a standalone type; cannot be combined with anything.
+      if sawVoid then .error "Duplicate type specifier 'void'"
+      else if sawInt || sawLong || sawUnsigned || sawSigned || sawDouble || sawChar then
+        .error "Cannot combine 'void' with other type specifiers"
+      else declSpecLoop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar true sc
+  | .KwStatic :: rest =>
+      match sc with
+      | some _ => .error "Multiple storage class specifiers"
+      | none   => declSpecLoop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar sawVoid (some .Static)
+  | .KwExtern :: rest =>
+      match sc with
+      | some _ => .error "Multiple storage class specifiers"
+      | none   => declSpecLoop rest sawInt sawLong sawUnsigned sawSigned sawDouble sawChar sawVoid (some .Extern)
+  | _ =>
+      -- End of declaration specifiers; determine the type.
+      let typ : Except String Typ :=
+        if sawVoid then .ok .Void   -- Chapter 17: void
+        else if sawDouble then .ok .Double  -- Chapter 13: double
+        else if sawChar then
+          -- Chapter 16: char types
+          if sawUnsigned then .ok .UChar       -- unsigned char
+          else if sawSigned then .ok .SChar    -- signed char
+          else .ok .Char                       -- plain char (impl-defined sign)
+        else if sawUnsigned then
+          if sawLong then .ok .ULong   -- unsigned long [int]
+          else .ok .UInt               -- unsigned [int]
+        else if sawLong then .ok .Long  -- [signed] [int] long
+        else if sawInt || sawSigned then .ok .Int  -- [signed] int
+        else .error "Expected type specifier (int, long, unsigned, signed, double, char, void, struct, union, etc.)"
+      match typ with
+      | .error e => .error e
+      | .ok t    => .ok (t, sc, none, toks)
+
+/-- Parse all declaration specifiers in any order (C allows intermixing).
+    Collects `int`, `long`, `unsigned`, `static`, `extern` in any order, then
+    returns the resolved type and storage class.
+
+    Chapter 18: extended return type — the third component is
+      `some (tag, members)` if a struct/union body `{ member ; ... }` was parsed,
+      `none` otherwise.  Callers that only need the type and storage class may
+      discard the third component with `_`.
+
+    Valid type combos (Chapter 12):
+      `int`, `long`, `int long`, `long int` → Int / Long (signed)
+      `unsigned`, `unsigned int`, `int unsigned` → UInt
+      `unsigned long`, `long unsigned`, `unsigned long int`, … → ULong
+
+    At most one storage class (`static` or `extern`).
+
+    Used for top-level and block-scope declarations where C allows
+    `int static long x` as equivalent to `static long x`. -/
+private partial def parseDeclSpecs (tokens : List Token)
+    : Except String (Typ × Option StorageClass × Option (String × List (AST.Typ × String)) × List Token) :=
+  declSpecLoop tokens false false false false false false false none
+
+end  -- mutual parseDeclSpecs / parseStructMembers
+
+/-- Consume trailing `*` tokens and wrap the base type in successive `Pointer` layers.
+    Chapter 14: `int *` → `Pointer(Int)`, `int **` → `Pointer(Pointer(Int))`, etc. -/
+private def consumeStars (baseTyp : Typ) (tokens : List Token) : Typ × List Token :=
+  match tokens with
+  | .Star :: rest => consumeStars (.Pointer baseTyp) rest
+  | _             => (baseTyp, tokens)
+
 /-- Parse an abstract declarator (no identifier): zero or more `*` tokens and/or
     parenthesized groups.  Returns a type-wrapping function and the remaining tokens.
     Used for abstract declarators in cast expressions, e.g.:
@@ -275,8 +374,9 @@ private def parseAbstractDeclarator (tokens : List Token) : (Typ → Typ) × Lis
       `(unsigned long (*))` and `(double (*(*(*)))))` -/
 private def parseType (tokens : List Token) : Except String (Typ × List Token) := do
   match parseDeclSpecs tokens with
-  | .ok (_, some _, _) => .error "Storage class specifier not allowed in type name"
-  | .ok (baseTyp, none, rest) =>
+  -- Chapter 18: parseDeclSpecs now returns a 4-tuple; ignore the struct-def field (3rd)
+  | .ok (_, some _, _, _) => .error "Storage class specifier not allowed in type name"
+  | .ok (baseTyp, none, _, rest) =>
       -- Use parseAbstractDeclarator (superset of consumeStars) for full abstract declarator support
       let (wrapFn, rest') := parseAbstractDeclarator rest
       .ok (wrapFn baseTyp, rest')
@@ -409,6 +509,16 @@ private partial def parsePostfixOps (e : Exp) (tokens : List Token) : Except Str
       let rest''       ← expect .CloseBracket rest'
       -- Recurse: `a[0][1]` chains to another subscript.
       parsePostfixOps (.Subscript e idx) rest''
+  -- Chapter 18: dot member access `e.member` — chains further postfix ops.
+  | .Dot :: .Identifier member :: rest =>
+      parsePostfixOps (.Dot e member) rest
+  -- Chapter 18: arrow member access `e->member` — chains further postfix ops.
+  | .Arrow :: .Identifier member :: rest =>
+      parsePostfixOps (.Arrow e member) rest
+  | .Dot :: tok :: _ =>
+      .error s!"Expected member name after '.' but found {tok.describe}"
+  | .Arrow :: tok :: _ =>
+      .error s!"Expected member name after '->' but found {tok.describe}"
   -- Chapter 15: postfix ++ and -- are NOT terminal — `ptr--[idx]` should parse as
   -- `(ptr--)[idx]`, so we recurse after applying the postfix op.
   | .PlusPlus   :: rest => parsePostfixOps (.PostfixIncr e) rest
@@ -600,7 +710,8 @@ private partial def parseParamListTail (tokens : List Token) : Except String (Li
     Chapter 14: uses `parseDeclaratorName` so parenthesized parameter declarators
     such as `double(*d)` and `int(**p)` are accepted. -/
 private partial def parseOneParam (tokens : List Token) : Except String ((Typ × String) × List Token) := do
-  let (baseTyp, scOpt, tokens) ← parseDeclSpecs tokens
+  -- Chapter 18: parseDeclSpecs returns a 4-tuple; ignore struct def info (3rd field).
+  let (baseTyp, scOpt, _, tokens) ← parseDeclSpecs tokens
   -- Storage-class specifiers (static, extern) are not allowed in parameter declarations.
   if scOpt.isSome then
     throw "Storage class specifier not allowed in parameter declaration"
@@ -695,7 +806,8 @@ end
 private def parseVarDecl (tokens : List Token) (storageClassOpt : Option StorageClass := none)
     : Except String (Declaration × List Token) := do
   -- Parse all declaration specifiers in any order
-  let (baseTyp, scFromSpecs, tokens) ← parseDeclSpecs tokens
+  -- Chapter 18: parseDeclSpecs returns a 4-tuple; ignore struct def info here.
+  let (baseTyp, scFromSpecs, _, tokens) ← parseDeclSpecs tokens
   let sc : Option StorageClass ←
     match storageClassOpt, scFromSpecs with
     | some a, some b =>
@@ -876,66 +988,93 @@ private partial def parseLocalFunDecl (name : String) (retTyp : Typ)
   | [] => .error "Expected \";\" after local function declaration but reached end of input"
   | t :: _ => .error s!"Expected \";\" after local function declaration but found {t.describe}"
 
-/-- Parse a block item: variable declaration, local function declaration, or statement.
+/-- Parse a block item: variable declaration, local function declaration, struct
+    declaration, or statement.  Returns a *list* of block items so that a
+    combined struct-definition-plus-declaration like `struct S { int x; } s;`
+    can expand to two items: `[SD "struct.S" (some [...]), D { name="s", ... }]`.
+
     Chapter 11: handles both `int` and `long` type specifiers.
+    Chapter 18: detects struct/union definitions (sdOpt from parseDeclSpecs) and
+    prepends an `SD` item before any variable or function declarator.
 
     The C grammar for block items requires distinguishing:
       `[sc] type name ( ...`  →  local function declaration
       `[sc] type name ...`    →  variable declaration
-      `stmt`                  →  statement
-
-    Since Lean 4 match does not support `when` guards on list patterns,
-    we use nested `if`/`match` expressions to inspect the head token. -/
-private partial def parseBlockItem (tokens : List Token) : Except String (BlockItem × List Token) :=
+      `struct tag { ... } ;`  →  struct/union definition only (no declarator)
+      `stmt`                  →  statement -/
+private partial def parseBlockItem (tokens : List Token) : Except String (List BlockItem × List Token) :=
   match tokens with
   | t :: _ =>
       -- A block item is a declaration if it starts with any declaration specifier
-      -- (int, long, static, extern — in any order).
+      -- (int, long, double, struct, extern, static, etc. — in any order).
       if isDeclSpecToken t then do
-        -- Peek at all declaration specifiers to determine type, storage class, and name.
-        -- This handles any ordering such as `int static long x`, `static int x`, etc.
-        let (baseRetTyp, sc, afterSpecs) ← parseDeclSpecs tokens
-        -- Chapter 14: use parseDeclaratorName for lookahead to handle parenthesized declarators
-        -- like `int(*ptr)`, `long(*(l_ptr))`, etc.
-        let (name, wrapFn, inlineParamsOpt, afterDecl) ← parseDeclaratorName afterSpecs
-        let retTyp := wrapFn baseRetTyp
-        match inlineParamsOpt with
-        | some params =>
-            -- parseDeclaratorName already consumed `name(params)` (e.g. `foo(void)`);
-            -- afterDecl is the tokens following the closing ')'.
-            -- Local function definitions with a body are not allowed inside a function.
-            match afterDecl with
-            | .Semicolon :: rest''' =>
-                .ok (.FD { name, params, retTyp, storageClass := sc }, rest''')
-            | .OpenBrace :: _ =>
-                .error s!"Function definition for '{name}' inside a function is not allowed"
-            | [] => .error "Expected \";\" after local function declaration but reached end of input"
-            | t :: _ => .error s!"Expected \";\" after local function declaration but found {t.describe}"
-        | none =>
-            match afterDecl with
-            | .OpenParen :: _ =>
-                -- Name followed by '(': local function declaration with params outside
-                parseLocalFunDecl name retTyp sc afterDecl
-            | _ => do
-                -- Variable declaration: re-parse from scratch using parseVarDecl
-                let (decl, rest) ← parseVarDecl tokens
-                .ok (.D decl, rest)
+        -- Parse all declaration specifiers; get struct/union def info if present.
+        let (baseRetTyp, sc, sdOpt, afterSpecs) ← parseDeclSpecs tokens
+        -- Build the SD item if we parsed an inline struct/union definition body.
+        let sdItems : List BlockItem :=
+          match sdOpt with
+          | some (tag, members) => [.SD tag (some members)]
+          | none                => []
+        -- Check for a bare struct/union declaration with no declarator: `struct S { ... };`
+        -- Also allow `struct S;` (forward declaration with no body).
+        match afterSpecs with
+        | .Semicolon :: rest =>
+            -- No declarator follows — just the struct/union definition (or error if nothing defined).
+            if sdItems.isEmpty then
+              -- Allow `struct tag;` or `union tag;` as a tag-only (forward) declaration.
+              match baseRetTyp with
+              | .Struct tag | .Union tag => .ok ([.SD tag none], rest)
+              | _ => .error "Declaration does not declare anything"
+            else
+              .ok (sdItems, rest)
+        | _ => do
+            -- A declarator follows the type specifiers.
+            -- Chapter 14: use parseDeclaratorName to handle parenthesized/pointer declarators.
+            let (name, wrapFn, inlineParamsOpt, afterDecl) ← parseDeclaratorName afterSpecs
+            let retTyp := wrapFn baseRetTyp
+            match inlineParamsOpt with
+            | some params =>
+                -- parseDeclaratorName already consumed `name(params)` inline.
+                -- Local function definitions with a body are not allowed inside a function.
+                match afterDecl with
+                | .Semicolon :: rest''' =>
+                    .ok (sdItems ++ [.FD { name, params, retTyp, storageClass := sc }], rest''')
+                | .OpenBrace :: _ =>
+                    .error s!"Function definition for '{name}' inside a function is not allowed"
+                | [] => .error "Expected \";\" after local function declaration but reached end of input"
+                | t :: _ => .error s!"Expected \";\" after local function declaration but found {t.describe}"
+            | none =>
+                match afterDecl with
+                | .OpenParen :: _ => do
+                    -- Name followed by '(': local function declaration with params outside
+                    let (fdItem, rest) ← parseLocalFunDecl name retTyp sc afterDecl
+                    .ok (sdItems ++ [fdItem], rest)
+                | .Equal :: rest => do
+                    -- Variable declaration with initializer
+                    let (init, rest') ← parseInitializer rest
+                    let rest''        ← expect .Semicolon rest'
+                    .ok (sdItems ++ [.D { name, typ := retTyp, init := some init, storageClass := sc }], rest'')
+                | _ => do
+                    -- Variable declaration without initializer
+                    let rest ← expect .Semicolon afterDecl
+                    .ok (sdItems ++ [.D { name, typ := retTyp, init := none, storageClass := sc }], rest)
       else do
-        -- Not a declaration specifier: must be a statement
+        -- Not a declaration specifier: must be a statement.
         let (stmt, rest) ← parseStatement tokens
-        .ok (.S stmt, rest)
+        .ok ([.S stmt], rest)
   | _ => do
       let (stmt, rest) ← parseStatement tokens
-      .ok (.S stmt, rest)
+      .ok ([.S stmt], rest)
 
 private partial def parseBlockItems (tokens : List Token) : Except String (List BlockItem × List Token) :=
   match tokens with
   | .CloseBrace :: _ => .ok ([], tokens)
   | [] => .error "Expected \"}\" but reached end of input"
   | _ => do
-      let (item, rest)   ← parseBlockItem tokens
-      let (items, rest') ← parseBlockItems rest
-      .ok (item :: items, rest')
+      -- parseBlockItem returns a *list* (may be multiple items for struct-def + decl).
+      let (items, rest)      ← parseBlockItem tokens
+      let (moreItems, rest') ← parseBlockItems rest
+      .ok (items ++ moreItems, rest')
 
 end
 
@@ -944,66 +1083,92 @@ end
 -- ---------------------------------------------------------------------------
 
 /-- Parse a top-level declaration or definition.
+    Returns a *list* of top-level items so that a combined struct-definition-plus-
+    declaration like `struct S { int x; } foo(void) { ... }` can expand to two
+    items: `[StructDecl "struct.S" (some [...]), FunDef ...]`.
+
     Grammar (Chapter 11):
       `[sc] type [sc] <name> "(" params ")" ";" | "{" body "}"` → FunDecl/FunDef
       `[sc] type [sc] <name> [ "=" exp ] ";"`                    → VarDecl
+    Chapter 18 additions:
+      `struct tag { ... } ;`                                      → StructDecl only
+      `struct tag { ... } name ...`                               → StructDecl + VarDecl/FunDecl/FunDef
 
     Chapter 11: `type` is `int` or `long` (not just `int`).
     Both orderings of storage class and type are accepted. -/
-private partial def parseTopLevel (tokens : List Token) : Except String (TopLevel × List Token) := do
-  -- Parse all declaration specifiers in any order (int/long/static/extern may be intermixed)
-  let (baseRetTyp, sc, tokens) ← parseDeclSpecs tokens
-  -- Chapter 14: use parseDeclaratorName to handle parenthesized/pointer declarators.
-  -- e.g. `int(return_3)(void)`, `long(*two_pointers(params))`, etc.
-  let (name, wrapFn, inlineParamsOpt, tokens) ← parseDeclaratorName tokens
-  let retTyp := wrapFn baseRetTyp
-  -- inlineParamsOpt: Some params if function params appeared inside the declarator
-  -- (e.g., `int(return_3(void))` or `long(*f(params))`).
-  -- tokens: if it starts with '(' it's a function with params outside the declarator.
-  match inlineParamsOpt with
-  | some params =>
-      -- Params were inside the declarator: decide function/variable from what follows
-      match tokens with
-      | .Semicolon :: rest' =>
-          .ok (.FunDecl { name, params, retTyp, storageClass := sc }, rest')
-      | .OpenBrace :: rest' => do
-          let (body, rest'') ← parseBlockItems rest'
-          let rest'''        ← expect .CloseBrace rest''
-          .ok (.FunDef { name, params, retTyp, body, storageClass := sc }, rest''')
-      | [] => .error s!"Expected open-brace or semicolon after function header for {name} but reached end of input"
-      | t :: _ => .error s!"Expected open-brace or semicolon after function header for {name} but found {t.describe}"
-  | none =>
-      -- No inline params: check what follows to decide function vs variable
-      match tokens with
-      | .OpenParen :: rest => do
-          -- '(' follows: function params outside the declarator
-          let (params, tokens) ← parseParamList rest
+private partial def parseTopLevel (tokens : List Token) : Except String (List TopLevel × List Token) := do
+  -- Parse all declaration specifiers in any order (int/long/static/extern may be intermixed).
+  -- Chapter 18: parseDeclSpecs now returns a 4-tuple; sdOpt carries any inline struct/union def.
+  let (baseRetTyp, sc, sdOpt, tokens) ← parseDeclSpecs tokens
+  -- Build the StructDecl item if we parsed an inline struct/union definition body.
+  let sdItems : List TopLevel :=
+    match sdOpt with
+    | some (tag, members) => [.StructDecl tag (some members)]
+    | none                => []
+  -- Check for a bare struct/union declaration with no declarator: `struct S { ... };`
+  -- Also allow `struct S;` or `union U;` as a tag-only (forward) declaration.
+  match tokens with
+  | .Semicolon :: rest =>
+      -- No declarator follows — just the struct/union definition (or error if nothing defined).
+      if sdItems.isEmpty then
+        match baseRetTyp with
+        | .Struct tag | .Union tag => .ok ([.StructDecl tag none], rest)
+        | _ => .error "Declaration does not declare anything"
+      else
+        .ok (sdItems, rest)
+  | _ => do
+      -- Chapter 14: use parseDeclaratorName to handle parenthesized/pointer declarators.
+      -- e.g. `int(return_3)(void)`, `long(*two_pointers(params))`, etc.
+      let (name, wrapFn, inlineParamsOpt, tokens) ← parseDeclaratorName tokens
+      let retTyp := wrapFn baseRetTyp
+      -- inlineParamsOpt: Some params if function params appeared inside the declarator
+      -- (e.g., `int(return_3(void))` or `long(*f(params))`).
+      -- tokens: if it starts with '(' it's a function with params outside the declarator.
+      match inlineParamsOpt with
+      | some params =>
+          -- Params were inside the declarator: decide function/variable from what follows.
           match tokens with
           | .Semicolon :: rest' =>
-              .ok (.FunDecl { name, params, retTyp, storageClass := sc }, rest')
+              .ok (sdItems ++ [.FunDecl { name, params, retTyp, storageClass := sc }], rest')
           | .OpenBrace :: rest' => do
               let (body, rest'') ← parseBlockItems rest'
               let rest'''        ← expect .CloseBrace rest''
-              .ok (.FunDef { name, params, retTyp, body, storageClass := sc }, rest''')
+              .ok (sdItems ++ [.FunDef { name, params, retTyp, body, storageClass := sc }], rest''')
           | [] => .error s!"Expected open-brace or semicolon after function header for {name} but reached end of input"
           | t :: _ => .error s!"Expected open-brace or semicolon after function header for {name} but found {t.describe}"
-      | .Equal :: rest => do
-          -- Chapter 15: initializer may be a compound `{ e1, e2, ... }` or a scalar expression.
-          let (init, rest') ← parseInitializer rest
-          let rest''        ← expect .Semicolon rest'
-          .ok (.VarDecl { name, typ := retTyp, init := some init, storageClass := sc }, rest'')
-      | .Semicolon :: rest =>
-          .ok (.VarDecl { name, typ := retTyp, init := none, storageClass := sc }, rest)
-      | [] => .error s!"Expected open-paren, semicolon, or equals after name {name} but reached end of input"
-      | t :: _ => .error s!"Expected open-paren, semicolon, or equals after name {name} but found {t.describe}"
+      | none =>
+          -- No inline params: check what follows to decide function vs variable.
+          match tokens with
+          | .OpenParen :: rest => do
+              -- '(' follows: function params outside the declarator
+              let (params, tokens) ← parseParamList rest
+              match tokens with
+              | .Semicolon :: rest' =>
+                  .ok (sdItems ++ [.FunDecl { name, params, retTyp, storageClass := sc }], rest')
+              | .OpenBrace :: rest' => do
+                  let (body, rest'') ← parseBlockItems rest'
+                  let rest'''        ← expect .CloseBrace rest''
+                  .ok (sdItems ++ [.FunDef { name, params, retTyp, body, storageClass := sc }], rest''')
+              | [] => .error s!"Expected open-brace or semicolon after function header for {name} but reached end of input"
+              | t :: _ => .error s!"Expected open-brace or semicolon after function header for {name} but found {t.describe}"
+          | .Equal :: rest => do
+              -- Chapter 15: initializer may be a compound `{ e1, e2, ... }` or a scalar expression.
+              let (init, rest') ← parseInitializer rest
+              let rest''        ← expect .Semicolon rest'
+              .ok (sdItems ++ [.VarDecl { name, typ := retTyp, init := some init, storageClass := sc }], rest'')
+          | .Semicolon :: rest =>
+              .ok (sdItems ++ [.VarDecl { name, typ := retTyp, init := none, storageClass := sc }], rest)
+          | [] => .error s!"Expected open-paren, semicolon, or equals after name {name} but reached end of input"
+          | t :: _ => .error s!"Expected open-paren, semicolon, or equals after name {name} but found {t.describe}"
 
 private partial def parseTopLevels (tokens : List Token) : Except String (List TopLevel) :=
   match tokens with
   | []   => .ok []
   | _    => do
-      let (item, rest) ← parseTopLevel tokens
-      let items        ← parseTopLevels rest
-      .ok (item :: items)
+      -- parseTopLevel returns a *list* (may be multiple items for struct-def + decl/fundef).
+      let (items, rest) ← parseTopLevel tokens
+      let moreItems     ← parseTopLevels rest
+      .ok (items ++ moreItems)
 
 def parseProgram (tokens : List Token) : Except String Program := do
   let topLevels ← parseTopLevels tokens

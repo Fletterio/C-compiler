@@ -57,8 +57,8 @@ private def ReplState.getOrInsert (s : ReplState) (id : String)
   | none =>
       match lookupBst bst id with
       | some (.ObjEntry _ _ true) =>
-          -- Static variable or read-only constant: RIP-relative Data operand
-          let op := Operand.Data id
+          -- Static variable or read-only constant: RIP-relative Data operand (offset 0)
+          let op := Operand.Data id 0
           ({ s with map := s.map ++ [(id, op)] }, op)
       | some (.ObjEntry .Quadword _ false) | some (.ObjEntry .Double _ false) =>
           -- Local long/ulong/double (8-byte): align maxBytes to 8, then allocate 8 bytes
@@ -83,8 +83,16 @@ private def ReplState.getOrInsert (s : ReplState) (id : String)
           -- elemAlign ∈ {4, 8, 16}, this requires bytes ≡ 0 (mod elemAlign).
           -- Step 1: pad maxBytes up to elemAlign so the top boundary is aligned.
           -- Step 2: add totalBytes, then pad again so the bottom boundary (base) is also aligned.
+          -- Chapter 18 extra: round totalBytes up to the next multiple of 8 for structs/unions.
+          -- CodeGen's `Copy` for ByteArray emits movq (8-byte) chunks; if the slot is not an
+          -- exact multiple of 8 bytes, a movq to the last chunk would write past the struct's
+          -- declared size and corrupt adjacent stack variables.
+          -- Arrays of scalars are exempt because their sizes are always multiples of their
+          -- element size (e.g., char[3] = 3 bytes), but structs may have non-multiple-of-8 sizes.
+          -- Rounding to 8 gives a "shadow" padding region that absorbs the extra write safely.
+          let paddedBytes := alignUp totalBytes 8
           let aligned := alignUp s.maxBytes elemAlign
-          let bytes   := alignUp (aligned + totalBytes) elemAlign
+          let bytes   := alignUp (aligned + paddedBytes) elemAlign
           let offset  : Int := -(bytes : Int)
           let op      := Operand.Memory .BP offset
           ({ map := s.map ++ [(id, op)], maxBytes := bytes }, op)
@@ -98,12 +106,16 @@ private def ReplState.getOrInsert (s : ReplState) (id : String)
 private def replaceOp (s : ReplState) (bst : BackendSymTable) : Operand → ReplState × Operand
   | .Pseudo id => s.getOrInsert id bst
   | .PseudoMem id byteOff =>
-      -- Chapter 15: resolve PseudoMem(id, byteOff) by looking up id's base address,
+      -- Chapter 15/18: resolve PseudoMem(id, byteOff) by looking up id's base address,
       -- then adding byteOff to the offset.
+      -- For local variables: Memory(BP, baseOff + byteOff)
+      -- For static variables: Data(name, byteOff) — used for struct member access on statics
       let (s', baseOp) := s.getOrInsert id bst
       match baseOp with
       | .Memory r baseOff => (s', .Memory r (baseOff + byteOff))
-      | op => (s', op)   -- fallback (shouldn't happen for local arrays)
+      -- Chapter 18: static variable PseudoMem → Data(name, byteOff)
+      | .Data nm 0 => (s', .Data nm byteOff)
+      | op => (s', op)   -- fallback (shouldn't happen)
   | op => (s, op)
 
 /-- Replace all Pseudo operands in a single instruction.
@@ -182,15 +194,27 @@ private def replaceInstr (s : ReplState) (bst : BackendSymTable)
       (s, [.Lea src' dst'])
   | instr => (s, [instr])  -- Ret, Cdq, Jmp, JmpCC, Label, Call pass through
 
-/-- Replace pseudoregisters in a single function definition. -/
+/-- Replace pseudoregisters in a single function definition.
+    Chapter 18: if the function returns a MEMORY-class struct (ByteArray > 16 bytes),
+    CodeGen has already emitted `movq %rdi, -8(%rbp)` at the function entry to save
+    the hidden return-value pointer.  We must therefore reserve the first 8 bytes of
+    the stack frame (maxBytes := 8) so PseudoReplace does not allocate a local variable
+    at -8(%rbp) and overwrite the saved hidden pointer. -/
 private def replaceFunctionDef (f : FunctionDef) (bst : BackendSymTable) : FunctionDef :=
+  -- Check if this function returns a MEMORY-class struct (ByteArray size > 16).
+  let isMemReturn : Bool :=
+    match lookupBst bst f.name with
+    | some (.FunEntry _ (.ByteArray size _)) => size > 16
+    | _ => false
+  -- If MEMORY return: start with 8 bytes reserved for the hidden pointer slot at -8(%rbp).
+  let initState : ReplState := if isMemReturn then { map := [], maxBytes := 8 } else ReplState.empty
   let (finalState, instrs) :=
     f.instructions.foldl
       (fun (acc : ReplState × List Instruction) instr =>
         let (s, out) := acc
         let (s', new) := replaceInstr s bst instr
         (s', out ++ new))
-      (ReplState.empty, [])
+      (initState, [])
   { f with instructions := instrs, stackSize := finalState.maxBytes }
 
 /-- Entry point for pass 2.

@@ -94,7 +94,7 @@ namespace AST
     int         →  Int
 -/
 
-/-- The types supported through Chapter 17.
+/-- The types supported through Chapter 18.
     `Int`          is a 32-bit signed integer      (C `int`).
     `Long`         is a 64-bit signed integer      (C `long`).
     `UInt`         is a 32-bit unsigned integer    (C `unsigned int`).
@@ -105,7 +105,9 @@ namespace AST
     `Char`         is a 1-byte character (impl-defined sign) (Chapter 16).
     `SChar`        is a 1-byte signed char                   (Chapter 16).
     `UChar`        is a 1-byte unsigned char                 (Chapter 16).
-    `Void`         is the incomplete/no-value type           (Chapter 17). -/
+    `Void`         is the incomplete/no-value type           (Chapter 17).
+    `Struct tag`   is a struct type identified by its tag    (Chapter 18).
+    `Union tag`    is a union type identified by its tag     (Chapter 18, extra credit). -/
 inductive Typ where
   | Int     : Typ              -- 32-bit signed integer
   | Long    : Typ              -- 64-bit signed integer
@@ -118,6 +120,8 @@ inductive Typ where
   | SChar   : Typ              -- 1-byte signed char                   (Chapter 16)
   | UChar   : Typ              -- 1-byte unsigned char                 (Chapter 16)
   | Void    : Typ              -- incomplete/no-value type              (Chapter 17)
+  | Struct  : String → Typ     -- struct type by tag name              (Chapter 18)
+  | Union   : String → Typ     -- union type by tag name               (Chapter 18 EC)
   deriving Repr, BEq
 
 /-- Return the size in bytes of a type. -/
@@ -133,6 +137,10 @@ def Typ.sizeOf : Typ → Nat
   | .SChar    => 1
   | .UChar    => 1
   | .Void     => 0   -- Chapter 17: void is incomplete; size 0 (should not be allocated)
+  -- Chapter 18: struct/union size determined by TypeTable, not AST alone.
+  -- Return 0 here; callers that need the real size must consult TypeTable.
+  | .Struct _ => 0
+  | .Union  _ => 0
 
 /-- Return the alignment in bytes of a type.
     Arrays: same as element alignment if total size < 16 bytes, else 16 (ABI). -/
@@ -150,6 +158,10 @@ def Typ.alignOf : Typ → Nat
   | .SChar    => 1
   | .UChar    => 1
   | .Void     => 0   -- Chapter 17: void is incomplete; no alignment
+  -- Chapter 18: struct/union alignment determined by TypeTable, not AST alone.
+  -- Return 1 here; callers that need the real alignment must consult TypeTable.
+  | .Struct _ => 1
+  | .Union  _ => 1
 
 /-- A typed constant.
     `ConstInt(n)`:    value fits in (or is explicitly typed as) 32-bit `int`.
@@ -214,7 +226,8 @@ inductive BinaryOp where
     Chapter 14 adds `AddrOf` (&) and `Dereference` (*).
     Chapter 15 adds `Subscript` for array indexing (a[i]).
     Chapter 16 adds `StringLiteral` for string constants like "hello".
-    Chapter 17 adds `SizeOf` (sizeof expression) and `SizeOfT` (sizeof type). -/
+    Chapter 17 adds `SizeOf` (sizeof expression) and `SizeOfT` (sizeof type).
+    Chapter 18 adds `Dot` (e.member) and `Arrow` (e->member) for struct access. -/
 inductive Exp where
   | Constant      : Const → Exp             -- Chapter 11: typed constant
   | Var           : String → Exp            -- variable reference
@@ -232,6 +245,8 @@ inductive Exp where
   | StringLiteral : String → Exp            -- Chapter 16: "hello" (type = Array(Char, n+1))
   | SizeOf        : Exp → Exp               -- Chapter 17: sizeof(expr)
   | SizeOfT       : Typ → Exp               -- Chapter 17: sizeof(type)
+  | Dot           : Exp → String → Exp      -- Chapter 18: e.member (struct member access)
+  | Arrow         : Exp → String → Exp      -- Chapter 18: e->member (pointer member access)
   deriving Repr, BEq
 
 /-- An initializer for a variable declaration.
@@ -284,11 +299,16 @@ inductive Statement where
   | Goto     : String → Statement
   | Null     : Statement
 
-/-- A block item: statement, variable declaration, or local function declaration. -/
+/-- A block item: statement, variable declaration, local function declaration, or
+    struct/union type declaration (Chapter 18). -/
 inductive BlockItem where
   | S  : Statement    → BlockItem
   | D  : Declaration  → BlockItem
   | FD : FunctionDecl → BlockItem
+  /-- Chapter 18: struct/union declaration inside a block.
+      tag = struct name; membersOpt = Some(member list) if a body is present, None if
+      it's a forward declaration (tag only). -/
+  | SD : String → Option (List (AST.Typ × String)) → BlockItem
 
 /-- A local function declaration (prototype only, no body).
     Chapter 11: params now carry type information. -/
@@ -319,6 +339,9 @@ inductive TopLevel where
   | FunDef  : FunctionDef  → TopLevel
   | FunDecl : FunctionDecl → TopLevel
   | VarDecl : Declaration  → TopLevel
+  /-- Chapter 18: file-scope struct/union type declaration.
+      tag = struct name; membersOpt = Some(member list) if a body is present. -/
+  | StructDecl : String → Option (List (AST.Typ × String)) → TopLevel
   deriving Repr
 
 /-- A complete C program: a list of top-level declarations and definitions. -/

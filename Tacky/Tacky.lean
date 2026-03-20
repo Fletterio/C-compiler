@@ -185,6 +185,11 @@ inductive Instruction where
       `scale` is the element size in bytes (always a positive constant).
       For `ptr - int`, TackyGen negates the index before emitting AddPtr. -/
   | AddPtr       : Val → Val → Int → Val → Instruction
+  /-- Chapter 18: read one member value from a struct/union variable.
+      `CopyFromOffset(srcName, offset, dst)` copies the scalar value at byte
+      `offset` within the named aggregate variable `srcName` into `dst`.
+      Used for struct member access: `s.x` → `CopyFromOffset("s", xOffset, tmp)`. -/
+  | CopyFromOffset : String → Int → Val → Instruction
   deriving Repr, BEq
 
 /-- A TACKY function definition. -/

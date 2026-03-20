@@ -85,6 +85,11 @@ inductive Token where
   | StringLiteral : String → Token -- string literal (unescaped contents), e.g. "hello"
   -- Chapter 17: sizeof operator keyword
   | KwSizeof     : Token          -- sizeof
+  -- Chapter 18: struct/union keywords and member-access operators
+  | KwStruct : Token              -- struct
+  | KwUnion  : Token              -- union  (extra credit)
+  | Dot      : Token              -- .  (member access)
+  | Arrow    : Token              -- -> (pointer member access)
   deriving Repr, BEq
 
 /-- Human-readable description of a token, used in parser error messages. -/
@@ -162,5 +167,10 @@ def Token.describe : Token → String
   | .CharConstant n => s!"character constant '{n}'"
   | .StringLiteral s => s!"string literal \"{s}\""
   | .KwSizeof      => "\"sizeof\""
+  -- Chapter 18
+  | .KwStruct      => "\"struct\""
+  | .KwUnion       => "\"union\""
+  | .Dot           => "\".\""
+  | .Arrow         => "\"->\""
 
 end Lexer

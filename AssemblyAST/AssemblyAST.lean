@@ -135,7 +135,11 @@ inductive Operand where
       Replaces the old `Stack(offset)` (which was always `Memory(BP, offset)`).
       Also used for pointer dereferences: `Memory(R10, 0)` = `(%r10)`. -/
   | Memory    : Reg → Int → Operand   -- Chapter 14 (replaces Stack)
-  | Data      : String → Operand
+  /-- Chapter 18: `Data(name, offset)` = `name+offset(%rip)` — RIP-relative access.
+      `offset = 0` gives the plain `name(%rip)` form used in all earlier chapters.
+      `offset != 0` is used for struct member access on static variables, where the
+      member lives at a fixed byte offset from the variable's base address. -/
+  | Data      : String → Int → Operand
   /-- Chapter 15: `PseudoMem(name, byteOffset)` — a named aggregate variable
       with a byte offset from its base.  Replaced by `Memory(BP, baseOff + byteOffset)`
       in the PseudoReplace pass.  Used for array element access. -/

@@ -48,7 +48,7 @@ private def roundUp16 (n : Int) : Int :=
 
 private def isMem : Operand → Bool
   | .Memory _ _     => true   -- Chapter 14: Memory(BP,n) and Memory(Rx,0) are both "memory"
-  | .Data _         => true
+  | .Data _ _       => true   -- Chapter 18: Data now carries an offset
   | .Indexed _ _ _  => true   -- Chapter 15: scaled-index addressing is a memory operand
   | _               => false
 

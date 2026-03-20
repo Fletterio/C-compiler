@@ -83,6 +83,8 @@ private def classifyWord (word : String) : Token :=
   | "double"   => .KwDouble   -- Chapter 13: double type keyword
   | "char"     => .KwChar     -- Chapter 16: char type keyword
   | "sizeof"   => .KwSizeof  -- Chapter 17: sizeof operator
+  | "struct"   => .KwStruct  -- Chapter 18: struct keyword
+  | "union"    => .KwUnion   -- Chapter 18: union keyword (extra credit)
   | _          => .Identifier word
 
 -- ---------------------------------------------------------------------------
@@ -405,7 +407,9 @@ private def nextToken (chars : List Char) : Option (Token × List Char) :=
   | '>' :: '>' :: rest  => some (.GreaterGreater,   rest)
   | '>' :: '=' :: rest  => some (.GreaterEqual,     rest)
   | '>' :: rest         => some (.Greater,          rest)
-  -- - family: -- before -= before -
+  -- - family: -> before -- before -= before -
+  -- Chapter 18: -> (arrow member access) must be matched before -- and -=
+  | '-' :: '>' :: rest  => some (.Arrow,            rest)
   | '-' :: '-' :: rest  => some (.MinusMinus,       rest)
   | '-' :: '=' :: rest  => some (.MinusEqual,       rest)
   | '-' :: rest         => some (.Minus,            rest)
@@ -413,12 +417,15 @@ private def nextToken (chars : List Char) : Option (Token × List Char) :=
   | '\'' :: rest => lexCharLiteral rest
   -- Chapter 16: string literal "..." (with escape sequences)
   | '"' :: rest => lexStringLiteral [] rest
-  -- Chapter 13: floating-point constant starting with '.' (e.g. .5, .25e3)
-  -- Must be checked before the catch-all so '.' isn't treated as unknown.
-  | '.' :: c :: _ =>
-      if isDigit c then tryParseFloat [] chars
-      else none
-  | '.' :: [] => none   -- lone '.' at end of input
+  -- '.' handling:
+  --   If followed by a digit: floating-point literal (e.g. .5, .25e3)   [Chapter 13]
+  --   If followed by a non-digit (or end of input): member access dot   [Chapter 18]
+  | '.' :: rest =>
+      match rest with
+      | c :: _ =>
+          if isDigit c then tryParseFloat [] chars  -- float: .5, .25e3
+          else some (.Dot, rest)                     -- member access: .member
+      | [] => some (.Dot, [])   -- lone '.' is a Dot token (parse error later if needed)
   -- Identifier/keyword and integer/float constant require predicate checks,
   -- so a catch-all arm with if/else handles them.
   | c :: _ =>

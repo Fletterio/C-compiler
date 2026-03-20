@@ -68,22 +68,41 @@ private def runCmd (cmd : String) (args : Array String) (errPrefix : String) : I
     Chapter 13: Double → Double (8-byte, uses XMM registers).
     Chapter 14: Pointer → Quadword (pointers are 8-byte, like unsigned long).
     Chapter 15: Array(elem, n) → ByteArray(totalBytes, alignment) so that
-      PseudoReplace can reserve the right amount of stack space. -/
-private def asmTypeOf : AST.Typ → AssemblyAST.AsmType
+      PseudoReplace can reserve the right amount of stack space.
+    Chapter 18: Struct/Union → ByteArray(totalSize, alignment) looked up from TypeTable. -/
+private def asmTypeOf (tt : Semantics.TypeTable) : AST.Typ → AssemblyAST.AsmType
   | .Int  | .UInt  => .Longword
   | .Long | .ULong => .Quadword
   | .Double        => .Double
   | .Pointer _     => .Quadword   -- Chapter 14: pointer is 8-byte
-  | .Array elem n  =>             -- Chapter 15: array occupies totalBytes with alignment
-      let totalBytes := elem.sizeOf * n
-      -- Use the ARRAY's own alignOf, not just the element's alignOf.
-      -- For arrays of 16 bytes or more, the ABI mandates 16-byte alignment regardless
-      -- of element alignment.  Passing elem.alignOf would give 4 for int arrays and
-      -- 8 for pointer arrays, under-aligning large arrays.
-      let alignment  := (AST.Typ.Array elem n).alignOf
+  | .Array elem n  =>             -- Chapter 15/18: array occupies totalBytes with alignment
+      -- Chapter 18: for arrays of struct/union, elem.sizeOf returns 0 (structs have no
+      -- statically-known size); look up the actual size from the TypeTable instead.
+      let elemSize : Nat := match elem with
+        | .Struct tag | .Union tag =>
+            match Semantics.lookupTypeTable tt tag with
+            | some sd => sd.size
+            | none    => 0
+        | _ => elem.sizeOf
+      let totalBytes := elemSize * n
+      -- Alignment: for struct/union elements, use the struct's alignment from TypeTable.
+      -- For scalar elements, use the array's own alignOf (which handles the ≥16-byte rule).
+      let elemAlign : Nat := match elem with
+        | .Struct tag | .Union tag =>
+            match Semantics.lookupTypeTable tt tag with
+            | some sd => sd.alignment
+            | none    => 1
+        | _ => elem.alignOf
+      -- Apply the ≥16-byte alignment rule: arrays of ≥16 bytes are 16-byte aligned.
+      let alignment  := if totalBytes >= 16 then max elemAlign 16 else elemAlign
       .ByteArray totalBytes alignment
   | .Char | .SChar | .UChar => .Byte   -- Chapter 16: char types are 1-byte
   | .Void            => .Longword      -- Chapter 17: void has no AsmType; use Longword as sentinel
+  -- Chapter 18: struct/union — look up size and alignment from the TypeTable.
+  | .Struct tag | .Union tag =>
+      match Semantics.lookupTypeTable tt tag with
+      | some sd => .ByteArray sd.size sd.alignment
+      | none    => .ByteArray 0 1
 
 /-- True iff the type is a signed integer type.
     Double returns false (sign concept doesn't apply to IEEE 754 types).
@@ -98,6 +117,7 @@ private def isSignedTyp : AST.Typ → Bool
   | .Char | .SChar   => true    -- Chapter 16: char and signed char are signed
   | .UChar           => false   -- Chapter 16: unsigned char is unsigned
   | .Void            => false   -- Chapter 17: void has no sign
+  | .Struct _ | .Union _ => false   -- Chapter 18: aggregate types are not signed scalars
 
 /-- Build the backend symbol table from:
     1. The frontend symbol table (all declared variables and functions).
@@ -115,8 +135,9 @@ private def isSignedTyp : AST.Typ → Bool
 
     Float const labels override with `isStatic = true` (prepended, lookupBst finds first). -/
 private def buildBackendSymTable
-    (frontendSt : Semantics.SymbolTable)
-    (typeEnv    : List (String × AST.Typ))
+    (frontendSt  : Semantics.SymbolTable)
+    (typeEnv     : List (String × AST.Typ))
+    (tt          : Semantics.TypeTable := [])   -- Chapter 18: struct/union layouts
     (floatConsts : List (String × Float) := [])
     (strConsts   : List (String × String) := [])   -- Chapter 16
     : AssemblyAST.BackendSymTable :=
@@ -125,11 +146,11 @@ private def buildBackendSymTable
     frontendSt.filterMap fun (name, entry) =>
       match entry.type, entry.attrs with
       | .Obj typ, .Local =>
-          some (name, .ObjEntry (asmTypeOf typ) (isSignedTyp typ) false)
+          some (name, .ObjEntry (asmTypeOf tt typ) (isSignedTyp typ) false)
       | .Obj typ, .Static _ _ =>
-          some (name, .ObjEntry (asmTypeOf typ) (isSignedTyp typ) true)
+          some (name, .ObjEntry (asmTypeOf tt typ) (isSignedTyp typ) true)
       | .Fun _ _ retTyp, .FunAttr isDef _ =>
-          some (name, .FunEntry isDef (asmTypeOf retTyp))
+          some (name, .FunEntry isDef (asmTypeOf tt retTyp))
       | _, _ => none
   -- Add typeEnv entries for temporaries not in the frontend sym table.
   -- Float constant labels from internFloat() are in typeEnv with type Double;
@@ -138,7 +159,7 @@ private def buildBackendSymTable
   let fromTypeEnv : AssemblyAST.BackendSymTable :=
     typeEnv.filterMap fun (name, typ) =>
       if frontendNames.contains name then none
-      else some (name, .ObjEntry (asmTypeOf typ) (isSignedTyp typ) false)
+      else some (name, .ObjEntry (asmTypeOf tt typ) (isSignedTyp typ) false)
   -- Chapter 13: float const labels must be static (RIP-relative Data operands).
   -- Prepend so lookupBst finds these first (overriding the isStatic=false entries
   -- that buildBackendSymTable would otherwise create from typeEnv).
@@ -188,7 +209,9 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
     | .error msg => throw (IO.userError s!"Parse error: {msg}")
   if stage == .Parse then return none
   -- Variable/identifier resolution
-  let (resolvedAst, initCounter, symTable) ←
+  -- Chapter 18: resolveProgram now returns a 4-tuple including the TypeTable
+  -- (which maps struct/union tags to their layout: member offsets, size, alignment).
+  let (resolvedAst, initCounter, symTable, typeTable) ←
     match Semantics.resolveProgram ast with
     | .ok r      => pure r
     | .error msg => throw (IO.userError s!"Semantic error: {msg}")
@@ -202,7 +225,7 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
   -- Must run BEFORE SwitchCollection so that duplicate detection sees
   -- the truncated values (e.g. `case 2^34:` in an int switch → `case 0:`).
   let resolvedAst ←
-    match Semantics.typeCheckProgram resolvedAst symTable with
+    match Semantics.typeCheckProgram resolvedAst symTable typeTable with
     | .ok p      => pure p
     | .error msg => throw (IO.userError s!"Type error: {msg}")
   -- Switch case collection (extra credit): validates case lists for duplicates.
@@ -220,16 +243,28 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
   -- Chapter 13: floatConsts = list of (label, Float) for float literal constants;
   --             needsNegZero = true if any double negation was emitted (needs .Lneg_zero).
   -- Chapter 16: strConsts = list of (label, String) for string literal constants.
+  -- Chapter 18: pass typeTable so TackyGen can look up struct/union member offsets.
   let (tacky, typeEnv, floatConsts, needsNegZero, strConsts) :=
-    Tacky.emitProgram resolvedAst symTable initCounter
+    Tacky.emitProgram resolvedAst symTable initCounter typeTable
   if stage == .Tacky then return none
   -- Build backend symbol table from frontend sym table + TACKY typeEnv.
   -- Float const labels (in floatConsts) need isStatic = true so PseudoReplace maps
   -- them to Data(name) operands instead of stack slots.
   -- Chapter 16: string const labels (in strConsts) also need isStatic = true.
-  let bst := buildBackendSymTable symTable typeEnv floatConsts strConsts
+  -- Chapter 18: pass typeTable so asmTypeOf can compute ByteArray size/alignment for structs.
+  let bst := buildBackendSymTable symTable typeEnv typeTable floatConsts strConsts
+  -- Build the combined AST type map for CodeGen (used to classify struct arguments/returns
+  -- by the System V AMD64 ABI rules).  Merges frontend symbol table Obj entries with
+  -- the TACKY typeEnv (which adds generated temporaries).
+  let frontendTypMap : List (String × AST.Typ) :=
+    symTable.filterMap fun (name, entry) =>
+      match entry.type with
+      | .Obj t => some (name, t)
+      | _      => none
+  let typMap : List (String × AST.Typ) := frontendTypMap ++ typeEnv
   -- Assembly generation pass 1: TACKY → Assembly AST
-  let asmAst := AssemblyAST.genProgram tacky bst
+  -- Chapter 18: pass typeTable and typMap for struct ABI classification.
+  let asmAst := AssemblyAST.genProgram tacky bst typeTable typMap
   -- Assembly generation pass 2: replace pseudoregisters
   let asmAst := AssemblyAST.replacePseudos asmAst bst
   -- Assembly generation pass 3: fix invalid instructions

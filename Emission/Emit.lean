@@ -138,7 +138,9 @@ private def emitOperand : Operand → String
   | .Imm n              => s!"${n}"
   | .Reg r              => emitReg4 r
   | .Memory r n         => s!"{n}({emitReg8 r})"
-  | .Data nm            => s!"{nm}(%rip)"
+  -- Chapter 18: Data(nm, off) emits nm+off(%rip) when off != 0, else nm(%rip).
+  -- GAS accepts the nm+off(%rip) RIP-relative form; the linker resolves nm+off at link time.
+  | .Data nm off        => if off == 0 then s!"{nm}(%rip)" else s!"{nm}+{off}(%rip)"
   | .Indexed b i s      => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
   | .Pseudo _           => panic! "Pseudo operand reached emission stage"
   | .PseudoMem _ _      => panic! "PseudoMem operand reached emission stage"
@@ -149,7 +151,8 @@ private def emitOperand8 : Operand → String
   | .Imm n              => s!"${n}"
   | .Reg r              => emitReg8 r
   | .Memory r n         => s!"{n}({emitReg8 r})"
-  | .Data nm            => s!"{nm}(%rip)"
+  -- Chapter 18: same offset handling as emitOperand
+  | .Data nm off        => if off == 0 then s!"{nm}(%rip)" else s!"{nm}+{off}(%rip)"
   | .Indexed b i s      => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
   | .Pseudo _           => panic! "Pseudo operand reached emission stage"
   | .PseudoMem _ _      => panic! "PseudoMem operand reached emission stage"
@@ -161,7 +164,8 @@ private def emitOperand8 : Operand → String
 private def emitXmmOperand : Operand → String
   | .Reg r              => emitRegXmm r
   | .Memory r n         => s!"{n}({emitReg8 r})"
-  | .Data nm            => s!"{nm}(%rip)"
+  -- Chapter 18: same offset handling
+  | .Data nm off        => if off == 0 then s!"{nm}(%rip)" else s!"{nm}+{off}(%rip)"
   | .Indexed b i s      => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
   | .Imm _              => panic! "Immediate cannot appear in XMM operand position"
   | .Pseudo _           => panic! "Pseudo operand reached emission stage"
@@ -172,7 +176,8 @@ private def emitXmmOperand : Operand → String
 private def emitByteOperand : Operand → String
   | .Reg r          => emitReg1 r
   | .Memory r n     => s!"{n}({emitReg8 r})"            -- Chapter 14
-  | .Data nm        => s!"{nm}(%rip)"
+  -- Chapter 18: same offset handling
+  | .Data nm off    => if off == 0 then s!"{nm}(%rip)" else s!"{nm}+{off}(%rip)"
   | .Imm n          => s!"${n}"
   | .Indexed b i s  => s!"({emitReg8 b}, {emitReg8 i}, {s})"  -- Chapter 15
   | .Pseudo _       => panic! "Pseudo operand reached emission stage"

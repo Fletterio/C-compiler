@@ -52,9 +52,10 @@ private partial def collectLabelsStmt : AST.Statement → List String
 
 /-- Collect all label names defined in a block item. -/
 private partial def collectLabelsItem : AST.BlockItem → List String
-  | .S stmt => collectLabelsStmt stmt
-  | .D _    => []
-  | .FD _   => []
+  | .S stmt  => collectLabelsStmt stmt
+  | .D _     => []
+  | .FD _    => []
+  | .SD _ _  => []   -- Chapter 18: struct/union declarations have no labels
 
 end
 
@@ -92,9 +93,10 @@ private partial def checkGotosStmt (defined : List String) : AST.Statement → E
 
 /-- Check that all goto targets in a block item are in `defined`. -/
 private partial def checkGotosItem (defined : List String) : AST.BlockItem → Except String Unit
-  | .S stmt => checkGotosStmt defined stmt
-  | .D _    => .ok ()
-  | .FD _   => .ok ()
+  | .S stmt  => checkGotosStmt defined stmt
+  | .D _     => .ok ()
+  | .FD _    => .ok ()
+  | .SD _ _  => .ok ()   -- Chapter 18: struct/union declarations have no gotos
 
 end
 
@@ -115,7 +117,8 @@ def resolveLabels (p : AST.Program) : Except String Unit := do
   for tl in p.topLevels do
     match tl with
     | .FunDef fd  => resolveFunctionLabels fd.body
-    | .FunDecl _  => pure ()   -- declarations have no body to check
-    | .VarDecl _  => pure ()   -- Chapter 10: file-scope variables have no body
+    | .FunDecl _      => pure ()   -- declarations have no body to check
+    | .VarDecl _      => pure ()   -- Chapter 10: file-scope variables have no body
+    | .StructDecl _ _ => pure ()   -- Chapter 18: struct/union type declarations have no body
 
 end Semantics

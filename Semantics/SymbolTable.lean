@@ -48,6 +48,10 @@ inductive InitialValue where
   | NoInitializer   : InitialValue
   | ArrayInitial    : List InitialValue → InitialValue  -- Chapter 15: static array initializer
   | StringInitial   : String → InitialValue  -- Chapter 16: char array init from string literal
+  /-- Chapter 18: static char-pointer member initialized with a string literal.
+      The String is the raw string content (without null terminator); TackyGen will
+      intern it as a StaticConstant and emit a `.quad label` pointer initializer. -/
+  | PointerInitial  : String → InitialValue
   deriving Repr, BEq
 
 /-- Attributes attached to a symbol table entry. -/
@@ -84,5 +88,45 @@ def insertSym (st : SymbolTable) (name : String) (entry : SymbolEntry) : SymbolT
     st.map fun (n, e) => if n == name then (n, entry) else (n, e)
   else
     (name, entry) :: st
+
+-- ---------------------------------------------------------------------------
+-- Chapter 18: Type table for struct/union definitions
+-- ---------------------------------------------------------------------------
+
+/-- A single member of a struct or union, with its byte offset from the start. -/
+structure MemberEntry where
+  name   : String   -- member name
+  typ    : AST.Typ  -- member type
+  offset : Nat      -- byte offset from start of struct/union
+  deriving Repr, BEq
+
+/-- The layout of a struct or union type.
+    For structs: members are placed at increasing offsets with alignment padding.
+    For unions:  all members have offset 0; size = max member size padded to alignment.
+    `size`      is the total byte size (including trailing padding).
+    `alignment` is the alignment requirement (maximum of all member alignments). -/
+structure StructDef where
+  members   : List MemberEntry
+  size      : Nat
+  alignment : Nat
+  deriving Repr, BEq
+
+/-- The type table maps internal struct/union tag names (e.g. "struct.Point") to
+    their layout definitions.  Built by VarResolution and threaded through the
+    entire compiler pipeline. -/
+abbrev TypeTable := List (String × StructDef)
+
+/-- Look up a struct/union tag in the type table. -/
+def lookupTypeTable (tt : TypeTable) (tag : String) : Option StructDef :=
+  match tt.find? (fun p => p.1 == tag) with
+  | some (_, sd) => some sd
+  | none         => none
+
+/-- Insert or update a struct/union entry in the type table. -/
+def insertTypeTable (tt : TypeTable) (tag : String) (sd : StructDef) : TypeTable :=
+  if tt.any (fun p => p.1 == tag) then
+    tt.map fun (n, e) => if n == tag then (n, sd) else (n, e)
+  else
+    (tag, sd) :: tt
 
 end Semantics

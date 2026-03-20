@@ -127,7 +127,10 @@ private def containsVoidArray : AST.Typ → Bool
     This models C's implicit array→pointer conversion. -/
 private def decayArray (e : AST.Exp) (t : AST.Typ) : AST.Exp × AST.Typ :=
   match t with
-  | .Array elem _ => (.AddrOf e, .Pointer elem)
+  -- Use Cast(Pointer(elem), e) instead of AddrOf(e) for array decay.
+  -- This lets TackyGen distinguish compiler-inserted decay (Cast) from
+  -- user-written &arr (AddrOf), which must give Pointer(Array) not Pointer(elem).
+  | .Array elem _ => (.Cast (.Pointer elem) e, .Pointer elem)
   | _             => (e, t)
 
 /-- Truncate an integer value `n` to the signed 32-bit range [−2^31, 2^31−1].
@@ -179,6 +182,47 @@ end
 /-- The symbol table is read-only in this pass; use a plain `Except` for errors
     and thread the symbol table as a parameter rather than through state. -/
 private abbrev TcM := Except String
+
+/-- Check that a type is "complete" with respect to struct/union definitions.
+    Pointers to incomplete types are allowed (e.g. `struct s *p;` is legal in C).
+    Arrays of incomplete struct types are illegal (C §6.2.5p22).
+    Throws a TypeCheck error if the type is an incomplete struct/union, or contains
+    an array whose element type is an incomplete struct/union. -/
+private partial def requireCompleteStructType (tt : TypeTable) (typ : AST.Typ) (ctx : String) : TcM Unit :=
+  match typ with
+  | .Struct tag | .Union tag =>
+      -- Check that the struct/union tag has a complete definition in the TypeTable.
+      match lookupTypeTable tt tag with
+      | some _ => pure ()
+      | none   => throw s!"TypeCheck: {ctx}: struct/union '{tag}' is an incomplete or undeclared type"
+  | .Array elem _ =>
+      -- Arrays of incomplete element type are illegal (C §6.2.5p22).
+      requireCompleteStructType tt elem ctx
+  | .Pointer t =>
+      -- Pointers to incomplete struct/union types are legal in C (e.g. `struct s *p;`).
+      -- However, a pointer to an array whose element type is incomplete is also problematic
+      -- (the array itself is an incomplete type, C §6.2.5p22), so we recurse into
+      -- pointer-to-array to verify the element type is complete.
+      match t with
+      | .Array _ _ => requireCompleteStructType tt t ctx
+      | _ => pure ()  -- pointer-to-struct/union/scalar: no completeness constraint
+  | _ => pure ()  -- scalars, void: no struct-completeness constraint
+
+/-- Compute the byte size of a type, consulting the TypeTable for struct/union sizes.
+    Unlike `AST.Typ.sizeOf`, this correctly handles:
+      - `.Struct tag` / `.Union tag` — looks up `TypeTable` for the real size
+      - `.Array elem n` — recurses to get the element size, then multiplies by n
+    Used for `sizeof` expression evaluation in TypeCheck. -/
+private partial def sizeOfTyp (tt : TypeTable) (typ : AST.Typ) : TcM Nat :=
+  match typ with
+  | .Struct tag | .Union tag =>
+      match lookupTypeTable tt tag with
+      | some sd => pure sd.size
+      | none    => throw s!"TypeCheck: sizeof requires a complete type; '{tag}' is not defined"
+  | .Array elem n => do
+      let elemSize ← sizeOfTyp tt elem
+      pure (elemSize * n)
+  | _ => pure typ.sizeOf   -- scalars, pointers, chars, void — use AST.Typ.sizeOf directly
 
 -- ---------------------------------------------------------------------------
 -- Expression type inference and cast insertion
@@ -234,6 +278,13 @@ private def implicitCastTo (target : AST.Typ) (current : AST.Typ) (e : AST.Exp) 
       -- Chapter 17: void value cannot be used in assignment, argument, or return context.
       -- void is an incomplete type with no value representation.
       throw "TypeCheck: void value cannot be used in expression context (void is not a scalar type)"
+  -- Chapter 18: struct/union assignments — both sides must have the exact same type.
+  -- Different struct types cannot be implicitly converted to each other.
+  | .Struct t1, .Struct t2 | .Union t1, .Union t2 =>
+      if t1 == t2 then return e
+      else throw s!"TypeCheck: cannot implicitly convert between different struct/union types"
+  | .Struct _, _ | _, .Struct _ | .Union _, _ | _, .Union _ =>
+      throw "TypeCheck: cannot implicitly convert between struct/union and non-struct/union types"
   | _, _ =>
       -- Ordinary numeric conversions: delegate to castTo
       return (castTo target current e)
@@ -247,9 +298,22 @@ private def lookupVarTyp (st : SymbolTable) (name : String) : TcM AST.Typ :=
   | some { type := .Fun _ _ _, .. } => throw s!"'{name}' is a function, not a variable"
   | none => throw s!"Undeclared identifier '{name}' in TypeCheck"
 
+/-- Check whether an expression is an lvalue (a designatable memory location).
+    In C: variables, dereferences, subscripts, and member accesses of lvalue bases are lvalues.
+    Function calls, ternary expressions, casts, and binary/unary expressions are rvalues.
+    Used to reject assignment to non-lvalue struct member expressions like `f().x = 0`. -/
+private def isLvalueExp : AST.Exp → Bool
+  | .Var _          => true          -- named variable
+  | .Dereference _  => true          -- pointer dereference
+  | .Subscript _ _  => true          -- array subscript (desugared to dereference)
+  | .Arrow _ _      => true          -- `ptr->member` is always an lvalue (deref + access)
+  | .Dot base _     => isLvalueExp base   -- `e.m` is lvalue iff `e` is lvalue
+  | _               => false         -- function calls, ternary, binary, casts, etc.
+
 /-- Infer the type of an expression and insert implicit casts where needed.
-    Returns the (possibly rewritten) expression and its type. -/
-private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
+    Returns the (possibly rewritten) expression and its type.
+    Chapter 18: accepts `tt : TypeTable` to look up struct/union member types and sizes. -/
+private def typeCheckExp (tt : TypeTable) (st : SymbolTable) : AST.Exp → TcResult
   -- Typed constants: preserve the constant's declared type
   | .Constant (.ConstInt n)    => return (.Constant (.ConstInt n),    .Int)
   | .Constant (.ConstLong n)   => return (.Constant (.ConstLong n),   .Long)
@@ -267,7 +331,7 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- to get the type, then replace the entire node with a constant.
   | .SizeOf inner => do
       -- Type-check the inner expression just to get its type (side effects not evaluated).
-      let (_, innerTyp) ← typeCheckExp st inner
+      let (_, innerTyp) ← typeCheckExp tt st inner
       -- C §6.5.3.4p1: sizeof cannot be applied to void type or function types.
       if innerTyp == .Void then
         throw "TypeCheck: sizeof cannot be applied to void type"
@@ -279,7 +343,10 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
       let sizeTyp : AST.Typ := match inner with
         | .Constant (.ConstChar _) | .Constant (.ConstUChar _) => .Int   -- char constant → int
         | _ => innerTyp                                                    -- everything else: use actual type
-      return (.Constant (.ConstULong (sizeTyp.sizeOf : Int)), .ULong)
+      -- Chapter 18: use sizeOfTyp to correctly compute size for struct/union types
+      -- and arrays of struct/union (e.g. sizeof(struct s[3]) = sizeof(struct s) * 3).
+      let sizeBytes : Nat ← sizeOfTyp tt sizeTyp
+      return (.Constant (.ConstULong (sizeBytes : Int)), .ULong)
   | .SizeOfT t => do
       -- C §6.5.3.4p1: sizeof cannot be applied to void type or function types.
       if t == .Void then
@@ -287,7 +354,9 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
       -- Chapter 17: arrays of incomplete element type (e.g. void[3]) are also illegal.
       if containsVoidArray t then
         throw "TypeCheck: sizeof cannot be applied to an array of incomplete element type (void[N])"
-      return (.Constant (.ConstULong (t.sizeOf : Int)), .ULong)
+      -- Chapter 18: use sizeOfTyp to correctly handle struct/union and arrays thereof.
+      let sizeBytes : Nat ← sizeOfTyp tt t
+      return (.Constant (.ConstULong (sizeBytes : Int)), .ULong)
   -- Variable reference: look up type.
   -- Arrays remain as Array type here; decay to pointer happens via
   -- implicitCastTo when used in a rvalue/pointer context (e.g. assignment, function arg).
@@ -297,10 +366,25 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- Explicit cast: type-check inner, wrap in Cast.
   -- Chapter 14: casting between pointer and double is never allowed, even explicitly.
   | .Cast targetTyp inner => do
-      let (inner', innerTyp) ← typeCheckExp st inner
+      let (inner', innerTyp) ← typeCheckExp tt st inner
+      -- C §6.3.2.1p3: arrays decay to pointers in almost all expression contexts, including
+      -- explicit casts (e.g. `(unsigned long)arr` → first decay arr to ptr, then cast ptr to ulong).
+      -- Exceptions: sizeof, alignof, unary &, string literal initializers — none apply here.
+      let (inner', innerTyp) := decayArray inner' innerTyp
       -- Chapter 17: target type cannot contain an array of void (e.g. `(void(*)[3])expr`).
       if containsVoidArray targetTyp then
         throw "TypeCheck: cast target type contains an array of incomplete element type (void[N])"
+      -- Chapter 18: cannot cast to or from a struct/union type (only scalar casts are legal).
+      match targetTyp with
+      | .Struct _ | .Union _ => throw "TypeCheck: cannot cast to a struct or union type"
+      | _ => pure ()
+      -- Chapter 18: casting a struct/union value to void is allowed (discards value).
+      -- All other casts from struct/union are illegal.
+      match innerTyp with
+      | .Struct _ | .Union _ =>
+          if targetTyp != .Void then
+            throw "TypeCheck: cannot cast a struct or union value"
+      | _ => pure ()
       match targetTyp, innerTyp with
       | .Pointer _, .Double =>
           throw "TypeCheck: cannot cast double to pointer"
@@ -318,17 +402,22 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- Exception: logical NOT (!) always produces Int regardless of operand type.
   -- Chapter 13: bitwise complement (~) is not valid on Double.
   | .Unary .Not inner => do
-      let (inner', innerTyp) ← typeCheckExp st inner
+      let (inner', innerTyp) ← typeCheckExp tt st inner
       -- Chapter 17: void is non-scalar; cannot be used with logical NOT
       if innerTyp == .Void then
         throw "TypeCheck: void type cannot be used with logical NOT (!)"
+      -- Chapter 18: struct/union are not scalar; cannot be used with !
+      match innerTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: struct/union type cannot be used with logical NOT (!)"
+      | _ => pure ()
       -- C §6.3.2.1p3: array operand decays to pointer before applying !.
       -- This handles `!"string literal"` where the string has array type.
       let (inner', _) := decayArray inner' innerTyp
       -- Logical NOT always produces int (0 or 1)
       return (.Unary .Not inner', .Int)
   | .Unary .Complement inner => do
-      let (inner', innerTyp) ← typeCheckExp st inner
+      let (inner', innerTyp) ← typeCheckExp tt st inner
       -- C §6.5.3.3: ~ requires integer operand; void, doubles, and pointers are not allowed
       if innerTyp == .Void then
         throw s!"TypeCheck: bitwise complement (~) is not valid on void"
@@ -336,13 +425,17 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
         throw s!"TypeCheck: bitwise complement (~) is not valid on a double"
       if isPointerType innerTyp then
         throw s!"TypeCheck: bitwise complement (~) is not valid on a pointer"
+      -- Chapter 18: ~ is not valid on struct/union
+      match innerTyp with
+      | .Struct _ | .Union _ => throw s!"TypeCheck: bitwise complement (~) is not valid on a struct/union"
+      | _ => pure ()
       -- Chapter 16: integer promotion — char types promote to Int before ~
       let (inner', innerTyp) :=
         if isCharType innerTyp then (.Cast .Int inner', .Int) else (inner', innerTyp)
       return (.Unary .Complement inner', innerTyp)
   -- Chapter 14: unary negation is not valid on a pointer or void
   | .Unary .Negate inner => do
-      let (inner', innerTyp) ← typeCheckExp st inner
+      let (inner', innerTyp) ← typeCheckExp tt st inner
       -- Chapter 17: void is non-scalar; cannot negate void
       if innerTyp == .Void then
         throw s!"TypeCheck: unary negation (-) is not valid on void"
@@ -360,8 +453,8 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- shift amount can have any integer type without affecting the result type.
   -- Chapter 13: shifts and bitwise ops (& | ^ %) are not valid on Double.
   | .Binary .ShiftLeft left right => do
-      let (left',  leftTyp)  ← typeCheckExp st left
-      let (right', rightTyp) ← typeCheckExp st right
+      let (left',  leftTyp)  ← typeCheckExp tt st left
+      let (right', rightTyp) ← typeCheckExp tt st right
       -- Chapter 17: void is non-scalar; cannot be used as shift operand
       if leftTyp == .Void || rightTyp == .Void then
         throw s!"TypeCheck: void type cannot be used as operand of shift operator (<<)"
@@ -379,8 +472,8 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
         if isCharType leftTyp then (.Cast .Int left', .Int) else (left', leftTyp)
       return (.Binary .ShiftLeft left' right', leftTyp)
   | .Binary .ShiftRight left right => do
-      let (left',  leftTyp)  ← typeCheckExp st left
-      let (right', rightTyp) ← typeCheckExp st right
+      let (left',  leftTyp)  ← typeCheckExp tt st left
+      let (right', rightTyp) ← typeCheckExp tt st right
       -- Chapter 17: void is non-scalar; cannot be used as shift operand
       if leftTyp == .Void || rightTyp == .Void then
         throw s!"TypeCheck: void type cannot be used as operand of shift operator (>>)"
@@ -401,22 +494,32 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- independently; do NOT apply usual arithmetic conversions between them.
   -- The result is always Int (0 or 1).
   | .Binary .And left right => do
-      let (left', leftTyp)   ← typeCheckExp st left
-      let (right', rightTyp) ← typeCheckExp st right
+      let (left', leftTyp)   ← typeCheckExp tt st left
+      let (right', rightTyp) ← typeCheckExp tt st right
       -- Chapter 17: void is non-scalar and cannot be used with logical AND (&&)
       if leftTyp == .Void || rightTyp == .Void then
         throw "TypeCheck: void type cannot be used with logical AND (&&)"
+      -- Chapter 18: struct/union are non-scalar and cannot be used with &&
+      match leftTyp, rightTyp with
+      | .Struct _, _ | .Union _, _ | _, .Struct _ | _, .Union _ =>
+          throw "TypeCheck: struct/union cannot be used with logical AND (&&)"
+      | _, _ => pure ()
       return (.Binary .And left' right', .Int)
   | .Binary .Or left right => do
-      let (left', leftTyp)   ← typeCheckExp st left
-      let (right', rightTyp) ← typeCheckExp st right
+      let (left', leftTyp)   ← typeCheckExp tt st left
+      let (right', rightTyp) ← typeCheckExp tt st right
       -- Chapter 17: void is non-scalar and cannot be used with logical OR (||)
       if leftTyp == .Void || rightTyp == .Void then
         throw "TypeCheck: void type cannot be used with logical OR (||)"
+      -- Chapter 18: struct/union are non-scalar and cannot be used with ||
+      match leftTyp, rightTyp with
+      | .Struct _, _ | .Union _, _ | _, .Struct _ | _, .Union _ =>
+          throw "TypeCheck: struct/union cannot be used with logical OR (||)"
+      | _, _ => pure ()
       return (.Binary .Or left' right', .Int)
   | .Binary op left right => do
-      let (left', leftTyp)   ← typeCheckExp st left
-      let (right', rightTyp) ← typeCheckExp st right
+      let (left', leftTyp)   ← typeCheckExp tt st left
+      let (right', rightTyp) ← typeCheckExp tt st right
       -- Chapter 17: void is non-scalar and cannot be used as a binary operand.
       -- This check comes BEFORE array decay so that void[N] decaying to void* is
       -- not a surprise; void operands are always rejected here.
@@ -424,6 +527,15 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
         throw "TypeCheck: void type cannot be used as operand of binary expression"
       if rightTyp == .Void then
         throw "TypeCheck: void type cannot be used as operand of binary expression"
+      -- Chapter 18: struct/union are not scalar; cannot be used with binary operators.
+      match leftTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: struct/union type cannot be used as operand of binary expression"
+      | _ => pure ()
+      match rightTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: struct/union type cannot be used as operand of binary expression"
+      | _ => pure ()
       -- Chapter 15: array-to-pointer decay in binary expression context.
       -- In C, an array used in an expression decays to a pointer to its first element.
       -- e.g. `arr + 2` where arr : int[3]  →  (&arr[0]) + 2 : int*
@@ -487,6 +599,11 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
             -- Chapter 17: void * arithmetic is not allowed
             if leftTyp == .Pointer .Void then
               throw s!"TypeCheck: pointer arithmetic is not allowed on void * (void is an incomplete type)"
+            -- Chapter 18: pointer arithmetic on pointer to incomplete struct is not allowed
+            -- (we need the element size to compute the step, and incomplete structs have no size)
+            (match leftTyp with
+            | .Pointer elem => requireCompleteStructType tt elem "pointer arithmetic"
+            | _ => pure ())
             -- Result is the pointer type
             return (.Binary .Add left' right', leftTyp)
           if isRightPtr && isLeftPtr == false then
@@ -496,6 +613,10 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
             -- Chapter 17: void * arithmetic is not allowed
             if rightTyp == .Pointer .Void then
               throw s!"TypeCheck: pointer arithmetic is not allowed on void * (void is an incomplete type)"
+            -- Chapter 18: pointer arithmetic on pointer to incomplete struct is not allowed
+            (match rightTyp with
+            | .Pointer elem => requireCompleteStructType tt elem "pointer arithmetic"
+            | _ => pure ())
             -- Result is the pointer type
             return (.Binary .Add left' right', rightTyp)
           -- Otherwise: neither is a pointer, fall through to normal arithmetic
@@ -507,6 +628,10 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
             -- Chapter 17: void * arithmetic is not allowed
             if leftTyp == .Pointer .Void then
               throw s!"TypeCheck: pointer arithmetic is not allowed on void * (void is an incomplete type)"
+            -- Chapter 18: pointer arithmetic on pointer to incomplete struct is not allowed
+            (match leftTyp with
+            | .Pointer elem => requireCompleteStructType tt elem "pointer arithmetic"
+            | _ => pure ())
             return (.Binary .Subtract left' right', .Long)
           if isLeftPtr && !isRightPtr then
             -- ptr - int: right operand must be integer
@@ -515,6 +640,10 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
             -- Chapter 17: void * arithmetic is not allowed
             if leftTyp == .Pointer .Void then
               throw s!"TypeCheck: pointer arithmetic is not allowed on void * (void is an incomplete type)"
+            -- Chapter 18: pointer arithmetic on pointer to incomplete struct is not allowed
+            (match leftTyp with
+            | .Pointer elem => requireCompleteStructType tt elem "pointer arithmetic"
+            | _ => pure ())
             return (.Binary .Subtract left' right', leftTyp)
           if !isLeftPtr && isRightPtr then
             throw s!"TypeCheck: cannot subtract a pointer from a non-pointer"
@@ -570,14 +699,16 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
       -- Chapter 15: arrays are not assignable in C (C §6.3.2.1)
       if isArrayType lhsTyp then
         throw s!"TypeCheck: cannot assign to '{lhsName}' which has array type (arrays are not assignable in C)"
-      let (rhs', rhsTyp) ← typeCheckExp st rhs
+      -- Chapter 18: struct/union assignment requires a complete type (need size for copy)
+      requireCompleteStructType tt lhsTyp s!"assignment to '{lhsName}'"
+      let (rhs', rhsTyp) ← typeCheckExp tt st rhs
       -- Chapter 14: use implicitCastTo to catch illegal pointer assignments
       let rhs'' ← implicitCastTo lhsTyp rhsTyp rhs'
       return (.Assignment (.Var lhsName) rhs'', lhsTyp)
   -- Chapter 14: assignment through a pointer dereference: `*ptr = rhs`
   | .Assignment (.Dereference ptrExp) rhs => do
-      let (ptr', ptrTyp) ← typeCheckExp st ptrExp
-      let (rhs', rhsTyp) ← typeCheckExp st rhs
+      let (ptr', ptrTyp) ← typeCheckExp tt st ptrExp
+      let (rhs', rhsTyp) ← typeCheckExp tt st rhs
       -- Chapter 15: apply array-to-pointer decay to the pointer expression.
       -- e.g. `*arr = 3` where arr : int[N] — arr decays to int* before dereferencing.
       let (ptr', ptrTyp) := decayArray ptr' ptrTyp
@@ -591,6 +722,8 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
           -- e.g. `*ptr_to_array = arr` is illegal — arrays are not assignable in C.
           if isArrayType t then
             throw s!"TypeCheck: cannot assign to an array type through a pointer dereference (arrays are not assignable in C)"
+          -- Chapter 18: cannot assign to an incomplete struct/union through a pointer
+          requireCompleteStructType tt t "assignment through pointer dereference"
           -- Chapter 14: use implicitCastTo to catch illegal pointer assignments
           let rhs'' ← implicitCastTo t rhsTyp rhs'
           return (.Assignment (.Dereference ptr') rhs'', t)
@@ -599,13 +732,35 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- Desugar the LHS subscript to a dereference, then handle as *ptr = rhs.
   | .Assignment (.Subscript arrExp idxExp) rhs => do
       -- Rewrite a[i] = rhs as *(a + i) = rhs; typeCheckExp on Subscript gives Dereference(...)
-      let (lhs', lhsTyp) ← typeCheckExp st (.Subscript arrExp idxExp)
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Subscript arrExp idxExp)
       -- Chapter 15: cannot assign to an array-typed subscript (e.g., dim2[0] = dim
       -- where dim2 : int[1][2] — the subscript has type int[2], which is an array).
       if isArrayType lhsTyp then
         throw s!"TypeCheck: cannot assign to an array type (arrays are not assignable in C)"
-      let (rhs', rhsTyp) ← typeCheckExp st rhs
+      let (rhs', rhsTyp) ← typeCheckExp tt st rhs
       -- lhs' should be Dereference(Binary.Add ...) with type = element type
+      let rhs'' ← implicitCastTo lhsTyp rhsTyp rhs'
+      return (.Assignment lhs' rhs'', lhsTyp)
+  -- Chapter 18: assignment to a struct member via dot: `s.member = rhs`
+  | .Assignment (.Dot structExp member) rhs => do
+      -- C §6.3.2.1p1: a struct member access `e.m` is an lvalue only if `e` is an lvalue.
+      -- Reject assignment to non-lvalue bases like `f().m = x` or `(a ? b : c).m = x`.
+      if !isLvalueExp structExp then
+        throw s!"TypeCheck: cannot assign to member '{member}' of non-lvalue struct expression"
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Dot structExp member)
+      -- Struct members of array type are not assignable
+      if isArrayType lhsTyp then
+        throw s!"TypeCheck: cannot assign to struct member '{member}' of array type"
+      let (rhs', rhsTyp) ← typeCheckExp tt st rhs
+      let rhs'' ← implicitCastTo lhsTyp rhsTyp rhs'
+      return (.Assignment lhs' rhs'', lhsTyp)
+  -- Chapter 18: assignment through pointer member access: `ptr->member = rhs`
+  | .Assignment (.Arrow ptrExp member) rhs => do
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Arrow ptrExp member)
+      -- Struct members of array type are not assignable
+      if isArrayType lhsTyp then
+        throw s!"TypeCheck: cannot assign to struct member '{member}' of array type"
+      let (rhs', rhsTyp) ← typeCheckExp tt st rhs
       let rhs'' ← implicitCastTo lhsTyp rhsTyp rhs'
       return (.Assignment lhs' rhs'', lhsTyp)
   | .Assignment lhs _ =>
@@ -617,12 +772,17 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   --             The condition must be scalar (not void).
   --             Both-void branches are valid; one-void + one-non-void is not.
   | .Conditional cond e1 e2 => do
-      let (cond', condTyp) ← typeCheckExp st cond
+      let (cond', condTyp) ← typeCheckExp tt st cond
       -- Chapter 17: the ternary condition must have scalar type (not void).
       if condTyp == .Void then
         throw "TypeCheck: void type cannot be used as conditional expression condition"
-      let (e1', t1)     ← typeCheckExp st e1
-      let (e2', t2)     ← typeCheckExp st e2
+      -- Chapter 18: the ternary condition must be scalar (not struct/union).
+      match condTyp with
+      | .Struct _ | .Union _ =>
+          throw "TypeCheck: struct/union cannot be used as ternary condition"
+      | _ => pure ()
+      let (e1', t1)     ← typeCheckExp tt st e1
+      let (e2', t2)     ← typeCheckExp tt st e2
       -- Chapter 15: apply array-to-pointer decay to both branches.
       -- e.g. `flag ? arr : ptr` where arr is int[N] — arr decays to int*.
       let (e1', t1) := decayArray e1' t1
@@ -662,50 +822,99 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
         -- One-void + one-non-void is invalid (cannot mix void and non-void types).
         if (t1 == .Void) != (t2 == .Void) then
           throw "TypeCheck: ternary branches have incompatible types (cannot mix void and non-void branches)"
+        -- Chapter 18: if either branch has struct/union type, both must have the SAME type.
+        -- There is no common/arithmetic type for struct/union, and implicit casting is illegal.
+        let isStruct1 := match t1 with | .Struct _ | .Union _ => true | _ => false
+        let isStruct2 := match t2 with | .Struct _ | .Union _ => true | _ => false
+        if isStruct1 || isStruct2 then do
+          if t1 != t2 then
+            throw s!"TypeCheck: ternary branches have incompatible struct/union types ({repr t1} vs {repr t2})"
+          -- Both are the same struct/union type: return it directly (no cast needed).
+          return (.Conditional cond' e1' e2', t1)
         let common := commonType t1 t2
         let e1'' := castTo common t1 e1'
         let e2'' := castTo common t2 e2'
         let r : AST.Exp := .Conditional cond' e1'' e2''
         return (r, common)
   -- Postfix increment/decrement: type of the variable
+  -- Chapter 18: struct/union types reject ++/--.
   | .PostfixIncr (.Var v) => do
       let t ← lookupVarTyp st v
-      -- Chapter 17: postfix ++ on a void * pointer is not allowed
-      if t == .Pointer .Void then
-        throw s!"TypeCheck: postfix ++ is not allowed on void * (void is an incomplete type)"
-      return (.PostfixIncr (.Var v), t)
+      match t with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: postfix ++ is not allowed on struct/union type"
+      | .Pointer .Void =>
+          throw s!"TypeCheck: postfix ++ is not allowed on void * (void is an incomplete type)"
+      | _ => return (.PostfixIncr (.Var v), t)
   | .PostfixDecr (.Var v) => do
       let t ← lookupVarTyp st v
-      -- Chapter 17: postfix -- on a void * pointer is not allowed
-      if t == .Pointer .Void then
-        throw s!"TypeCheck: postfix -- is not allowed on void * (void is an incomplete type)"
-      return (.PostfixDecr (.Var v), t)
+      match t with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: postfix -- is not allowed on struct/union type"
+      | .Pointer .Void =>
+          throw s!"TypeCheck: postfix -- is not allowed on void * (void is an incomplete type)"
+      | _ => return (.PostfixDecr (.Var v), t)
   -- Chapter 14: postfix ++/-- through a pointer dereference: `(*p)++`
   | .PostfixIncr (.Dereference ptrExp) => do
-      let (ptr', ptrTyp) ← typeCheckExp st ptrExp
+      let (ptr', ptrTyp) ← typeCheckExp tt st ptrExp
       match ptrTyp with
       | .Pointer t =>
-          -- Chapter 17: cannot apply ++ to a void lvalue (dereferencing void * is incomplete)
-          if t == .Void then
-            throw "TypeCheck: postfix ++ on a void lvalue is not allowed (void is an incomplete type)"
-          return (.PostfixIncr (.Dereference ptr'), t)
+          match t with
+          | .Struct _ | .Union _ =>
+              throw s!"TypeCheck: postfix ++ is not allowed on struct/union type"
+          | .Void =>
+              throw "TypeCheck: postfix ++ on a void lvalue is not allowed (void is an incomplete type)"
+          | _ => return (.PostfixIncr (.Dereference ptr'), t)
       | _ => throw s!"TypeCheck: postfix ++ requires a pointer dereference"
   | .PostfixDecr (.Dereference ptrExp) => do
-      let (ptr', ptrTyp) ← typeCheckExp st ptrExp
+      let (ptr', ptrTyp) ← typeCheckExp tt st ptrExp
       match ptrTyp with
       | .Pointer t =>
-          -- Chapter 17: cannot apply -- to a void lvalue (dereferencing void * is incomplete)
-          if t == .Void then
-            throw "TypeCheck: postfix -- on a void lvalue is not allowed (void is an incomplete type)"
-          return (.PostfixDecr (.Dereference ptr'), t)
+          match t with
+          | .Struct _ | .Union _ =>
+              throw s!"TypeCheck: postfix -- is not allowed on struct/union type"
+          | .Void =>
+              throw "TypeCheck: postfix -- on a void lvalue is not allowed (void is an incomplete type)"
+          | _ => return (.PostfixDecr (.Dereference ptr'), t)
       | _ => throw s!"TypeCheck: postfix -- requires a pointer dereference"
   -- Chapter 15: postfix ++/-- on array subscript: a[i]++
   | .PostfixIncr (.Subscript arrExp idxExp) => do
-      let (lhs', lhsTyp) ← typeCheckExp st (.Subscript arrExp idxExp)
-      return (.PostfixIncr lhs', lhsTyp)
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Subscript arrExp idxExp)
+      match lhsTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: postfix ++ is not allowed on struct/union type"
+      | _ => return (.PostfixIncr lhs', lhsTyp)
   | .PostfixDecr (.Subscript arrExp idxExp) => do
-      let (lhs', lhsTyp) ← typeCheckExp st (.Subscript arrExp idxExp)
-      return (.PostfixDecr lhs', lhsTyp)
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Subscript arrExp idxExp)
+      match lhsTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: postfix -- is not allowed on struct/union type"
+      | _ => return (.PostfixDecr lhs', lhsTyp)
+  -- Chapter 18: postfix ++/-- on struct member: s.x++ or p->x++
+  | .PostfixIncr (.Dot structExp member) => do
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Dot structExp member)
+      match lhsTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: postfix ++ is not allowed on struct/union type"
+      | _ => return (.PostfixIncr lhs', lhsTyp)
+  | .PostfixDecr (.Dot structExp member) => do
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Dot structExp member)
+      match lhsTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: postfix -- is not allowed on struct/union type"
+      | _ => return (.PostfixDecr lhs', lhsTyp)
+  | .PostfixIncr (.Arrow ptrExp member) => do
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Arrow ptrExp member)
+      match lhsTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: postfix ++ is not allowed on struct/union type"
+      | _ => return (.PostfixIncr lhs', lhsTyp)
+  | .PostfixDecr (.Arrow ptrExp member) => do
+      let (lhs', lhsTyp) ← typeCheckExp tt st (.Arrow ptrExp member)
+      match lhsTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: postfix -- is not allowed on struct/union type"
+      | _ => return (.PostfixDecr lhs', lhsTyp)
   | .PostfixIncr e | .PostfixDecr e =>
       throw s!"TypeCheck: invalid lvalue in postfix operator"
   -- Chapter 14: address-of operator: `&e` has type `Pointer(typeOf e)`.
@@ -714,13 +923,28 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- Chapter 15: &arr where arr is an Array type gives Pointer(Array elem n), not Pointer(elem).
   -- Chapter 16: &"hello" is valid — string literals are lvalues in read-only data.
   | .AddrOf inner => do
-      let (inner', innerTyp) ← typeCheckExp st inner
+      -- Chapter 18: &*ptr where ptr has pointer-to-incomplete-type is legal (C §6.5.3.2):
+      -- &*ptr and ptr are equivalent; the dereference+address-of cancel out.
+      -- Handle this before the general Dereference type-check (which requires completeness).
+      match inner with
+      | .Dereference ptrExpr => do
+          let (ptrExpr', ptrTyp) ← typeCheckExp tt st ptrExpr
+          let (ptrExpr', ptrTyp) := decayArray ptrExpr' ptrTyp
+          match ptrTyp with
+          | .Pointer pointeeTyp =>
+              -- Whether the pointee is complete or incomplete, &*ptr is legal.
+              return (.AddrOf (.Dereference ptrExpr'), .Pointer pointeeTyp)
+          | _ => throw "TypeCheck: operand of * in &*expr must be a pointer type"
+      | _ => pure ()
+      let (inner', innerTyp) ← typeCheckExp tt st inner
       -- Only lvalues are valid operands of &
       match inner' with
       | .Var _           => return (.AddrOf inner', .Pointer innerTyp)
       | .Dereference _   => return (.AddrOf inner', .Pointer innerTyp)
       | .Subscript _ _   => return (.AddrOf inner', .Pointer innerTyp)
       | .StringLiteral _ => return (.AddrOf inner', .Pointer innerTyp)   -- Chapter 16
+      | .Dot _ _         => return (.AddrOf inner', .Pointer innerTyp)   -- Chapter 18
+      | .Arrow _ _       => return (.AddrOf inner', .Pointer innerTyp)   -- Chapter 18
       | _ => throw "TypeCheck: operand of address-of (&) must be an lvalue (variable, *expr, a[i], or string literal)"
   -- Chapter 14: dereference operator: `*e` has type `t` when `typeOf e = Pointer(t)`
   -- Chapter 15: apply array-to-pointer decay before the pointer check.
@@ -728,18 +952,22 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
   -- But also `**row_ptr` where `*row_ptr : Array(int, N)` — the inner result has
   -- Array type, which decays to a Pointer before the outer * is applied.
   | .Dereference inner => do
-      let (inner', innerTyp) ← typeCheckExp st inner
+      let (inner', innerTyp) ← typeCheckExp tt st inner
       -- Decay: if `inner'` has array type, treat it as a pointer to the first element
       let (inner', innerTyp) := decayArray inner' innerTyp
       match innerTyp with
-      | .Pointer t => return (.Dereference inner', t)
+      | .Pointer t =>
+          -- Chapter 18: cannot dereference a pointer to an incomplete struct/union (C §6.5.3.2).
+          -- The result type t must be a complete type so we know its size and layout.
+          requireCompleteStructType tt t "pointer dereference"
+          return (.Dereference inner', t)
       | _ => throw s!"TypeCheck: cannot dereference a non-pointer type"
   -- Chapter 15: array subscript `a[i]` ≡ `*(a + i)`.
   -- The array (or pointer) `a` is decayed to a pointer, then `i` indexes it.
   -- The result type is the pointee type (an lvalue of element type).
   | .Subscript arrExp idxExp => do
-      let (arr', arrTyp) ← typeCheckExp st arrExp
-      let (idx', idxTyp) ← typeCheckExp st idxExp
+      let (arr', arrTyp) ← typeCheckExp tt st arrExp
+      let (idx', idxTyp) ← typeCheckExp tt st idxExp
       -- C §6.5.2.1: E1[E2] == *(E1 + E2), and subscript is commutative: E1[E2] == E2[E1].
       -- The pointer/array operand can be on EITHER side (e.g. `3[arr]` is valid: arr + 3).
       -- We track (ptrExpr, intExpr, intTyp) separately so we can:
@@ -747,14 +975,17 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
       --   2. Build `ptrExpr + intExpr` in the correct order.
       let (ptrExpr, intExpr, intTyp, elemTyp) ← match arrTyp, idxTyp with
         | .Array elem _, _  =>
-            -- Left side is array: decay to pointer to first element; right is index
-            pure (.AddrOf arr', idx', idxTyp, elem)
+            -- Left side is array: decay to pointer to first element via Cast, not AddrOf.
+            -- Using Cast(Pointer(elem), arr') (rather than AddrOf) lets TackyGen distinguish
+            -- this compiler-inserted decay from a user-written &arr, which should give
+            -- Pointer(Array(elem,n)) rather than Pointer(elem) for correct pointer arithmetic.
+            pure (.Cast (.Pointer elem) arr', idx', idxTyp, elem)
         | .Pointer elem, _  =>
             -- Left side is already a pointer (e.g. `p[i]`); right is index
             pure (arr', idx', idxTyp, elem)
         | _, .Array elem _  =>
-            -- Right side is array (e.g. `3[arr]`): decay array to pointer; left is index
-            pure (.AddrOf idx', arr', arrTyp, elem)
+            -- Right side is array (e.g. `3[arr]`): decay array to pointer via Cast; left is index
+            pure (.Cast (.Pointer elem) idx', arr', arrTyp, elem)
         | _, .Pointer elem  =>
             -- Right side is pointer (e.g. `0[ptr]` or `3[ptr]`): swap; left is index
             pure (idx', arr', arrTyp, elem)
@@ -766,20 +997,62 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
       -- Chapter 17: cannot subscript a pointer to void (incomplete element type has no size)
       if elemTyp == .Void then
         throw "TypeCheck: cannot subscript a pointer to void (void is an incomplete type, element has no size)"
+      -- Chapter 18: cannot subscript a pointer to an incomplete struct/union (element size unknown)
+      requireCompleteStructType tt elemTyp "subscript element type"
       -- Desugar to *(ptrExpr + intExpr); pointer arithmetic is now legal (Ch15)
       let addExp := AST.Exp.Binary .Add ptrExpr intExpr
       return (.Dereference addExp, elemTyp)
   -- Function call: cast each argument to the declared parameter type
+  -- Chapter 18: member access via dot operator `e.member`
+  | .Dot e member => do
+      let (e', eTyp) ← typeCheckExp tt st e
+      -- The dot operator requires the left side to have struct or union type (not a pointer).
+      let tagOpt : Option String := match eTyp with
+        | .Struct tag | .Union tag => some tag
+        | _                        => none
+      match tagOpt with
+      | none => throw s!"TypeCheck: '.' operator requires a struct or union operand, got {repr eTyp}"
+      | some tag =>
+          match lookupTypeTable tt tag with
+          | none => throw s!"TypeCheck: struct/union '{tag}' is not defined (incomplete type)"
+          | some sd =>
+              match sd.members.find? (fun m => m.name == member) with
+              | none     => throw s!"TypeCheck: struct/union '{tag}' has no member named '{member}'"
+              | some mem => return (.Dot e' member, mem.typ)
+  -- Chapter 18: pointer member access via arrow operator `e->member`
+  | .Arrow e member => do
+      let (e', eTyp) ← typeCheckExp tt st e
+      -- Apply array-to-pointer decay (unusual but possible)
+      let (e', eTyp) := decayArray e' eTyp
+      -- The arrow operator requires the left side to be a pointer to a struct/union.
+      let tagOpt : Option String := match eTyp with
+        | .Pointer (.Struct tag) | .Pointer (.Union tag) => some tag
+        | _ => none
+      match tagOpt with
+      | none => throw s!"TypeCheck: '->' operator requires a pointer-to-struct/union operand, got {repr eTyp}"
+      | some tag =>
+          match lookupTypeTable tt tag with
+          | none => throw s!"TypeCheck: struct/union '{tag}' is not defined (incomplete type)"
+          | some sd =>
+              match sd.members.find? (fun m => m.name == member) with
+              | none     => throw s!"TypeCheck: struct/union '{tag}' has no member named '{member}'"
+              | some mem => return (.Arrow e' member, mem.typ)
   | .FunCall fname args => do
       match lookupSym st fname with
       | none => throw s!"Undeclared function '{fname}'"
       | some { type := .Obj _, .. } => throw s!"'{fname}' is a variable, not a function"
       | some { type := .Fun _ paramTypes retTyp, .. } => do
+          -- Chapter 18: calling a function with incomplete struct return type is illegal
+          -- (we can't copy the return value without knowing its size).
+          requireCompleteStructType tt retTyp s!"call to '{fname}' (return type)"
           -- Type-check each argument and implicitly cast to the corresponding param type
-          let typedArgs ← args.mapM (typeCheckExp st)
+          let typedArgs ← args.mapM (typeCheckExp tt st)
           -- Chapter 14: use implicitCastTo to catch illegal pointer/int conversions
           let castedArgs ← (typedArgs.zip paramTypes).mapM fun ((arg, argTyp), paramTyp) =>
             implicitCastTo paramTyp argTyp arg
+          -- Chapter 18: passing an incomplete struct as a function argument is illegal
+          for (_, argTyp) in typedArgs do
+            requireCompleteStructType tt argTyp s!"argument to '{fname}'"
           -- For extra args beyond paramTypes (shouldn't occur), keep as-is
           let allArgs := castedArgs ++ (typedArgs.drop paramTypes.length).map (·.1)
           return (.FunCall fname allArgs, retTyp)
@@ -788,24 +1061,43 @@ private def typeCheckExp (st : SymbolTable) : AST.Exp → TcResult
 -- Initializer type-checking (must come after typeCheckExp)
 -- ---------------------------------------------------------------------------
 
+-- `partial def makeZeroInit` needs `Inhabited AST.Initializer` for Lean 4 to accept it.
+-- Use `CompoundInit []` (empty compound initializer) as the default value.
+private instance : Inhabited AST.Initializer := ⟨.CompoundInit []⟩
+
 /-- Build a zero-valued initializer for the given type.
     C §6.7.9p10: elements not explicitly initialized are zero-initialized,
     as if they had static storage duration.
     For scalar types, emits the typed zero constant directly so that
     TackyGen can use the correct AsmType without needing an implicit cast.
     For array types, recursively creates a CompoundInit of zeros.
-    Chapter 16: char types use ConstChar(0) / ConstUChar(0). -/
-private def makeZeroInit : AST.Typ → AST.Initializer
+    Chapter 16: char types use ConstChar(0) / ConstUChar(0).
+    Chapter 18: struct/union types create a CompoundInit of zeros for each member. -/
+private partial def makeZeroInit (tt : TypeTable) : AST.Typ → AST.Initializer
   | .Int       => .SingleInit (.Constant (.ConstInt 0))
   | .Long      => .SingleInit (.Constant (.ConstLong 0))
   | .UInt      => .SingleInit (.Constant (.ConstUInt 0))
   | .ULong     => .SingleInit (.Constant (.ConstULong 0))
   | .Double    => .SingleInit (.Constant (.ConstDouble 0.0))
   | .Pointer _ => .SingleInit (.Constant (.ConstInt 0))  -- null pointer constant
-  | .Array e n => .CompoundInit (List.replicate n (makeZeroInit e))
+  | .Array e n => .CompoundInit (List.replicate n (makeZeroInit tt e))
   | .Char | .SChar => .SingleInit (.Constant (.ConstChar 0))   -- Chapter 16
   | .UChar         => .SingleInit (.Constant (.ConstUChar 0))  -- Chapter 16
   | .Void          => .SingleInit (.Constant (.ConstInt 0))    -- Chapter 17: void cannot be zero-initialized; fallback
+  -- Chapter 18: struct — zero each member in declaration order.
+  | .Struct tag =>
+      match lookupTypeTable tt tag with
+      | some sd => .CompoundInit (sd.members.map fun m => makeZeroInit tt m.typ)
+      | none    => .SingleInit (.Constant (.ConstInt 0))  -- incomplete type: fallback
+  -- Chapter 18: union — only the first member is explicitly zero-initialized.
+  -- (All members alias the same memory; only the first gets an init in the AST.)
+  | .Union tag =>
+      match lookupTypeTable tt tag with
+      | some sd =>
+          match sd.members.head? with
+          | some m => .CompoundInit [makeZeroInit tt m.typ]
+          | none   => .CompoundInit []
+      | none    => .SingleInit (.Constant (.ConstInt 0))  -- incomplete type: fallback
 
 /-- Type-check an initializer for a variable of the given type.
     Chapter 15: `CompoundInit` is legal only for array types; each element
@@ -813,8 +1105,10 @@ private def makeZeroInit : AST.Typ → AST.Initializer
     Zero-pads the initializer list to the full array size (C §6.7.9p10).
     Chapter 16: `SingleInit(StringLiteral s)` for a char array is converted to
     a `CompoundInit` of ConstChar elements (with null terminator, zero-padded).
-    `SingleInit(StringLiteral s)` for a pointer type decays to Pointer(Char). -/
-private partial def typeCheckInitializer (st : SymbolTable) (varTyp : AST.Typ)
+    `SingleInit(StringLiteral s)` for a pointer type decays to Pointer(Char).
+    Chapter 18: `CompoundInit` for struct/union types type-checks each initializer
+    against the corresponding member type and zero-pads missing members. -/
+private partial def typeCheckInitializer (tt : TypeTable) (st : SymbolTable) (varTyp : AST.Typ)
     : AST.Initializer → TcM AST.Initializer
   | .SingleInit (.StringLiteral s) => do
       -- Chapter 16: string literal initializer — special handling.
@@ -852,14 +1146,26 @@ private partial def typeCheckInitializer (st : SymbolTable) (varTyp : AST.Typ)
       | _ => do
           -- Non-array context: type-check as a regular string literal expression.
           -- This handles `char *p = "hello"` — the string literal decays to Pointer(Char).
-          let (e', eTyp) ← typeCheckExp st (.StringLiteral s)
+          let (e', eTyp) ← typeCheckExp tt st (.StringLiteral s)
           let e'' ← implicitCastTo varTyp eTyp e'
           return .SingleInit e''
   | .SingleInit e => do
-      let (e', eTyp) ← typeCheckExp st e
+      let (e', eTyp) ← typeCheckExp tt st e
       -- Array types cannot be initialized with a scalar expression
       if isArrayType varTyp then
         throw s!"TypeCheck: cannot initialize an array with a scalar expression"
+      -- Chapter 18: struct/union types can only be initialized with:
+      --   (a) another value of the same struct/union type (copy init: `struct s x = f()`)
+      --   (b) a scalar that decays to the same type — not applicable for aggregates
+      -- Reject initialization with a non-aggregate expression (e.g. `union u x = 1`).
+      -- `implicitCastTo` will handle the same-type case and throw for mismatched types.
+      match varTyp with
+      | .Struct _ | .Union _ =>
+          -- Only allow if eTyp is also a struct/union (copy init).
+          match eTyp with
+          | .Struct _ | .Union _ => pure ()   -- same-type check deferred to implicitCastTo
+          | _ => throw s!"TypeCheck: cannot initialize a struct/union with a non-aggregate expression"
+      | _ => pure ()
       let e'' ← implicitCastTo varTyp eTyp e'
       return .SingleInit e''
   | .CompoundInit inits => do
@@ -870,10 +1176,46 @@ private partial def typeCheckInitializer (st : SymbolTable) (varTyp : AST.Typ)
             throw s!"TypeCheck: compound initializer has {inits.length} elements but array only has {size}"
           -- Zero-pad to the full array size (C §6.7.9p10: unlisted elements
           -- are zero-initialized as if they had static storage duration).
-          let padded := inits ++ List.replicate (size - inits.length) (makeZeroInit elemTyp)
-          let inits' ← padded.mapM (typeCheckInitializer st elemTyp)
+          let padded := inits ++ List.replicate (size - inits.length) (makeZeroInit tt elemTyp)
+          let inits' ← padded.mapM (typeCheckInitializer tt st elemTyp)
           return .CompoundInit inits'
-      | _ => throw s!"TypeCheck: compound initializer used for non-array type {repr varTyp}"
+      -- Chapter 18: struct compound initializer — type-check each field initializer
+      -- in order, zero-padding any missing members.
+      | .Struct tag =>
+          match lookupTypeTable tt tag with
+          | none => throw s!"TypeCheck: struct '{tag}' is not defined"
+          | some sd =>
+              let members := sd.members
+              if inits.length > members.length then
+                throw s!"TypeCheck: compound initializer has {inits.length} elements but struct '{tag}' only has {members.length} members"
+              -- Pair each provided initializer with its member type; zero-pad missing members.
+              let memberTypes := members.map (·.typ)
+              let paddedInits : List AST.Initializer :=
+                inits ++ (memberTypes.drop inits.length).map (makeZeroInit tt)
+              let inits' ← (paddedInits.zip memberTypes).mapM fun (init, mTyp) =>
+                typeCheckInitializer tt st mTyp init
+              return .CompoundInit inits'
+      -- Chapter 18: union compound initializer.
+      -- C §6.7.9p17: only the first member is initialized.  All members alias
+      -- the same bytes, so only one element is allowed in the initializer and we
+      -- only type-check (and emit) the first member.
+      | .Union tag =>
+          match lookupTypeTable tt tag with
+          | none => throw s!"TypeCheck: union '{tag}' is not defined"
+          | some sd =>
+              let members := sd.members
+              -- A union initializer may have AT MOST one element.
+              if inits.length > 1 then
+                throw s!"TypeCheck: union initializer must have exactly one element, got {inits.length}"
+              -- Type-check the first (and only) member.
+              match members.head? with
+              | none => return .CompoundInit []
+              | some firstMember =>
+                  let firstInit :=
+                    if inits.isEmpty then makeZeroInit tt firstMember.typ else inits.head!
+                  let firstInit' ← typeCheckInitializer tt st firstMember.typ firstInit
+                  return .CompoundInit [firstInit']
+      | _ => throw s!"TypeCheck: compound initializer used for non-array, non-struct type {repr varTyp}"
 
 -- ---------------------------------------------------------------------------
 -- Statement type-checking
@@ -889,8 +1231,9 @@ private partial def typeCheckInitializer (st : SymbolTable) (varTyp : AST.Typ)
 mutual
 
 /-- Type-check a statement, threading the current function's return type for
-    `return` statements. -/
-private partial def typeCheckStmt (st : SymbolTable) (retTyp : AST.Typ) : AST.Statement → TcM AST.Statement
+    `return` statements.
+    Chapter 18: accepts `tt : TypeTable` for struct member type lookups. -/
+private partial def typeCheckStmt (tt : TypeTable) (st : SymbolTable) (retTyp : AST.Typ) : AST.Statement → TcM AST.Statement
   -- Chapter 17: Return is now Option Exp — void functions use `Return none`.
   | .Return none => do
       -- `return;` is only valid in void functions.
@@ -901,54 +1244,74 @@ private partial def typeCheckStmt (st : SymbolTable) (retTyp : AST.Typ) : AST.St
       -- `return expr;` with a value.
       if retTyp == .Void then
         throw "TypeCheck: cannot return a value from a void function"
-      let (e', eTyp) ← typeCheckExp st e
+      let (e', eTyp) ← typeCheckExp tt st e
       -- Chapter 14: use implicitCastTo to catch illegal pointer return type conversions
       let e'' ← implicitCastTo retTyp eTyp e'
       return .Return (some e'')
   | .Expression e => do
-      let (e', _) ← typeCheckExp st e
+      let (e', eTyp) ← typeCheckExp tt st e
+      -- Chapter 18: an expression of incomplete struct/union type cannot be used as a statement.
+      -- (Evaluating an incomplete struct as a value requires knowing its size for copying.)
+      requireCompleteStructType tt eTyp "expression statement"
       return .Expression e'
   | .If cond thenStmt elseOpt => do
-      let (cond', condTyp) ← typeCheckExp st cond
-      -- Chapter 17: void is non-scalar and cannot be used as an if condition
+      let (cond', condTyp) ← typeCheckExp tt st cond
+      -- C §6.8.4.1: controlling expression must have scalar type.
+      -- Void, struct, union, and array types are non-scalar.
       if condTyp == .Void then
         throw "TypeCheck: void type cannot be used as if condition"
-      let then' ← typeCheckStmt st retTyp thenStmt
-      let else' ← elseOpt.mapM (typeCheckStmt st retTyp)
+      match condTyp with
+      | .Struct _ | .Union _ => throw "TypeCheck: struct/union type cannot be used as if condition (not a scalar)"
+      | .Array _ _ => throw "TypeCheck: array type cannot be used as if condition (not a scalar)"
+      | _ => pure ()
+      let then' ← typeCheckStmt tt st retTyp thenStmt
+      let else' ← elseOpt.mapM (typeCheckStmt tt st retTyp)
       return .If cond' then' else'
   | .Compound items => do
-      let items' ← items.mapM (typeCheckBlockItem st retTyp)
+      let items' ← items.mapM (typeCheckBlockItem tt st retTyp)
       return .Compound items'
   | .While cond body lbl => do
-      let (cond', condTyp) ← typeCheckExp st cond
-      -- Chapter 17: void is non-scalar and cannot be used as a while condition
+      let (cond', condTyp) ← typeCheckExp tt st cond
+      -- C §6.8.5: controlling expression must have scalar type.
       if condTyp == .Void then
         throw "TypeCheck: void type cannot be used as while condition"
-      let body' ← typeCheckStmt st retTyp body
+      match condTyp with
+      | .Struct _ | .Union _ => throw "TypeCheck: struct/union type cannot be used as while condition (not a scalar)"
+      | .Array _ _ => throw "TypeCheck: array type cannot be used as while condition (not a scalar)"
+      | _ => pure ()
+      let body' ← typeCheckStmt tt st retTyp body
       return .While cond' body' lbl
   | .DoWhile body cond lbl => do
-      let body' ← typeCheckStmt st retTyp body
-      let (cond', condTyp) ← typeCheckExp st cond
-      -- Chapter 17: void is non-scalar and cannot be used as a do-while condition
+      let body' ← typeCheckStmt tt st retTyp body
+      let (cond', condTyp) ← typeCheckExp tt st cond
+      -- C §6.8.5: controlling expression must have scalar type.
       if condTyp == .Void then
         throw "TypeCheck: void type cannot be used as do-while condition"
+      match condTyp with
+      | .Struct _ | .Union _ => throw "TypeCheck: struct/union type cannot be used as do-while condition (not a scalar)"
+      | .Array _ _ => throw "TypeCheck: array type cannot be used as do-while condition (not a scalar)"
+      | _ => pure ()
       return .DoWhile body' cond' lbl
   | .For init cond post body lbl => do
-      let init' ← typeCheckForInit st init
+      let init' ← typeCheckForInit tt st init
       let cond' ← cond.mapM (fun e => do
-        let (e', eTyp) ← typeCheckExp st e
-        -- Chapter 17: void is non-scalar and cannot be used as a for loop condition
+        let (e', eTyp) ← typeCheckExp tt st e
+        -- C §6.8.5: controlling expression must have scalar type.
         if eTyp == .Void then throw "TypeCheck: void type cannot be used as for loop condition"
+        match eTyp with
+        | .Struct _ | .Union _ => throw "TypeCheck: struct/union type cannot be used as for loop condition (not a scalar)"
+        | .Array _ _ => throw "TypeCheck: array type cannot be used as for loop condition (not a scalar)"
+        | _ => pure ()
         return e')
-      let post' ← post.mapM (fun e => do let (e', _) ← typeCheckExp st e; return e')
-      let body' ← typeCheckStmt st retTyp body
+      let post' ← post.mapM (fun e => do let (e', _) ← typeCheckExp tt st e; return e')
+      let body' ← typeCheckStmt tt st retTyp body
       return .For init' cond' post' body' lbl
   | .Break lbl    => return .Break lbl
   | .Continue lbl => return .Continue lbl
   | .Switch exp body lbl cases => do
-      let (exp', expTyp) ← typeCheckExp st exp
+      let (exp', expTyp) ← typeCheckExp tt st exp
       -- C §6.8.4.2: the controlling expression must have integer type.
-      -- Void, double, pointer, and array are not valid switch controlling expression types.
+      -- Void, double, pointer, array, struct, and union are not valid switch types.
       if expTyp == .Void then
         throw s!"TypeCheck: switch controlling expression must have integer type, not void"
       if expTyp == .Double then
@@ -958,7 +1321,12 @@ private partial def typeCheckStmt (st : SymbolTable) (retTyp : AST.Typ) : AST.St
       -- Chapter 15: arrays also cannot be used as switch controlling expression
       if isArrayType expTyp then
         throw s!"TypeCheck: switch controlling expression must have integer type, not array"
-      let body' ← typeCheckStmt st retTyp body
+      -- Chapter 18: struct/union also cannot be used as switch controlling expression
+      match expTyp with
+      | .Struct _ | .Union _ =>
+          throw s!"TypeCheck: switch controlling expression must have integer type, not struct/union"
+      | _ => pure ()
+      let body' ← typeCheckStmt tt st retTyp body
       -- C §6.8.4.2p2: integer promotions are performed on the controlling expression.
       -- Char/SChar/UChar all promote to Int (C §6.3.1.1p2).
       -- We model this by inserting an explicit Cast to Int and treating the switch as Int-typed.
@@ -977,34 +1345,41 @@ private partial def typeCheckStmt (st : SymbolTable) (retTyp : AST.Typ) : AST.St
         | _     => body'   -- Long/ULong: no truncation needed
       return .Switch exp'' body'' lbl cases
   | .Case n body lbl => do
-      let body' ← typeCheckStmt st retTyp body
+      let body' ← typeCheckStmt tt st retTyp body
       return .Case n body' lbl
   | .Default body lbl => do
-      let body' ← typeCheckStmt st retTyp body
+      let body' ← typeCheckStmt tt st retTyp body
       return .Default body' lbl
   | .Labeled lbl stmt => do
-      let stmt' ← typeCheckStmt st retTyp stmt
+      let stmt' ← typeCheckStmt tt st retTyp stmt
       return .Labeled lbl stmt'
   | .Goto lbl => return .Goto lbl
   | .Null     => return .Null
 
 /-- Type-check a `for` initializer: cast the initializer expression (if any)
-    to match the declared variable type. -/
-private partial def typeCheckForInit (st : SymbolTable) : AST.ForInit → TcM AST.ForInit
+    to match the declared variable type.
+    Chapter 18: accepts `tt : TypeTable` for struct member type lookups. -/
+private partial def typeCheckForInit (tt : TypeTable) (st : SymbolTable) : AST.ForInit → TcM AST.ForInit
   | .InitExp eOpt => do
-      let eOpt' ← eOpt.mapM (fun e => do let (e', _) ← typeCheckExp st e; return e')
+      -- Chapter 18: like an expression statement, the for-init expression must have complete type.
+      let eOpt' ← eOpt.mapM (fun e => do
+        let (e', eTyp) ← typeCheckExp tt st e
+        requireCompleteStructType tt eTyp "for-loop init expression"
+        return e')
       return .InitExp eOpt'
   | .InitDecl decl => do
       -- Chapter 15: use typeCheckInitializer (handles both scalar and compound inits)
-      let init' ← decl.init.mapM (typeCheckInitializer st decl.typ)
+      let init' ← decl.init.mapM (typeCheckInitializer tt st decl.typ)
       return .InitDecl { decl with init := init' }
 
 /-- Type-check a block item: statements are recursed into; declaration
     initializers are cast to match the declared variable type; local function
-    declarations are passed through unchanged. -/
-private partial def typeCheckBlockItem (st : SymbolTable) (retTyp : AST.Typ) : AST.BlockItem → TcM AST.BlockItem
+    declarations are passed through unchanged.
+    Chapter 18: accepts `tt : TypeTable` for struct member type lookups.
+    `BlockItem.SD` (struct/union type declaration) passes through unchanged. -/
+private partial def typeCheckBlockItem (tt : TypeTable) (st : SymbolTable) (retTyp : AST.Typ) : AST.BlockItem → TcM AST.BlockItem
   | .S stmt => do
-      let stmt' ← typeCheckStmt st retTyp stmt
+      let stmt' ← typeCheckStmt tt st retTyp stmt
       return .S stmt'
   | .D decl => do
       -- Chapter 17: reject void variable declarations and arrays of void element type.
@@ -1013,10 +1388,20 @@ private partial def typeCheckBlockItem (st : SymbolTable) (retTyp : AST.Typ) : A
         throw s!"TypeCheck: cannot declare variable '{decl.name}' with void type (void is an incomplete type)"
       if containsVoidArray decl.typ then
         throw s!"TypeCheck: cannot declare variable '{decl.name}' with a type containing an array of void"
-      -- Chapter 15: use typeCheckInitializer (handles scalar SingleInit and CompoundInit)
-      let init' ← decl.init.mapM (typeCheckInitializer st decl.typ)
+      -- Chapter 18: reject declarations of incomplete struct/union type (C §6.7p7).
+      -- Exception: `extern struct s x;` is a declaration (not a definition) and does NOT
+      -- allocate memory, so incomplete type is allowed there.
+      -- All other local declarations (auto and static) are definitions requiring complete type.
+      match decl.storageClass with
+      | some .Extern => pure ()  -- extern at block scope: incomplete type allowed
+      | _ =>
+          requireCompleteStructType tt decl.typ
+            s!"declaration of '{decl.name}'"
+      -- Chapter 15/18: use typeCheckInitializer (handles scalar, compound, and struct inits)
+      let init' ← decl.init.mapM (typeCheckInitializer tt st decl.typ)
       return .D { decl with init := init' }
   | .FD fd => return .FD fd   -- local function declarations need no type-checking here
+  | .SD tag membersOpt => return .SD tag membersOpt   -- Chapter 18: struct/union decl passes through
 
 end
 
@@ -1025,8 +1410,9 @@ end
 -- ---------------------------------------------------------------------------
 
 /-- Type-check a function definition: type-check the body with the function's
-    return type so that `return` statements are correctly cast. -/
-private def typeCheckFunctionDef (st : SymbolTable) (f : AST.FunctionDef) : TcM AST.FunctionDef := do
+    return type so that `return` statements are correctly cast.
+    Chapter 18: accepts `tt : TypeTable` for struct member type lookups. -/
+private def typeCheckFunctionDef (tt : TypeTable) (st : SymbolTable) (f : AST.FunctionDef) : TcM AST.FunctionDef := do
   -- Chapter 17: reject void-typed named parameters.
   -- In C, `(void)` as the only parameter means "no parameters" (empty list after parsing);
   -- a named parameter `void x` is always illegal.
@@ -1035,17 +1421,29 @@ private def typeCheckFunctionDef (st : SymbolTable) (f : AST.FunctionDef) : TcM 
       throw s!"TypeCheck: parameter '{paramName}' cannot have void type (use (void) for empty parameter list)"
     if containsVoidArray paramTyp then
       throw s!"TypeCheck: parameter '{paramName}' type cannot contain an array of void"
-  let body' ← f.body.mapM (typeCheckBlockItem st f.retTyp)
+    -- Chapter 18: reject parameters of incomplete struct/union type.
+    requireCompleteStructType tt paramTyp s!"parameter '{paramName}'"
+  -- Chapter 18: reject function definitions with incomplete struct/union return type.
+  -- (Function declarations may have incomplete return types in C, but definitions
+  -- that actually produce a value need a complete type to copy the return value.)
+  match f.retTyp with
+  | .Struct tag | .Union tag =>
+      match lookupTypeTable tt tag with
+      | none => throw s!"TypeCheck: function '{f.name}' return type '{tag}' is an incomplete or undeclared struct/union"
+      | _    => pure ()
+  | _ => pure ()
+  let body' ← f.body.mapM (typeCheckBlockItem tt st f.retTyp)
   return { f with body := body' }
 
 /-- Entry point for the type-checking pass.
     Walks all top-level function definitions; variable declarations at file scope
-    are checked (initializer cast) but otherwise unchanged. -/
-def typeCheckProgram (p : AST.Program) (st : SymbolTable) : Except String AST.Program := do
+    are checked (initializer cast) but otherwise unchanged.
+    Chapter 18: accepts `tt : TypeTable` (from VarResolution) for struct/union layouts. -/
+def typeCheckProgram (p : AST.Program) (st : SymbolTable) (tt : TypeTable) : Except String AST.Program := do
   let topLevels' ← p.topLevels.mapM fun tl =>
     match tl with
     | .FunDef fd  => do
-        let fd' ← typeCheckFunctionDef st fd
+        let fd' ← typeCheckFunctionDef tt st fd
         return .FunDef fd'
     | .VarDecl decl => do
         -- Chapter 17: reject void variable declarations and arrays of void element type.
@@ -1054,8 +1452,16 @@ def typeCheckProgram (p : AST.Program) (st : SymbolTable) : Except String AST.Pr
           throw s!"TypeCheck: cannot declare variable '{decl.name}' with void type (void is an incomplete type)"
         if containsVoidArray decl.typ then
           throw s!"TypeCheck: cannot declare variable '{decl.name}' with a type containing an array of void"
-        -- Chapter 15: use typeCheckInitializer (handles scalar and compound inits)
-        let init' ← decl.init.mapM (typeCheckInitializer st decl.typ)
+        -- Chapter 18: reject definitions of incomplete struct/union type (C §6.7p7).
+        -- File-scope `extern struct s x;` is a declaration without definition → allowed.
+        -- All other file-scope declarations (no storage class, or `static`) define memory → complete type required.
+        match decl.storageClass with
+        | some .Extern => pure ()  -- extern declaration: incomplete type allowed
+        | _ =>
+            requireCompleteStructType tt decl.typ
+              s!"declaration of '{decl.name}'"
+        -- Chapter 15/18: use typeCheckInitializer (handles scalar, compound, and struct inits)
+        let init' ← decl.init.mapM (typeCheckInitializer tt st decl.typ)
         return .VarDecl { decl with init := init' }
     | .FunDecl fd => do
         -- Chapter 17: reject void-typed named parameters in function declarations.
@@ -1067,6 +1473,10 @@ def typeCheckProgram (p : AST.Program) (st : SymbolTable) : Except String AST.Pr
           if containsVoidArray paramTyp then
             throw s!"TypeCheck: parameter '{paramName}' type cannot contain an array of void"
         return .FunDecl fd
+    | .StructDecl tag membersOpt =>
+        -- Chapter 18: file-scope struct/union type declaration passes through TypeCheck unchanged.
+        -- The layout was already computed by VarResolution.
+        return .StructDecl tag membersOpt
   return { p with topLevels := topLevels' }
 
 end Semantics

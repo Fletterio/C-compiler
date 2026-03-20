@@ -144,6 +144,7 @@ private partial def labelBlockItem
   | .S stmt => return .S (← labelStatement stmt breakLbl contLbl switchLbl)
   | .D _    => return item
   | .FD _   => return item
+  | .SD _ _ => return item   -- Chapter 18: struct/union declarations need no labeling
 
 end
 
@@ -172,6 +173,9 @@ def labelLoops (p : AST.Program) : Except String AST.Program := do
       | .VarDecl vd =>
           -- Chapter 10: file-scope variable declarations have no body
           return .VarDecl vd
+      | .StructDecl tag membersOpt =>
+          -- Chapter 18: struct/union type declarations have no body to label
+          return .StructDecl tag membersOpt
   match action.run 0 with
   | .error msg          => .error msg
   | .ok (topLevels', _) => .ok { p with topLevels := topLevels' }

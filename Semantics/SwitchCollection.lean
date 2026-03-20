@@ -65,9 +65,10 @@ private partial def collectCasesFromStmt : AST.Statement → Except String (List
 
 /-- Collect case entries from a block item. -/
 private partial def collectCasesFromItem : AST.BlockItem → Except String (List CaseEntry)
-  | .S stmt => collectCasesFromStmt stmt
-  | .D _    => return []
-  | .FD _   => return []
+  | .S stmt  => collectCasesFromStmt stmt
+  | .D _     => return []
+  | .FD _    => return []
+  | .SD _ _  => return []   -- Chapter 18: struct/union declarations have no cases
 
 end
 
@@ -149,6 +150,9 @@ def collectSwitchCases (p : AST.Program) : Except String AST.Program := do
     | .VarDecl vd =>
         -- Chapter 10: file-scope variable declarations have no body
         return AST.TopLevel.VarDecl vd
+    | .StructDecl tag membersOpt =>
+        -- Chapter 18: struct/union type declarations have no body to process
+        return AST.TopLevel.StructDecl tag membersOpt
   return { p with topLevels := topLevels' }
 
 end Semantics
