@@ -332,6 +332,8 @@ private partial def lexStringLiteral (acc : List Char) (chars : List Char)
       match parseEscape rest with
       | some (c, remaining) => lexStringLiteral (c :: acc) remaining
       | none                => none
+  -- C §6.4.5: a string literal may not contain an unescaped newline.
+  | '\n' :: _   => none
   | c :: rest   => lexStringLiteral (c :: acc) rest
 
 /-- Try to consume one token from the front of `chars`.

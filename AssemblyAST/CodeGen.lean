@@ -569,7 +569,16 @@ private def convertFunCall (name : String) (args : List Tacky.Val) (dst : Option
                 match convertVal arg with
                 | .Reg r => [.Push (.Reg r)]
                 | .Imm n => [.Push (.Imm n)]
-                | op     => [.Mov .Quadword op (.Reg .AX), .Push (.Reg .AX)]
+                | op     =>
+                    -- Use the correct-width read to avoid reading past the value's end
+                    -- at page boundaries (e.g. an int near the end of a BSS page).
+                    -- Byte: movzbl reads 1 byte and zero-extends to 32 bits (safe).
+                    -- Longword: movl reads 4 bytes and zero-extends to 64 bits via %eax.
+                    -- Quadword/Pointer: movq reads 8 bytes (always safe for 8-byte types).
+                    let loadInstr : Instruction :=
+                      if t == .Byte then .MovZeroExtend .Byte .Longword op (.Reg .AX)
+                      else .Mov t op (.Reg .AX)
+                    [loadInstr, .Push (.Reg .AX)]
               (ia, xa, sa ++ [pushSlot], iIdx, xIdx))
       initialAcc
   -- Stack padding: an odd number of 8-byte pushes leaves RSP misaligned (16-byte boundary).
