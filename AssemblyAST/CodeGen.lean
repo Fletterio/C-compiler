@@ -719,13 +719,27 @@ private structure CgState where
         address, then RAX is loaded with the pointer before Ret. -/
 private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTable)
     (ctr : Nat) (tt : Semantics.TypeTable) (typMap : List (String × AST.Typ))
-    (isMemReturn : Bool) : List Instruction × Nat :=
+    (isMemReturn : Bool) (funRetAsmType : AsmType) : List Instruction × Nat :=
   match instr with
   -- Chapter 17: Return is now Option Val — void functions emit just Ret.
   | .Return none =>
       ([.Ret], ctr)
   | .Return (some v) =>
-      let t := valAsmType bst v
+      -- For Val.Constant, valAsmType uses a numeric heuristic that gives the wrong
+      -- instruction size for small-valued large-typed returns (e.g. Constant(-1) for
+      -- a Long-returning function → Longword → movl $-1, %eax instead of movq).
+      -- Use funRetAsmType for constants when it's an integer type (Longword/Quadword/Byte).
+      -- For Double and struct returns (ByteArray), fall back to valAsmType: Mov with
+      -- an integer constant is a bug in those cases, but the implicit-return fallback
+      -- (TackyGen appends Return(Constant 0) to every non-void function) can hit this
+      -- path; valAsmType gives Longword, and the dead code is harmless (it follows an
+      -- already-emitted real Return and will be eliminated by the assembler/linker).
+      let t := match v with
+        | .Constant _ =>
+            match funRetAsmType with
+            | .Longword | .Quadword | .Byte => funRetAsmType   -- integer returns: use exact type
+            | _                             => valAsmType bst v -- Double/ByteArray: use old heuristic
+        | _ => valAsmType bst v
       if t == .Double then
         ([.Movsd (convertVal v) (.Reg .XMM0), .Ret], ctr)
       else
@@ -1196,6 +1210,9 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
   | .AddPtr ptr idx scale dst =>
       -- dst = ptr + idx * scale.  Lowers to:
       --   1. movq ptr, R11                     — load pointer into scratch reg
+      --   [constant-index fast path]
+      --   2. leaq (n*scale)(%r11), dst          — if idx is a compile-time constant
+      --   [variable-index general path]
       --   2. movslq idx, R9 (or movq idx, R9)  — sign-extend/copy index to 64-bit
       --   3a. leaq (R11, R9, scale), dst        — if scale ∈ {1,2,4,8} (x86 addressing)
       --   3b. imulq $scale, R9; leaq (R11,R9,1) — otherwise (multi-dimensional arrays with
@@ -1203,28 +1220,54 @@ private def convertInstruction (instr : Tacky.Instruction) (bst : BackendSymTabl
       -- x86 `leaq (base, idx, scale)` only supports scale ∈ {1, 2, 4, 8}.
       -- For larger or non-power-of-2 scales (e.g. `int a[N][3]` → scale = 12),
       -- we multiply the index by the scale first using imulq, then use scale=1.
-      let idxT := valAsmType bst idx
-      let extendIdx : List Instruction :=
-        if idxT == .Byte then
-          -- Chapter 16: char index — sign-extend byte directly to 64-bit
-          [.Movsx .Byte .Quadword (convertVal idx) (.Reg .R9)]
-        else if idxT == .Longword then
-          -- Int index — sign-extend 32-bit → 64-bit (handles negative indices correctly)
-          [.Movsx .Longword .Quadword (convertVal idx) (.Reg .R9)]
-        else
-          -- Long/ULong/Pointer index — copy 64-bit directly
-          [.Mov .Quadword (convertVal idx) (.Reg .R9)]
-      let scaleInstrs : List Instruction :=
-        if scale == 1 || scale == 2 || scale == 4 || scale == 8 then
-          -- Valid leaq scale: use (base, idx, scale) addressing directly
-          [.Lea (.Indexed .R11 .R9 scale) (convertVal dst)]
-        else
-          -- Scale not encodable in leaq: multiply first, then use scale=1
-          [.Binary .Quadword .Mult (.Imm scale) (.Reg .R9),
-           .Lea (.Indexed .R11 .R9 1) (convertVal dst)]
-      ([.Mov .Quadword (convertVal ptr) (.Reg .R11)] ++
-       extendIdx ++
-       scaleInstrs, ctr)
+      let ptrLoad := .Mov .Quadword (convertVal ptr) (.Reg .R11)
+      -- Helper: general path — load idx into R9 (with sign extension), then scale.
+      let generalPath (idx : Tacky.Val) : List Instruction :=
+        let idxT := valAsmType bst idx
+        let extendIdx : List Instruction :=
+          if idxT == .Byte then
+            -- Chapter 16: char index — sign-extend byte directly to 64-bit
+            [.Movsx .Byte .Quadword (convertVal idx) (.Reg .R9)]
+          else if idxT == .Longword then
+            -- Int/UInt index — sign-extend 32-bit → 64-bit (handles negative indices
+            -- correctly; also handles wrapUInt32 constants like 4294967291 = UInt(-5),
+            -- which movslq treats as -5 by truncating the immediate to 32 bits and
+            -- sign-extending).
+            [.Movsx .Longword .Quadword (convertVal idx) (.Reg .R9)]
+          else
+            -- Long/ULong/Pointer index — copy 64-bit directly
+            [.Mov .Quadword (convertVal idx) (.Reg .R9)]
+        let scaleInstrs : List Instruction :=
+          if scale == 1 || scale == 2 || scale == 4 || scale == 8 then
+            -- Valid leaq scale: use (base, idx, scale) addressing directly
+            [.Lea (.Indexed .R11 .R9 scale) (convertVal dst)]
+          else
+            -- Scale not encodable in leaq: multiply first, then use scale=1
+            [.Binary .Quadword .Mult (.Imm scale) (.Reg .R9),
+             .Lea (.Indexed .R11 .R9 1) (convertVal dst)]
+        extendIdx ++ scaleInstrs
+      match idx with
+      | .Constant n =>
+          -- Constant index fast path: compute byte offset at compile time and emit a
+          -- single `leaq offset(%r11), dst`, eliminating the imulq instruction.
+          --
+          -- IMPORTANT: x86-64 memory displacement is a *signed* 32-bit field, so the
+          -- offset must lie in [-2^31, 2^31-1].  If the constant was already sign-
+          -- normalized by cpSubstInstr (via signNormAddPtrIdx), small negative offsets
+          -- such as -5 are already negative here.  If the constant was NOT normalized
+          -- (e.g. the variable wasn't in typeEnv), we fall back to the general path
+          -- which handles it correctly via movslq (truncates and sign-extends).
+          let byteOffset : Int := n * scale
+          if -2147483648 ≤ byteOffset && byteOffset ≤ 2147483647 then
+            ([ptrLoad, .Lea (.Memory .R11 byteOffset) (convertVal dst)], ctr)
+          else
+            -- Offset doesn't fit in 32-bit displacement: use general path.
+            -- Constant(n) with valAsmType=Longword will be emitted as a 32-bit
+            -- immediate in movslq, which correctly sign-extends to 64-bit.
+            ([ptrLoad] ++ generalPath idx, ctr)
+      | _ =>
+          -- Variable index: use general path.
+          ([ptrLoad] ++ generalPath idx, ctr)
   | .CopyToOffset src dstName offset =>
       -- Copy `src` to byte offset `offset` within aggregate variable `dstName`.
       -- PseudoReplace converts PseudoMem(dstName, offset) to Memory(BP, base + offset).
@@ -1300,7 +1343,7 @@ private def convertFunctionDef (f : Tacky.FunctionDef) (bst : BackendSymTable) (
   let paramCopies := emitParamCopies f.params bst tt typMap (if isMemReturn then 1 else 0)
   let (bodyInstrs, finalCtr) := f.body.foldl (fun (acc : List Instruction × Nat) i =>
     let (instrs, ctr) := acc
-    let (new, ctr') := convertInstruction i bst ctr tt typMap isMemReturn
+    let (new, ctr') := convertInstruction i bst ctr tt typMap isMemReturn retAsmType
     (instrs ++ new, ctr')) ([], initCtr)
   ({ name         := f.name,
      global       := f.global,

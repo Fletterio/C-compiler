@@ -714,24 +714,54 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
   | .Assignment (.Dot base member) rhs => do
       let s ← get
       let (rhsVal, _, rhsInstrs) ← emitExp st rhs
-      -- Compute the address of the member
-      let (memberAddr, memberTyp, addrInstrs) ← emitLvalAddr st (.Dot base member)
-      -- Store the rhs value into the member
-      let storeInstrs ← match memberTyp with
-        | .Struct innerTag | .Union innerTag =>
-            -- Aggregate member: store each scalar field using AggregateStoreAt
+      let tag := match ← (do let (_, bt, _) ← emitLvalAddr st base; return bt) with
+        | .Struct t | .Union t => t | _ => ""
+      let (memberTyp, memberOffset) := lookupMember s.typeTable tag member
+      -- If base is a directly named variable and member is scalar,
+      -- use CopyToOffset — this avoids GetAddress and allows DSE to track
+      -- the struct as a named aggregate (not an addr-taken aliasable variable).
+      let baseName? : Option String := match base with
+        | .Var name => some name
+        | _ => none
+      let storeInstrs ← match baseName?, memberTyp with
+        | some baseName, .Struct innerTag | some baseName, .Union innerTag =>
+            -- Aggregate sub-member on a directly named struct: use aggregate copy.
+            -- Need to compute base address first for AggregateStoreAt.
+            let (baseAddr, baseTyp, baseInstrs) ← emitLvalAddr st base
+            let (memberAddr, _, memberAddrInstrs) ←
+              if memberOffset == 0 then pure (baseAddr, baseTyp, [])
+              else do
+                let addrTmp := Val.Var (← makeTemporary (.Pointer memberTyp))
+                pure (addrTmp, memberTyp, [.AddPtr baseAddr (.Constant 1) memberOffset addrTmp])
             let rhsName := match rhsVal with | .Var n => n | .Constant _ => ""
-            emitAggregateStoreAt memberAddr innerTag 0 0 rhsName
-        | _ =>
-            -- Scalar member: Store rhs to member address
-            -- Route constants through a typed temp (for byte-sized members)
+            let aInstrs ← emitAggregateStoreAt memberAddr innerTag 0 0 rhsName
+            pure (baseInstrs ++ memberAddrInstrs ++ aInstrs)
+        | some baseName, _ =>
+            -- Scalar member of a directly named struct/union: use CopyToOffset.
+            -- This avoids GetAddress (which would add the struct to addrTakenVars)
+            -- and allows DSE to eliminate dead writes to struct members.
+            -- MUST route through a typed temporary: valAsmType(Constant n) uses
+            -- magnitude and returns Longword for small n regardless of true type,
+            -- which would emit movl instead of movq for Long/ULong members, or
+            -- movl instead of movb for Char/SChar/UChar members.
+            let tmp ← makeTemporary memberTyp
+            pure [.Copy rhsVal (.Var tmp), .CopyToOffset (.Var tmp) baseName memberOffset]
+        | none, .Struct innerTag | none, .Union innerTag =>
+            -- Aggregate sub-member of nested/pointer base: use AggregateStoreAt.
+            let (memberAddr, _, addrInstrs) ← emitLvalAddr st (.Dot base member)
+            let rhsName := match rhsVal with | .Var n => n | .Constant _ => ""
+            let aInstrs ← emitAggregateStoreAt memberAddr innerTag 0 0 rhsName
+            pure (addrInstrs ++ aInstrs)
+        | none, _ =>
+            -- Scalar member via pointer/nested base: use GetAddress + Store.
+            let (memberAddr, _, addrInstrs) ← emitLvalAddr st (.Dot base member)
             let (storeVal, typedInstrs) ← match rhsVal with
               | .Constant _ =>
                   let tmp := Val.Var (← makeTemporary memberTyp)
                   pure (tmp, [Instruction.Copy rhsVal tmp])
               | _ => pure (rhsVal, [])
-            pure (typedInstrs ++ [.Store storeVal memberAddr])
-      return (rhsVal, memberTyp, rhsInstrs ++ addrInstrs ++ storeInstrs)
+            pure (addrInstrs ++ typedInstrs ++ [.Store storeVal memberAddr])
+      return (rhsVal, memberTyp, rhsInstrs ++ storeInstrs)
   -- Chapter 18: assignment to a struct member via arrow operator: `p->member = rhs`
   | .Assignment (.Arrow ptr member) rhs => do
       let s ← get
@@ -796,20 +826,46 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
         ptrInstrs ++ [.Load ptrVal loadedVal, .Copy loadedVal oldVal] ++
         addInstrs ++ [.Store loadedVal ptrVal])
   -- Chapter 18: postfix ++ on a struct member: `s.member++` or `p->member++`
-  -- Get the member address, load old value, increment, store back, return old value.
+  -- When base is a directly named variable and member is scalar, use CopyFromOffset +
+  -- CopyToOffset to avoid GetAddress (which would add the struct to addrTakenVars and
+  -- prevent DSE from eliminating dead writes to struct members).
   | .PostfixIncr (.Dot base member) => do
-      let (memberAddr, memberTyp, addrInstrs) ← emitLvalAddr st (.Dot base member)
+      let s ← get
+      let baseName? : Option String := match base with
+        | .Var name => some name
+        | _ => none
+      let tag := match ← (do let (_, bt, _) ← emitLvalAddr st base; return bt) with
+        | .Struct t | .Union t => t | _ => ""
+      let (memberTyp, memberOffset) := lookupMember s.typeTable tag member
       let loadedVal := Val.Var (← makeTemporary memberTyp)
       let oldVal    := Val.Var (← makeTemporary memberTyp)
-      let s ← get
+      let s2 ← get
       let addInstrs : List Instruction :=
         match memberTyp with
         -- Chapter 18: use typeSizeOf for struct/union pointer types
-        | .Pointer elemTyp => [.AddPtr loadedVal (.Constant 1) (typeSizeOf s.typeTable elemTyp) loadedVal]
+        | .Pointer elemTyp => [.AddPtr loadedVal (.Constant 1) (typeSizeOf s2.typeTable elemTyp) loadedVal]
         | _ => [.Binary .Add loadedVal (.Constant 1) loadedVal]
-      return (oldVal, memberTyp,
-        addrInstrs ++ [.Load memberAddr loadedVal, .Copy loadedVal oldVal] ++
-        addInstrs ++ [.Store loadedVal memberAddr])
+      match baseName?, memberTyp with
+      | some _, .Struct _ | some _, .Union _ =>
+          -- Aggregate sub-member of named struct: still need GetAddress+Load+Store
+          let (memberAddr, _, addrInstrs) ← emitLvalAddr st (.Dot base member)
+          return (oldVal, memberTyp,
+            addrInstrs ++ [.Load memberAddr loadedVal, .Copy loadedVal oldVal] ++
+            addInstrs ++ [.Store loadedVal memberAddr])
+      | some baseName, _ =>
+          -- Scalar member of directly named struct/union: use CopyFromOffset/CopyToOffset.
+          -- This avoids GetAddress (which would make the struct address-taken) and allows
+          -- DSE to see the struct as a named aggregate, enabling dead store elimination.
+          return (oldVal, memberTyp,
+            [.CopyFromOffset baseName memberOffset loadedVal, .Copy loadedVal oldVal] ++
+            addInstrs ++ [.CopyToOffset loadedVal baseName memberOffset])
+      | none, _ =>
+          -- Member of a non-directly-named base (nested struct, pointer, etc.):
+          -- use GetAddress + Load + Store as before.
+          let (memberAddr, _, addrInstrs) ← emitLvalAddr st (.Dot base member)
+          return (oldVal, memberTyp,
+            addrInstrs ++ [.Load memberAddr loadedVal, .Copy loadedVal oldVal] ++
+            addInstrs ++ [.Store loadedVal memberAddr])
   | .PostfixIncr (.Arrow ptr member) => do
       let (memberAddr, memberTyp, addrInstrs) ← emitLvalAddr st (.Arrow ptr member)
       let loadedVal := Val.Var (← makeTemporary memberTyp)
@@ -866,19 +922,46 @@ private partial def emitExp (st : Semantics.SymbolTable) : AST.Exp → GenM (Val
         ptrInstrs ++ [.Load ptrVal loadedVal, .Copy loadedVal oldVal] ++
         subInstrs ++ [.Store loadedVal ptrVal])
   -- Chapter 18: postfix -- on a struct member: `s.member--` or `p->member--`
+  -- When base is a directly named variable and member is scalar, use CopyFromOffset +
+  -- CopyToOffset to avoid GetAddress (which would add the struct to addrTakenVars and
+  -- prevent DSE from eliminating dead writes to struct members).
   | .PostfixDecr (.Dot base member) => do
-      let (memberAddr, memberTyp, addrInstrs) ← emitLvalAddr st (.Dot base member)
+      let s ← get
+      let baseName? : Option String := match base with
+        | .Var name => some name
+        | _ => none
+      let tag := match ← (do let (_, bt, _) ← emitLvalAddr st base; return bt) with
+        | .Struct t | .Union t => t | _ => ""
+      let (memberTyp, memberOffset) := lookupMember s.typeTable tag member
       let loadedVal := Val.Var (← makeTemporary memberTyp)
       let oldVal    := Val.Var (← makeTemporary memberTyp)
-      let s ← get
+      let s2 ← get
       let subInstrs : List Instruction :=
         match memberTyp with
         -- Chapter 18: use typeSizeOf for struct/union pointer types
-        | .Pointer elemTyp => [.AddPtr loadedVal (.Constant (-1)) (typeSizeOf s.typeTable elemTyp) loadedVal]
+        | .Pointer elemTyp => [.AddPtr loadedVal (.Constant (-1)) (typeSizeOf s2.typeTable elemTyp) loadedVal]
         | _ => [.Binary .Subtract loadedVal (.Constant 1) loadedVal]
-      return (oldVal, memberTyp,
-        addrInstrs ++ [.Load memberAddr loadedVal, .Copy loadedVal oldVal] ++
-        subInstrs ++ [.Store loadedVal memberAddr])
+      match baseName?, memberTyp with
+      | some _, .Struct _ | some _, .Union _ =>
+          -- Aggregate sub-member of named struct: still need GetAddress+Load+Store
+          let (memberAddr, _, addrInstrs) ← emitLvalAddr st (.Dot base member)
+          return (oldVal, memberTyp,
+            addrInstrs ++ [.Load memberAddr loadedVal, .Copy loadedVal oldVal] ++
+            subInstrs ++ [.Store loadedVal memberAddr])
+      | some baseName, _ =>
+          -- Scalar member of directly named struct/union: use CopyFromOffset/CopyToOffset.
+          -- This avoids GetAddress (which would make the struct address-taken) and allows
+          -- DSE to see the struct as a named aggregate, enabling dead store elimination.
+          return (oldVal, memberTyp,
+            [.CopyFromOffset baseName memberOffset loadedVal, .Copy loadedVal oldVal] ++
+            subInstrs ++ [.CopyToOffset loadedVal baseName memberOffset])
+      | none, _ =>
+          -- Member of a non-directly-named base (nested struct, pointer, etc.):
+          -- use GetAddress + Load + Store as before.
+          let (memberAddr, _, addrInstrs) ← emitLvalAddr st (.Dot base member)
+          return (oldVal, memberTyp,
+            addrInstrs ++ [.Load memberAddr loadedVal, .Copy loadedVal oldVal] ++
+            subInstrs ++ [.Store loadedVal memberAddr])
   | .PostfixDecr (.Arrow ptr member) => do
       let (memberAddr, memberTyp, addrInstrs) ← emitLvalAddr st (.Arrow ptr member)
       let loadedVal := Val.Var (← makeTemporary memberTyp)
@@ -1458,8 +1541,17 @@ def emitProgram (p : AST.Program) (symTable : Semantics.SymbolTable)
     { counter := initCounter, typeEnv := [], floatConsts := [], needsNegZero := false,
       strConsts := [], typeTable := tt }
   let (allItems, finalState) := action.run initState
+  -- Merge symTable Obj types into typeEnv so the optimizer can look up
+  -- types of user-declared variables (renamed to "name.N" by VarResolution).
+  -- TackyGen's own typeEnv only records temporaries (tmp.N); without symTable
+  -- types, constant folding cannot wrap arithmetic correctly for user vars.
+  let symTypeEnv : List (String × AST.Typ) := symTable.filterMap fun (nm, entry) =>
+    match entry.type with
+    | .Obj t => some (nm, t)
+    | _      => none
+  let mergedTypeEnv := finalState.typeEnv ++ symTypeEnv
   ({ topLevels := allItems },
-   finalState.typeEnv,
+   mergedTypeEnv,
    finalState.floatConsts,
    finalState.needsNegZero,
    finalState.strConsts)

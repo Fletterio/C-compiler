@@ -6,6 +6,7 @@ import Semantics.SwitchCollection
 import Semantics.LabelResolution
 import Semantics.TypeCheck
 import Tacky.TackyGen
+import Tacky.Optimize
 import AssemblyAST.CodeGen
 import AssemblyAST.PseudoReplace
 import AssemblyAST.FixUp
@@ -194,7 +195,8 @@ def preprocess (inputPath : String) : IO String := do
            b. PseudoReplace (uses backend sym table for sizes/static decisions)
            c. FixUp (typed instruction fixups, large immediates, AllocateStack)
       8. Emit     — serialize to AT&T-syntax text -/
-def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := do
+def compile (preprocessedPath : String) (stage : Stage)
+    (optFlags : Tacky.OptFlags := {}) : IO (Option String) := do
   let contents ← IO.FS.readFile preprocessedPath
   -- Lex
   let tokens ←
@@ -246,6 +248,12 @@ def compile (preprocessedPath : String) (stage : Stage) : IO (Option String) := 
   -- Chapter 18: pass typeTable so TackyGen can look up struct/union member offsets.
   let (tacky, typeEnv, floatConsts, needsNegZero, strConsts) :=
     Tacky.emitProgram resolvedAst symTable initCounter typeTable
+  -- Chapter 19: run optimization passes (constant folding, etc.) on the TACKY IR.
+  -- optimizeProgram threads the typeEnv and floatConsts through all functions so that
+  -- any new float constants produced by the optimizer are recorded in floatConsts/typeEnv
+  -- and will be picked up by buildBackendSymTable and emitted as StaticConstant items.
+  let (tacky, floatConsts, typeEnv) :=
+    Tacky.optimizeProgram tacky optFlags typeEnv floatConsts
   if stage == .Tacky then return none
   -- Build backend symbol table from frontend sym table + TACKY typeEnv.
   -- Float const labels (in floatConsts) need isStatic = true so PseudoReplace maps
@@ -321,11 +329,12 @@ def assembleToObject (assemblyPath : String) (objectPath : String) : IO Unit := 
   try IO.FS.removeFile assemblyPath catch _ => pure ()
 
 def run (inputPath : String) (stage : Stage)
-    (extraLinkerFlags : List String := []) : IO Unit := do
+    (extraLinkerFlags : List String := [])
+    (optFlags : Tacky.OptFlags := {}) : IO Unit := do
   let preprocessed ← preprocess inputPath
   let assemblyOpt ←
     try
-      let asm ← compile preprocessed stage
+      let asm ← compile preprocessed stage optFlags
       try IO.FS.removeFile preprocessed catch _ => pure ()
       pure asm
     catch e =>
